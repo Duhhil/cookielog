@@ -1,0 +1,30 @@
+# Build artifacts
+*.obj
+*.exp
+*.lib
+__pycache__/
+*.pyc
+
+# Old folders (replaced by ifec/)
+cooked/
+
+# Loot (captured cookies - do not commit)
+loot/
+
+# Infected exes (do not commit)
+ifec/
+
+# Test game
+GET UPSTAIRS (64bit)/
+
+# Runtime artifacts
+hosts.json
+cookies_all.json
+cookies_all.txt
+cookies_recv.json
+cookies_recv.txt
+cookie_log.jsonl
+drop.json
+
+# Debug
+*.log

