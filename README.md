@@ -7,8 +7,8 @@
  ║                                                                      ║
  ║   This is offensive security tooling for penetration testing,        ║
  ║   red-team exercises, and security education. It builds an           ║
- ║   infected executable that extracts browser cookies from a          ║
- ║   target machine and exfiltrates them to a remote C2 server.        ║
+ ║   infected executable that extracts browser cookies from a           ║
+ ║   target machine and exfiltrates them to a remote C2 server.         ║
  ║                                                                      ║
  ║   ONLY use this on systems you own or are explicitly authorized      ║
  ║   to test. Unauthorized use against third-party systems, networks,   ║
