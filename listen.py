@@ -2,6 +2,11 @@
 """listen.py — HTTP server that receives cookies exfiltrated by the payload.
 Run on the attacker side:  python listen.py [port]
 
+  EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING
+
+  This is offensive security tooling. Only use on systems you own or are
+  explicitly authorized to test. Unauthorized use is illegal.
+
 The payload (when infected with the C2 URL) makes an HTTP POST with JSON in the
 Cookie-Editor format (directly importable in the browser via the Cookie-Editor extension).
 

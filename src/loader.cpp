@@ -1,5 +1,11 @@
 // loader.cpp - process hollowing injector for any .exe the attacker chooses.
 //
+//   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
+//
+//   This is offensive security tooling for penetration testing, red-team exercises,
+//   and security education. Only use on systems you own or are explicitly authorized
+//   to test. Unauthorized use is illegal. The authors are not responsible for misuse.
+//
 //   loader.exe -p C:\tools\Host.exe [--kill] [--purge] [-t 60000]
 //   -t wait N ms for payload to finish; --kill terminate host after; --purge delete file on reboot
 //

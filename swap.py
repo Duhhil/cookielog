@@ -1,4 +1,8 @@
 # swap.py -- turns cookies_all.json into a cookies.txt PER SITE, ready to import.
+#
+#   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING.
+#   Only use on systems you own or are explicitly authorized to test.
+#
 #   python swap.py                        lists the sites on hand
 #   python swap.py netflix                swap\netflix.com.txt (everything that has not expired)
 #   python swap.py netflix --session      only the live session

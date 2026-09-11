@@ -1,5 +1,12 @@
 # cookielog.py — cookie logger: Firefox + Chromium (Chrome, Edge, Brave, Vivaldi, Opera)
 #
+#   EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING
+#
+#   This is offensive security tooling for penetration testing, red-team
+#   exercises, and security education. Only use on systems you own or are
+#   explicitly authorized to test. Unauthorized use is illegal. The authors
+#   are not responsible for misuse.
+#
 #   python cookielog.py             # single pass -> cookies_all.txt + cookies_all.json
 #   python cookielog.py --live      # continuous log -> cookie_log.jsonl (new/changed)
 #   python cookielog.py --firefox   # filter browser (chrome|edge|brave|vivaldi|opera|firefox)

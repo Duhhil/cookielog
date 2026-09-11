@@ -1,0 +1,46 @@
+# DISCLAIMER
+
+## Educational Use Only
+
+This software (cookielog) is provided for **educational purposes only** — specifically for
+security research, penetration testing training, red-team exercises, and learning how
+cookie-stealing attacks work so that defenders can build detection and mitigation.
+
+## What This Tool Does
+
+cookielog builds an infected executable that, when run:
+
+1. Opens the original host application normally (the victim sees nothing wrong)
+2. Silently extracts browser cookies (Chrome, Edge, Brave, Vivaldi, Opera, Firefox)
+3. Exfiltrates the cookies via HTTP POST to an attacker-controlled server
+
+## Authorized Use Only
+
+**ONLY use this software on systems you own or are explicitly authorized to test.**
+
+Unauthorized use against third-party systems, networks, devices, or individuals is illegal
+under computer crime statutes in most jurisdictions, including but not limited to:
+
+- **United States:** 18 U.S.C. § 1030 (Computer Fraud and Abuse Act)
+- **Brazil:** Lei nº 12.737/2012 (Lei Carolina Dieckmann) and art. 154-A do Código Penal
+- **European Union:** Directive 2013/40/EU on attacks against information systems
+- **United Kingdom:** Computer Misuse Act 1990
+
+Penalties may include fines and imprisonment.
+
+## No Warranty
+
+This software is provided "as is", without warranty of any kind, express or implied.
+The authors are not responsible for any damage, data loss, or legal consequences resulting
+from the use or misuse of this software.
+
+## Responsibility
+
+By using this software, you accept full responsibility for your actions and agree that:
+
+1. You will only test systems you own or have written authorization to test
+2. You will not use this tool to steal credentials or session tokens from third parties
+3. You will not distribute infected executables to unsuspecting users
+4. You understand the legal implications of unauthorized use in your jurisdiction
+
+If you do not agree with these terms, do not use this software.

@@ -1,5 +1,27 @@
 # cookielog
 
+```
+ ╔══════════════════════════════════════════════════════════════════════╗
+ ║                                                                      ║
+ ║   EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING          ║
+ ║                                                                      ║
+ ║   This is offensive security tooling for penetration testing,        ║
+ ║   red-team exercises, and security education. It builds an           ║
+ ║   infected executable that extracts browser cookies from a          ║
+ ║   target machine and exfiltrates them to a remote C2 server.        ║
+ ║                                                                      ║
+ ║   ONLY use this on systems you own or are explicitly authorized      ║
+ ║   to test. Unauthorized use against third-party systems, networks,   ║
+ ║   or individuals is illegal in most jurisdictions and may result     ║
+ ║   in criminal prosecution.                                           ║
+ ║                                                                      ║
+ ║   The authors are not responsible for misuse. This code is           ║
+ ║   provided for learning how cookie-stealing attacks work so          ║
+ ║   that defenders can build detection and mitigation.                 ║
+ ║                                                                      ║
+ ╚══════════════════════════════════════════════════════════════════════╝
+```
+
 Cookie exfiltration toolkit for Windows. Steals cookies from Chromium-based browsers
 (Chrome, Edge, Brave, Vivaldi, Opera) and Firefox by injecting a CRT-less payload into a
 legitimate host `.exe` via process hollowing. The payload extracts cookies on the victim's
@@ -8,10 +30,6 @@ JSON format that imports directly into a browser.
 
 A legacy Python extractor (`cookielog.py`) and a local named-pipe mode (`sink.py`) are also
 included for direct extraction without injection.
-
-> **Operating mode:** this is offensive tooling. It builds an infected executable that runs a
-> hidden payload alongside a normally-opening host app, extracts the victim's browser cookies,
-> and ships them to a remote C2. Use only on systems you own or are authorized to test.
 
 ---
 
@@ -90,6 +108,7 @@ targeted cleanup of the orphaned `cmd.exe` by `ParentProcessId` (PowerShell, not
 
 ```
 cookielog/
+├── DISCLAIMER            # Educational use disclaimer (read this first)
 ├── auto.py               # One-click: build + listen + infect + test (GUI + CLI)
 ├── auto.bat              # Shortcut: python auto.py %*
 ├── pick.py               # GUI infector (standalone, manual C2 config)
