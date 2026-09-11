@@ -1,5 +1,6 @@
 @echo off
-REM cmd_init.cmd — useful aliases and tools for cmd.exe
+REM cmd_init.cmd -- useful aliases and tools for cmd.exe
+REM EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING
 REM This runs automatically on every cmd startup (via AutoRun registry key)
 REM alongside Clink injection.
 

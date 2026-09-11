@@ -1,6 +1,11 @@
 ===============================================================================
-  COOKIELOG — FLUXO DO PAYLOAD (PASSO A PASSO)
+  COOKIELOG -- FLUXO DO PAYLOAD (PASSO A PASSO)
 ===============================================================================
+
+  USO EDUCACIONAL APENAS -- PARA PESQUISA E TREINAMENTO DE SEGURANCA
+  Use apenas em sistemas que voce possui ou esta explicitamente autorizado
+  a testar. Uso nao autorizado e ilegal. Os autores nao se responsabilizam
+  pelo uso indevido.
 
 Este documento descreve exatamente o que acontece quando a vítima executa
 um .exe infectado, do duplo-clique até a exfiltração dos cookies.

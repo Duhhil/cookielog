@@ -1,6 +1,10 @@
 ===============================================================================
-  COOKIELOG — PAYLOAD EXECUTION FLOW (STEP BY STEP)
+  COOKIELOG -- PAYLOAD EXECUTION FLOW (STEP BY STEP)
 ===============================================================================
+
+  EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
+  Only use on systems you own or are explicitly authorized to test.
+  Unauthorized use is illegal. The authors are not responsible for misuse.
 
 This document describes exactly what happens when a victim runs an infected
 .exe, from double-click to cookie exfiltration.

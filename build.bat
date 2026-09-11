@@ -1,5 +1,6 @@
 @echo off
 REM build.bat - compiles ckdll.dll (payload) and loader.exe (injector)
+REM EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING
 REM Requires: MSVC (Visual Studio 2022 Build Tools C++ with vcvars64.bat)
 REM
 REM Output:

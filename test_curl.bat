@@ -1,5 +1,6 @@
 @echo off
 REM test_curl.bat - tests the HTTP listener (listen.py) with a fake cookie via curl
+REM EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING
 REM Usage: test_curl.bat [port]
 REM   1. Open another terminal: python listen.py 9090
 REM   2. Run this: test_curl.bat 9090
