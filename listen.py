@@ -10,7 +10,7 @@ Output:
   cookies_recv.txt   — Netscape format (importable in curl/wget)
   stdout             — per-domain summary
 """
-import json, os, sys, time, socket
+import json, os, sys, time, socket, socketserver
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +24,16 @@ PORT   = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 class HTTPServerV4(HTTPServer):
     """Force IPv4 — HTTPServer default may resolve 0.0.0.0 to IPv6 on Windows."""
     address_family = socket.AF_INET
+
+    def server_bind(self):
+        """Override to skip socket.getfqdn() — it does a reverse DNS lookup on the
+        bind address (0.0.0.0) which takes 4+ seconds on Windows, delaying listen()
+        and causing the payload's HTTP connect to fail with WSAECONNREFUSED (10061)."""
+        # TCPServer.server_bind does: setsockopt + bind + getsockname (no DNS)
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = socket.gethostname()  # local, no network lookup
+        self.server_port = port
 
 
 def load_existing():
