@@ -33,6 +33,36 @@ included for direct extraction without injection.
 
 ---
 
+## Installation
+
+Run the installer — it installs all dependencies automatically:
+
+```bat
+install.bat              :: install everything (Python, MSVC, CLI tools, build)
+install.bat --check      :: check what's installed (don't install anything)
+install.bat --no-build   :: skip MSVC + build (Python + CLI tools only)
+install.bat --no-tools   :: skip CLI tools (fzf, bat, ripgrep, clink)
+```
+
+What `install.bat` does:
+
+1. **Python pip packages** — `cryptography`, `websocket-client` from `requirements.txt`
+2. **MSVC Build Tools 2022** — C++ workload via winget (~2 GB download, needed to compile the
+   payload). Python tools work without MSVC; you only need it to run `build.bat`.
+3. **CLI tools** — Clink (cmd autocomplete), fzf (fuzzy finder), bat (syntax-highlighted cat),
+   ripgrep (fast grep) — all via winget
+4. **cmd_init.cmd** — copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
+   Linux-style aliases (`ls`, `cat`, `grep`, etc.) load on every cmd.exe start
+5. **Build** — runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
+
+After installation, start cookielog with:
+
+```bat
+auto.bat
+```
+
+---
+
 ## What's New
 
 ### `auto.py` — one-click payload setup (GUI + CLI)
@@ -146,36 +176,6 @@ cookielog/
 │   └── cookies_all.txt   # From sink.py (pipe mode)
 └── tools/
     └── PsExec64.exe      # Sysinternals (for legacy v20 extraction)
-```
-
----
-
-## Installation
-
-Run the installer — it installs all dependencies automatically:
-
-```bat
-install.bat              :: install everything (Python, MSVC, CLI tools, build)
-install.bat --check      :: check what's installed (don't install anything)
-install.bat --no-build   :: skip MSVC + build (Python + CLI tools only)
-install.bat --no-tools   :: skip CLI tools (fzf, bat, ripgrep, clink)
-```
-
-What `install.bat` does:
-
-1. **Python pip packages** — `cryptography`, `websocket-client` from `requirements.txt`
-2. **MSVC Build Tools 2022** — C++ workload via winget (~2 GB download, needed to compile the
-   payload). Python tools work without MSVC; you only need it to run `build.bat`.
-3. **CLI tools** — Clink (cmd autocomplete), fzf (fuzzy finder), bat (syntax-highlighted cat),
-   ripgrep (fast grep) — all via winget
-4. **cmd_init.cmd** — copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
-   Linux-style aliases (`ls`, `cat`, `grep`, etc.) load on every cmd.exe start
-5. **Build** — runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
-
-After installation, start cookielog with:
-
-```bat
-auto.bat
 ```
 
 ---
