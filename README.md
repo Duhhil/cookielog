@@ -93,6 +93,9 @@ targeted cleanup of the orphaned `cmd.exe` by `ParentProcessId` (PowerShell, not
 
 ### Other changes
 
+- **`install.bat`** — one-click dependency installer: Python pip packages, MSVC Build Tools,
+  CLI tools (Clink, fzf, bat, ripgrep) via winget, `cmd_init.cmd` setup, autorun registry,
+  and payload build. Supports `--check` (status only), `--no-build`, `--no-tools`.
 - **`auto.bat`** — shortcut: `python auto.py %*`
 - **`cmd_init.cmd`** — Linux-style aliases for cmd.exe (`ls`, `cat`, `grep`, `..`, `...`) +
   cookielog shortcuts (`cl_auto`, `cl_pick`, `cl_listen`) + Python shortcuts (`py`, `pi`, `pf`).
@@ -109,6 +112,7 @@ targeted cleanup of the orphaned `cmd.exe` by `ParentProcessId` (PowerShell, not
 ```
 cookielog/
 ├── DISCLAIMER            # Educational use disclaimer (read this first)
+├── install.bat           # One-click dependency installer (Python, MSVC, CLI tools)
 ├── auto.py               # One-click: build + listen + infect + test (GUI + CLI)
 ├── auto.bat              # Shortcut: python auto.py %*
 ├── pick.py               # GUI infector (standalone, manual C2 config)
@@ -142,6 +146,36 @@ cookielog/
 │   └── cookies_all.txt   # From sink.py (pipe mode)
 └── tools/
     └── PsExec64.exe      # Sysinternals (for legacy v20 extraction)
+```
+
+---
+
+## Installation
+
+Run the installer — it installs all dependencies automatically:
+
+```bat
+install.bat              :: install everything (Python, MSVC, CLI tools, build)
+install.bat --check      :: check what's installed (don't install anything)
+install.bat --no-build   :: skip MSVC + build (Python + CLI tools only)
+install.bat --no-tools   :: skip CLI tools (fzf, bat, ripgrep, clink)
+```
+
+What `install.bat` does:
+
+1. **Python pip packages** — `cryptography`, `websocket-client` from `requirements.txt`
+2. **MSVC Build Tools 2022** — C++ workload via winget (~2 GB download, needed to compile the
+   payload). Python tools work without MSVC; you only need it to run `build.bat`.
+3. **CLI tools** — Clink (cmd autocomplete), fzf (fuzzy finder), bat (syntax-highlighted cat),
+   ripgrep (fast grep) — all via winget
+4. **cmd_init.cmd** — copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
+   Linux-style aliases (`ls`, `cat`, `grep`, etc.) load on every cmd.exe start
+5. **Build** — runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
+
+After installation, start cookielog with:
+
+```bat
+auto.bat
 ```
 
 ---
@@ -558,6 +592,7 @@ are skipped.
 
 | Script | What it does |
 |---|---|
+| `install.bat` | One-click dependency installer (Python, MSVC, CLI tools, build, cmd_init) |
 | `auto.bat` | Shortcut: `python auto.py %*` |
 | `start_attack.bat` | Launches `listen.py` (port 9090) + `pick.py` GUI together |
 | `test_curl.bat` | POSTs a fake cookie to the listener via `curl` to verify it works |
