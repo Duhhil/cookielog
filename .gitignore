@@ -31,3 +31,6 @@ config.json
 
 # Debug
 *.log
+
+# Loader backup (created on victim when infected exe runs)
+~ck_bak.bin
