@@ -26,5 +26,8 @@ cookies_recv.txt
 cookie_log.jsonl
 drop.json
 
+# Config (contains API tokens -- do not commit)
+config.json
+
 # Debug
 *.log
