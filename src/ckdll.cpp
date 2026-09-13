@@ -593,7 +593,8 @@ static void LoadLocalState(const wchar_t* root){
 
 // Decrypt a single Chromium cookie value
 // Format: "v10" or "v20" prefix (3 bytes) + 12-byte nonce + ciphertext + 16-byte GCM tag
-// v20 has an additional 32-byte SHA256 domain hash prefix in the plaintext
+// Chrome >=118 (including v10) prepends a 32-byte SHA256(host_key) domain hash
+// to the plaintext for cookie isolation. We strip it for both v10 and v20.
 static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* on){
     if(n<31){ DbgInt("DecCookie: n too small", n); return false; }
     const unsigned char* k = g_key10;
@@ -605,7 +606,8 @@ static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* 
     ULONG ctLen = n-15-16;
     bool ok = AesGcm(k,32,enc+3,enc+15,ctLen,enc+n-16,out,ctLen,&got);
     if(!ok){ DbgInt("DecCookie: AesGcm failed, n=", n); return false; }
-    int s = isv20 ? 32 : 0;      // v20 has 32-byte SHA256 domain hash prefix in plaintext
+    // Chrome >=118: both v10 and v20 have 32-byte SHA256(host) domain hash prefix
+    int s = (got >= 32) ? 32 : 0;
     if((int)got < s){ DbgInt("DecCookie: got < s, got=", got); return false; }
     *on = (int)(got - s); memmove(out,out+s,*on); return true;
 }
