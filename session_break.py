@@ -32,12 +32,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Win32 API bindings for handle hijacking
+# Win32 API bindings for handle hijacking (Windows-only; the analysis modes
+# below work on Linux, the live extraction does not)
 # ---------------------------------------------------------------------------
 
-ntdll = ctypes.WinDLL("ntdll.dll")
-kernel32 = ctypes.WinDLL("kernel32.dll")
-crypt32 = ctypes.WinDLL("crypt32.dll")
+if sys.platform == "win32":
+    ntdll = ctypes.WinDLL("ntdll.dll")
+    kernel32 = ctypes.WinDLL("kernel32.dll")
+    crypt32 = ctypes.WinDLL("crypt32.dll")
 
 # Set argtypes for functions that need 64-bit handle support
 kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
@@ -472,7 +474,10 @@ def extract_firefox_cookies():
     print("STAGE 1b: Extract Firefox cookies (plaintext)")
     print("=" * 100)
 
-    ff_profile = os.path.join(os.environ["APPDATA"], "Mozilla", "Firefox", "Profiles")
+    if sys.platform == "win32":
+        ff_profile = os.path.join(os.environ["APPDATA"], "Mozilla", "Firefox", "Profiles")
+    else:
+        ff_profile = os.path.expanduser("~/.mozilla/firefox")
     if not os.path.isdir(ff_profile):
         print("  [!] No Firefox profiles found")
         return []
@@ -888,7 +893,10 @@ def run_cryptanalysis(cookies):
 
 if __name__ == "__main__":
     # Extract cookies
-    vivaldi_cookies = extract_vivaldi_cookies()
+    if sys.platform != "win32":
+        print("[-] live Vivaldi extraction needs Windows (handle hijacking via NtQuerySystemInformation)")
+        print("    on Linux only the Firefox cookie read below works (profile at ~/.mozilla/firefox)")
+    vivaldi_cookies = extract_vivaldi_cookies() if sys.platform == "win32" else []
     firefox_cookies = extract_firefox_cookies()
 
     all_cookies = vivaldi_cookies + firefox_cookies

