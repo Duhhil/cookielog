@@ -610,6 +610,14 @@ The toolkit is split in two sides, and only the ATTACKER side is portable:
 
 Windows-only entry points print a clear message and return instead of crashing.
 
+**Arch Linux notes:** the interpreter is `python` (3.x), not `python3` -- run
+`python auto.py ...` etc., or create the alias once:
+`ln -s "$(command -v python)" ~/.local/bin/python3`. pip is PEP 668-managed
+(externally-managed environment): the cleanest route is
+`sudo pacman -S python-cryptography python-websocket-client`; otherwise
+`./install.sh` falls back to `pip --break-system-packages` automatically.
+The GUI (`pick.py`) needs the `tk` package, which `./install.sh` installs.
+
 Quick start on Linux (attacker):
 
 ```bash
