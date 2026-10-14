@@ -159,10 +159,20 @@ echo
 echo "=============================================================================="
 echo "  summary"
 echo "=============================================================================="
-command -v python3 >/dev/null 2>&1 && echo "  python3:      $(python3 -V 2>&1)" || echo "  python3:      MISSING"
-python3 -m pip --version >/dev/null 2>&1 && echo "  pip:          ok" || echo "  pip:          MISSING"
-python3 -c "import tkinter" >/dev/null 2>&1 && echo "  tkinter:      ok" || echo "  tkinter:      missing (pick.py GUI only)"
-python3 -c "import cryptography, websocket" >/dev/null 2>&1 && echo "  pip packages: ok" || echo "  pip packages: MISSING"
+# Debian/Ubuntu/Fedora/openSUSE name the interpreter python3; Arch names it python
+PYBIN="$(command -v python3 || command -v python)"
+if [ -n "$PYBIN" ]; then
+    echo "  interpreter:  $PYBIN ($($PYBIN -V 2>&1))"
+    "$PYBIN" -m pip --version >/dev/null 2>&1 && echo "  pip:          ok" || echo "  pip:          MISSING"
+    "$PYBIN" -c "import tkinter" >/dev/null 2>&1 && echo "  tkinter:      ok" || echo "  tkinter:      missing (pick.py GUI only)"
+    "$PYBIN" -c "import cryptography, websocket" >/dev/null 2>&1 && echo "  pip packages: ok" || echo "  pip packages: MISSING"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "  note:         Arch-style system: the interpreter is 'python' (3.x), not 'python3'."
+        echo "                run commands as 'python auto.py ...', or once: ln -s $PYBIN ~/.local/bin/python3"
+    fi
+else
+    echo "  python3:      MISSING"
+fi
 [ -f bin/loader.exe ] && echo "  loader.exe:   prebuilt present" || echo "  loader.exe:   MISSING (copy bin/ from a Windows build machine)"
 [ -f bin/ckdll.dll ]  && echo "  ckdll.dll:    prebuilt present" || echo "  ckdll.dll:    MISSING (copy bin/ from a Windows build machine)"
 echo
