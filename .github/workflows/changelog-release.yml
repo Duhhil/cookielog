@@ -1,0 +1,50 @@
+# changelog-release.yml
+# Every push that touches CHANGELOG.md turns the latest entry into a GitHub
+# Release. The version, title and notes are parsed from the file itself:
+#
+#   ### v7 -- some title (current)
+#   ...release notes...
+#
+# Version = the token right after ### (vN or vN.M). The (current) suffix is
+# dropped from the release title. Editing the same version later (typo fixes,
+# extra notes) updates the existing release instead of failing on the tag.
+
+name: changelog-release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'CHANGELOG.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse latest changelog entry
+        id: entry
+        run: |
+          awk '/^### /{ if (seen) exit; if (/^### v[0-9]/) seen=1 } seen{print}' CHANGELOG.md > entry.md
+          version=$(head -1 entry.md | sed -E 's/^### (v[0-9][0-9.]*).*/\1/')
+          title=$(head -1 entry.md | sed -E 's/^### //; s/ \(current\)$//')
+          tail -n +2 entry.md > notes.md
+          if [ -z "$version" ]; then
+            echo "no '### vX' heading found in CHANGELOG.md" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "title=$title"   >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.entry.outputs.version }}
+          name: ${{ steps.entry.outputs.title }}
+          body_path: notes.md
+          make_latest: true
