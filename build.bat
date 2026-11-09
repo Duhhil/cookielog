@@ -42,14 +42,11 @@ if exist "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Bu
 if exist "%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 
 :have_vcvars
-if not defined VCVARS (
-    echo [build] ERROR: vcvars64.bat not found.
-    echo [build] Install "Visual Studio Build Tools 2022" and select:
-    echo [build]   Desktop development with C++  ^(MSVC v143 + Windows 10/11 SDK^)
-    echo [build] Then run this script again.
-    exit /b 2
-)
+if defined VCVARS goto :run_vcvars
+echo [build] vcvars64.bat not found.
+goto :no_msvc
 
+:run_vcvars
 REM No block here either: %VCVARS% can contain "(x86)" and would close it.
 if /i "%VCVARS%"=="ready" goto :vcvars_ok
 echo [build] vcvars: %VCVARS%
@@ -59,12 +56,25 @@ REM vcvars can "succeed" on a half-installed VS (the batch exists, the compiler
 REM binaries do not). cl.exe on PATH is the only proof that matters.
 where cl.exe >nul 2>&1
 if not errorlevel 1 goto :cl_ok
-echo [build] ERROR: cl.exe is not on PATH after vcvars.
+echo [build] cl.exe is not on PATH after vcvars.
 echo [build] vcvars used: %VCVARS%
-echo [build] The install is incomplete: VC\Tools\MSVC exists but bin\Hostx64\x64
-echo [build] has no cl.exe/link.exe. Open the Visual Studio Installer, Modify,
-echo [build] and add "MSVC v143 - VS 2022 C++ x64/x86 build tools".
-exit /b 3
+goto :no_msvc
+
+:no_msvc
+REM The compiler binaries can be stripped while headers and libs survive (this
+REM happened on the test machine: zero .exe under VS, SDK and Installer). clang-cl
+REM with lld-link and llvm-ml builds the same MSVC-ABI binaries from those files.
+if not exist "%~dp0build_clang.bat" goto :no_fallback
+echo [build] no MSVC compiler -- falling back to build_clang.bat
+call "%~dp0build_clang.bat"
+exit /b %errorlevel%
+
+:no_fallback
+echo [build] ERROR: no C++ compiler (cl.exe missing and build_clang.bat missing).
+echo [build] Install "Visual Studio Build Tools 2022" with:
+echo [build]   Desktop development with C++  ^(MSVC v143 + Windows 10/11 SDK^)
+echo [build] or unpack LLVM (clang-cl/lld-link/llvm-ml) into %%USERPROFILE%%\toolchain.
+exit /b 2
 :cl_ok
 
 where cl.exe >nul 2>&1
