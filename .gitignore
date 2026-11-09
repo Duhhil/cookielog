@@ -23,6 +23,7 @@
 # Runtime artifacts (victim side / local tests -- never commit)
 # ============================================================
 loot/
+swap/
 ifec/
 ~ck_bak.bin
 ~ck_tmp.exe

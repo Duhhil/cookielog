@@ -14,34 +14,34 @@ cd /d "%~dp0"
 REM ---------------------------------------------------------------- toolchain
 REM The old script hardcoded one BuildTools path and sent vcvars output to nul:
 REM when that path was wrong the build "failed" with no explanation.
+REM
+REM NOTE: every test below is a single-line IF, never an IF ( ... ) block.
+REM %ProgramFiles(x86)% expands to a value containing ")" and cmd parses blocks
+REM at expansion time -- inside a block the ")" closed the block early and the
+REM script died with "\Microsoft was unexpected at this time" before it ever
+REM looked for vcvars.
 set "VCVARS="
+set "PF86=%ProgramFiles(x86)%"
 
 REM 1) already in a Developer Command Prompt
 where cl.exe >nul 2>&1 && if exist "%VCToolsInstallDir%" set "VCVARS=ready"
+if defined VCVARS goto :have_vcvars
 
 REM 2) vswhere (authoritative, works for Community/Professional/Enterprise/BuildTools)
-if not defined VCVARS (
-    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-    if exist "%VSWHERE%" (
-        for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-            if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
-        )
-    )
-)
+set "VSWHERE=%PF86%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" goto :try_roots
+for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+if defined VCVARS goto :have_vcvars
 
+:try_roots
 REM 3) common install roots
-if not defined VCVARS (
-    for %%r in (
-        "%ProgramFiles%\Microsoft Visual Studio\2022\Community"
-        "%ProgramFiles%\Microsoft Visual Studio\2022\Professional"
-        "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise"
-        "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools"
-        "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools"
-    ) do (
-        if exist "%%~r\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%~r\VC\Auxiliary\Build\vcvars64.bat"
-    )
-)
+if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+if exist "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if exist "%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%PF86%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 
+:have_vcvars
 if not defined VCVARS (
     echo [build] ERROR: vcvars64.bat not found.
     echo [build] Install "Visual Studio Build Tools 2022" and select:
@@ -50,10 +50,22 @@ if not defined VCVARS (
     exit /b 2
 )
 
-if /i not "%VCVARS%"=="ready" (
-    echo [build] vcvars: %VCVARS%
-    call "%VCVARS%" >nul 2>&1
-)
+REM No block here either: %VCVARS% can contain "(x86)" and would close it.
+if /i "%VCVARS%"=="ready" goto :vcvars_ok
+echo [build] vcvars: %VCVARS%
+call "%VCVARS%" >nul 2>&1
+:vcvars_ok
+REM vcvars can "succeed" on a half-installed VS (the batch exists, the compiler
+REM binaries do not). cl.exe on PATH is the only proof that matters.
+where cl.exe >nul 2>&1
+if not errorlevel 1 goto :cl_ok
+echo [build] ERROR: cl.exe is not on PATH after vcvars.
+echo [build] vcvars used: %VCVARS%
+echo [build] The install is incomplete: VC\Tools\MSVC exists but bin\Hostx64\x64
+echo [build] has no cl.exe/link.exe. Open the Visual Studio Installer, Modify,
+echo [build] and add "MSVC v143 - VS 2022 C++ x64/x86 build tools".
+exit /b 3
+:cl_ok
 
 where cl.exe >nul 2>&1
 if errorlevel 1 (

@@ -107,7 +107,7 @@ def merge(new):
         # saved login of a domain (all name="password") collapsed into one and
         # cross-profile cookies overwrote each other
         k = (c.get("_host"), c.get("browser"), c.get("profile"), c.get("domain"),
-             c["name"], c.get("path"), c.get("_username"),
+             c["name"], c.get("path"), c.get("_username"), c.get("_partition"),
              c.get("value") if c["name"] == "token" else None)
         if k not in seen:
             seen[k] = len(out); out.append(c)
