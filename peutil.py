@@ -79,3 +79,35 @@ def find_sentinel(blob, sentinel, slot=None, section=".data"):
             return 3
         return 1 if name else 2      # not a PE / unknown section: neutral
     return min(hits, key=lambda h: (rank(h), h))
+
+
+def _section_of(blob, offset):
+    for sname, _va, _vs, rptr, rsize in sections(blob):
+        if rptr <= offset < rptr + rsize:
+            return sname
+    return None
+
+
+def patch_ready(blob, sentinel, slot=None, section=".data"):
+    """Index safe to overwrite with a new value, or -1 when nothing should move.
+
+    find_sentinel() answers "where is the writable global"; this answers "may this
+    byte range be overwritten". Two ways to get it wrong:
+
+      * the .text immediate -- the 8-byte flags also exist inline as code bytes;
+        writing there changes an instruction, not a variable.
+      * the memcmp constant -- once the array is patched the sentinel survives
+        only there, so a second patch would rewrite the comparison instead of
+        the buffer. For slots wider than the sentinel the zero padding proves
+        which copy is the array; a non-zero tail means already patched.
+    """
+    idx = find_sentinel(blob, sentinel, slot, section)
+    if idx < 0:
+        return -1
+    if _section_of(blob, idx) == ".text":
+        return -1
+    if slot and slot > len(sentinel):
+        pad = slot - len(sentinel)
+        if blob[idx + len(sentinel):idx + slot] != b"\0" * pad:
+            return -1
+    return idx
