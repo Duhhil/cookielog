@@ -51,6 +51,7 @@ _*
 *.log
 .codex_*
 loot_listener.*
+tests/last_py.txt
 
 # ============================================================
 # Old folders / test samples (do not commit)
