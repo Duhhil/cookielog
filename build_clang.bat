@@ -78,8 +78,14 @@ if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )
    /link /SUBSYSTEM:WINDOWS /PDBALTPATH:fontcache.pdb user32.lib advapi32.lib
 if errorlevel 1 ( echo [build] LOADER BUILD FAILED & exit /b 1 )
 
+echo [build] ckdec.exe ...
+"%CLANG_BIN%\clang-cl.exe" /nologo /O2 /MT /std:c++17 /utf-8 ^
+   src\ckdec.cpp /Fe:bin\ckdec.exe -fuse-ld=lld ^
+   /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib
+if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
+
 echo [build] ALL OK (clang-cl)
-for %%f in (bin\ckdll.dll bin\loader.exe) do echo [build]   %%~nxf  %%~zf bytes
+for %%f in (bin\ckdll.dll bin\loader.exe bin\ckdec.exe) do echo [build]   %%~nxf  %%~zf bytes
 exit /b 0
 
 :no_clang
