@@ -3,7 +3,54 @@
 
 ## What's New
 
-### v12 -- TLS C2 in the payload, chunked delivery (current)
+### v13 -- self-injection, indirect syscalls, ETW patch (current)
+
+**The loader no longer hollows a host.** `notepad.exe` (and the `cmd.exe` fallback)
+is gone: `loader.exe` maps `ckdll.dll` into its own address space, resolves the IAT
+in-process, applies base relocations if `0x5F000000` is taken, and runs
+`payload_entry` on a thread. The four calls behavioural engines key on --
+`CreateProcessW` suspended, `NtUnmapViewOfSection`, remote `WriteProcessMemory`,
+remote thread creation -- are absent from the flow. The clean host still runs as
+its own process; the loader stays resident for the payload's lifetime.
+
+**Indirect syscalls for allocate / protect / thread.** `InitSyscalls()` reads the
+SSN straight from the mapped ntdll stub (`4C 8B D1 B8 ss ss ss ss`, following a
+rel32 hook once if an EDR rewrote the prologue) and finds a `0F 05 C3`
+(`syscall; ret`) gadget in ntdll's `.text`. Three 21-byte stubs
+(`mov r10,rcx; mov eax,ssn; mov r11,gadget; jmp r11`) are written to one RX page.
+`NtAllocateVirtualMemory`, `NtProtectVirtualMemory` and `NtCreateThreadEx` go
+through them; if initialisation fails the loader falls back to the kernel32
+exports instead of aborting the run. The syscall instruction stays inside ntdll,
+so the return address on the stack is an ntdll address, not private memory.
+
+**ETW patch and image hygiene.** `EtwEventWrite` is rewritten to `33 C0 C3`
+(`xor eax,eax; ret`) before the payload thread: every event write reports success
+and emits nothing, and the on-disk ntdll is untouched (copy-on-write page).
+After the IAT fixup the mapped payload's DOS/NT headers are zeroed, each section
+gets its real protection (no global RWX), and the `.pdata` range is registered
+with `RtlAddFunctionTable`, so an exception inside the manually mapped image can
+still unwind. The decrypted staging buffer is zeroed before `free`.
+
+**Signature policy.** Release builds set
+`SetProcessMitigationPolicy(ProcessSignaturePolicy = MicrosoftSignedOnly)` after
+all modules are loaded. The payload is already mapped and only imports signed
+System32 DLLs (`winsqlite3.dll` included); a later unsigned image cannot be mapped
+into the process. DEBUG builds skip it so a debugger can load extensions.
+
+**Harness semantics.** The loader process is now the payload host: killing it kills
+the extraction. `auto.py --run` waits for the loader to exit (6 min watchdog)
+before killing the game and restoring the original file; `pick.py` defaults its
+budget to 300 s. `-t` caps the payload wait (no cap by default); `--kill` is
+accepted for compatibility and does nothing.
+
+**Bench.** Release run `r16224` (coverage run id equals the loader PID) wrote the
+same totals as Stage 4: 3,574 rows / 3,573 decrypted. External probe at
+`0x5F000000`: committed private page, `PAGE_READONLY`, first bytes `00 00` (headers
+wiped). Notepad count unchanged across the run. DEBUG loader log:
+SSNs `0x18` / `0x50` / `0xC2`, mapped base `0x5F000000`, thread via indirect
+`NtCreateThreadEx`, payload exit code 0. 24 tests pass; `build.py verify` ok.
+
+### v12 -- TLS C2 in the payload, chunked delivery
 
 **The payload speaks TLS without a proxy.** `https://` in the C2 slot now selects
 a schannel 1.2 client inside `ckdll.dll`: raw Winsock connect, `SCHANNEL_CRED`

