@@ -62,7 +62,7 @@ if errorlevel 1 ( echo [build] LLVM-ML FAILED & exit /b 1 )
 "%CLANG_BIN%\clang-cl.exe" /nologo /LD /Od /Oi- /GS- /Gs4096 /utf-8 -fuse-ld=lld ^
    src\ckdll.cpp bin\chkstk.obj /Fe:bin\ckdll.dll ^
    /link /DLL /INCREMENTAL:NO /NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO ^
-         /BASE:0x5F000000 /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib
+         /BASE:0x5F000000 /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib secur32.lib
 if errorlevel 1 ( echo [build] DLL BUILD FAILED & exit /b 1 )
 
 echo [build] ckdec.exe ...

