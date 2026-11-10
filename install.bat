@@ -9,7 +9,7 @@ REM   2. MSVC Build Tools 2022 (C++ workload) -- via winget
 REM   3. CLI tools: Clink, fzf, bat, ripgrep -- via winget
 REM   4. cmd_init.cmd (Linux-style aliases) to %USERPROFILE%\bin\
 REM   5. Autorun registry key for cmd_init.cmd
-REM   6. Builds the payload (loader.exe + ckdll.dll)
+REM   6. Builds the payload (loader.exe + ckdll.dll + ckdec.exe + ckkey.exe)
 REM
 REM Usage:
 REM   install.bat              :: install everything
@@ -228,23 +228,17 @@ if "%DO_BUILD%"=="0" (
     goto step6
 )
 
-if not exist "!VCVARS!" (
-    echo [-] MSVC not found -- skipping build
-    echo     Install MSVC Build Tools and run: build.bat
-    goto step6
-)
-
-if exist "bin\loader.exe" if exist "bin\ckdll.dll" (
+if exist "bin\loader.exe" if exist "bin\ckdll.dll" if exist "bin\ckdec.exe" if exist "bin\ckkey.exe" (
     echo [+] Binaries already compiled
     goto step6
 )
 
-echo [*] Running build.bat...
-call build.bat
+echo [*] Running build.py all...
+python build.py all
 if %errorlevel%==1 (
     echo [-] Build failed
 ) else (
-    echo [+] Build successful: bin\loader.exe + bin\ckdll.dll
+    echo [+] Build successful: loader.exe + ckdll.dll + ckdec.exe + ckkey.exe
 )
 
 REM ==============================================================================
@@ -285,6 +279,12 @@ if exist "bin\loader.exe" (echo     [+] compiled) else (echo     [-] not compile
 
 echo   ckdll.dll:  
 if exist "bin\ckdll.dll" (echo     [+] compiled) else (echo     [-] not compiled)
+
+echo   ckdec.exe:
+if exist "bin\ckdec.exe" (echo     [+] compiled) else (echo     [-] not compiled)
+
+echo   ckkey.exe:
+if exist "bin\ckkey.exe" (echo     [+] compiled) else (echo     [-] not compiled)
 echo.
 
 if "%CHECK_ONLY%"=="1" (
