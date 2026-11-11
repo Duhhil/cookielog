@@ -3,7 +3,36 @@
 
 ## What's New
 
-### v13 -- self-injection, indirect syscalls, ETW patch (current)
+### v14 -- key stage: probe the directory, not the token (current)
+
+**The key stage stopped asking whether the loader is elevated.** It probes the browser's
+`Application` directory with a real create/delete (`.ckprobe.<pid>`) and runs the stage
+wherever the write succeeds. The token was the wrong question: a per-user Chromium install
+under `%LOCALAPPDATA%` is owned by the same user who runs the loader, so Vivaldi, Brave and
+per-user Chrome now get their app-bound key unwrapped at medium IL. A system install under
+`Program Files` fails the probe and is skipped with `app dir not writable`, instead of
+burning a deploy that would fail anyway.
+
+**The UAC bypass was built, tested, and thrown out.** fodhelper and computerdefaults carry
+`autoElevate`, so the HKCU `ms-settings` handler went in and worked as designed -- and
+Defender tagged the registry write as `Behavior:Win32/UACBypassExp.T!gen` and terminated the
+process that performed it, which is the loader itself. The run lost the payload, not just
+the key: a bad exchange one browser key for the whole infection. The remaining silent
+elevation routes are per-build and add a behavioural signature precisely where the loader is
+already watched; the probe removes the same coverage gap for per-user installs with no new
+surface at all. The bypass code and `shell32.lib` are gone from the build.
+
+**`--keydebug` changed meaning.** It no longer toggles an elevation gate -- it skips the
+probe and forces the deploy attempt, for stores where a redirected or virtualised path lies
+to `CreateFile`. A failed attempt is logged either way.
+
+**Bench proof.** Fake per-user Vivaldi under a redirected `%LOCALAPPDATA%`, loader running at
+medium IL (`S-1-16-8192`): the stage reached CLSID discovery and logged
+`elevation service CLSID not found` (expected -- no real browser), with no probe file left
+behind. The same tree with a deny-write ACE produced `app dir not writable`, and the payload
+mapped and exited normally in both runs. 24 tests pass, `build.py verify` ok.
+
+### v13 -- self-injection, indirect syscalls, ETW patch
 
 **The loader no longer hollows a host.** `notepad.exe` (and the `cmd.exe` fallback)
 is gone: `loader.exe` maps `ckdll.dll` into its own address space, resolves the IAT
