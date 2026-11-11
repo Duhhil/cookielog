@@ -282,7 +282,7 @@ python auto.py --clear-discord              :: remove Discord from config
 | `--c2 <url>` | Override C2 URL (e.g. `https://c2.example.com/` or `http://PUBLIC_IP:9400/`). `https` uses the payload's schannel transport and defaults to 443. Use when victim is outside your LAN. GUI: "DETECT PUBLIC IP" button |
 | `--no-anti-vm` | Disable VM MAC / debugger / sandbox checks (patch `CKAV0000` -> `CKAV0001`). Use for VM targets |
 | `--find-port` | Scan ports 9400-9500 and use the first free one. Saved to `config.json` |
-| `--tunnel` | Start a `cloudflared` quick tunnel and use its `https://*.trycloudflare.com/` URL as the C2. No VPS, no certificate, no port-forward (works behind CGNAT). Needs `cloudflared`; `install.bat` / `install.sh` fetch it |
+| `--tunnel` | Start a `cloudflared` quick tunnel and use its `https://*.trycloudflare.com/` URL as the C2. No VPS, no certificate, no port-forward (works behind CGNAT). Needs `cloudflared`; `install.bat` / `install.sh` fetch it. The GUI has the same switch (`Tunnel HTTPS` checkbox) |
 | `--config` | Show saved relay settings and exit |
 | `--clear-telegram` | Remove Telegram token from config.json |
 | `--clear-discord` | Remove Discord webhook from config.json |
@@ -836,7 +836,9 @@ Exfiltration priority in the payload:
 ### C2 without a VPS -- `--tunnel`
 
 `auto.py --tunnel` starts `cloudflared` in quick-tunnel mode in front of the local listener
-and embeds the resulting `https://<name>.trycloudflare.com/` URL in the payload. Cloudflare
+and embeds the resulting `https://<name>.trycloudflare.com/` URL in the payload. The picker's
+**Tunnel HTTPS** checkbox runs the same path: the Port field owns the listener, and the public
+URL replaces whatever is in the C2 field. Cloudflare
 terminates TLS at its edge and forwards plain HTTP to `127.0.0.1:<port>`, so:
 
 - no domain, no certificate, no VPS, and **no inbound port** -- it works from a CGNAT line

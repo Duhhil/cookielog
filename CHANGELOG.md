@@ -16,6 +16,15 @@ Bench proof: infected `where.exe` with the tunnel URL embedded delivered **4010 
 the POST and the `/health` probe answering before the build. The tunnel process dies with
 `auto.py`; a killed tunnel costs late victims exactly like a killed VPS listener.
 
+**The picker was wired to the tunnel and rebuilt.** `auto.py`'s GUI gained a
+`Tunnel HTTPS (cloudflared)` checkbox; when it is on, the Port field owns the listener and
+the public URL replaces the C2 field (a loopback C2 in that field is no longer rejected,
+because the tunnel is the endpoint). The checkbox is authoritative once the dialog opens --
+`--tunnel` only pre-checks it. The same switch went into `run_one`, so the interactive
+`gui` command behaves like the CLI. Layout: the native Windows theme, group boxes instead
+of stacked 50px indents, standard buttons, one status line for LAN/public/port/test
+results, and the relay state inline. No custom palette, no card dashboard.
+
 **`install.bat` was hiding failures.** `if %errorlevel%==1` only matches exit code 1, so a
 pip or winget failure that returned 2+ was treated as success; all checks now use
 `if errorlevel 1`. Parentheses in echoed flag names (`(--no-tools)`) closed the surrounding
