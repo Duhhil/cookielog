@@ -140,7 +140,7 @@ def compiler_ready(root):
     return False, info
 
 
-def run_script(root, name, timeout=600):
+def run_script(root, name, timeout=600, args=None):
     """Run a build .bat with cmd/c. Returns (ok, combined_output)."""
     script = os.path.join(root, name)
     if not os.path.isfile(script):
@@ -148,7 +148,7 @@ def run_script(root, name, timeout=600):
     if sys.platform != "win32":
         return False, "build scripts are Windows-only; ship prebuilt bin/ on Linux"
     try:
-        r = subprocess.run(["cmd", "/c", script], cwd=root,
+        r = subprocess.run(["cmd", "/c", script] + list(args or ()), cwd=root,
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, "%s timed out after %ss" % (name, timeout)

