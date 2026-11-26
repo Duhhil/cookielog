@@ -27,13 +27,14 @@ for ($i = 0; $i -lt $len; $i++) {
     $enc[$i] = [byte]($b[$i] -bxor $key[$i -band 15])
 }
 
-# Format key as C array
-$keyStr = ($key | ForEach-Object { "0x{0:x2}" -f $_ }) -join ","
-# Format encrypted bytes as C array
+# Format key as C array. Cache the 256 possible literals: formatting every
+# payload byte separately dominated build time on large DLLs.
+$hex = 0..255 | ForEach-Object { "0x{0:x2}" -f $_ }
+$keyStr = ($key | ForEach-Object { $hex[$_] }) -join ","
 $encStr = [System.Text.StringBuilder]::new($len * 5)
 for ($i = 0; $i -lt $len; $i++) {
     if ($i -gt 0) { [void]$encStr.Append(",") }
-    [void]$encStr.Append("0x{0:x2}" -f $enc[$i])
+    [void]$encStr.Append($hex[$enc[$i]])
 }
 
 Set-Content -Encoding ascii "$PSScriptRoot\payload.h" @"

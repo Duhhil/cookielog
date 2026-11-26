@@ -97,6 +97,13 @@ def build_keytool(root):
     return ok, out
 
 
+def build_proxy(root, def_path, out_path, implib_path, pdb_path):
+    """Link one target-specific proxy without touching the base payload artifacts."""
+    return toolchain.run_script(
+        root, "build.bat", timeout=600,
+        args=("proxy", def_path, out_path, implib_path, pdb_path))
+
+
 def toolchain_status(root):
     ok, info = toolchain.compiler_ready(root)
     return ok, info

