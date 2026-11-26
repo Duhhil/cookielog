@@ -53,7 +53,7 @@ class TestFilters(unittest.TestCase):
         rows = [c(name="a"), c(name="password"), c(name="b", expires=0)]
         self.assertEqual(len(loot.filter_cookies(rows)), 2)
         self.assertEqual(len(loot.filter_passwords(rows)), 1)
-        self.assertEqual(len(loot.filter_session(rows)), 2)   # both non-password rows have no expiry
+        self.assertEqual(len(loot.filter_session(rows)), 2)   # Both non-password rows have no expiry
 
     def test_expiry_tolerates_junk(self):
         self.assertEqual(loot.expiry({"expires": "nope"}), 0)

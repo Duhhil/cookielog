@@ -66,7 +66,7 @@ REM Uncomment to use a custom prompt:
 REM @prompt $E[92m$P$E[0m$G 
 
 REM ------------------------------------------------------------------ Environment info
-REM Show current dir on startup (only in interactive sessions)
+REM Show current dir on startup (only in interactive sessions).
 if /i "%1"=="" (
     echo [cmd] %CD%
 )

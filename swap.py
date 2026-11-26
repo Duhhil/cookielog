@@ -35,11 +35,11 @@ def expiry(c):
 
 def keep(c, session, auth, now):
     if not isinstance(c, dict) or not c.get("name"): return False
-    if not c.get("domain"): return False                          # nothing to group on
+    if not c.get("domain"): return False                          # Nothing to group on
     if c.get("name") in ("password", "token"): return False       # listen.py mixes logins/tokens in
     e = expiry(c)
-    if e and e < now - 300: return False                          # expired never works
-    if session and e: return False                                # session = no recorded expiry
+    if e and e < now - 300: return False                          # Expired never works
+    if session and e: return False                                # Session = no recorded expiry
     nm = c.get("name") or ""
     if JUNK.search(nm): return False
     if auth and not AUTH.search(nm): return False

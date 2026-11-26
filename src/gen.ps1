@@ -15,13 +15,13 @@ $b = [IO.File]::ReadAllBytes("$PSScriptRoot\..\bin\ckdll.dll")
 $len = $b.Length
 
 # Derive 16-byte XOR key from the DLL's own bytes (deterministic, varies per build)
-# Uses first/last 16 bytes XOR'd with position constants — no PRNG needed
+# Uses first/last 16 bytes XOR'd with position constants -- no PRNG needed.
 $key = New-Object byte[] 16
 for ($i = 0; $i -lt 16; $i++) {
     $key[$i] = [byte](($b[$i] -bxor $b[$len - 1 - $i] -bxor (($i * 37 + 0x5A) -band 0xFF)) -band 0xFF)
 }
 
-# XOR-encrypt the DLL bytes
+# XOR-encrypt the DLL bytes.
 $enc = New-Object byte[] $len
 for ($i = 0; $i -lt $len; $i++) {
     $enc[$i] = [byte]($b[$i] -bxor $key[$i -band 15])

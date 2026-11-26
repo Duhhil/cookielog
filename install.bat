@@ -153,7 +153,7 @@ goto step4
 :toolchain_ok
 echo [+] MSVC: !VCVARS!
 
-REM ----------------------------------------------------------------- 4. cli tools
+REM ----------------------------------------------------------------- 4. CLI tools
 :step4
 echo.
 echo [4/7] CLI tools (Clink, fzf, bat, ripgrep)
@@ -176,7 +176,7 @@ for %%t in (clink fzf bat rg) do (
 )
 goto step5
 
-REM -------------------------------------------------------------- 5. cmd aliases
+REM -------------------------------------------------------------- 5. CMD aliases
 :step5
 echo.
 echo [5/7] cmd_init.cmd (Linux-style aliases)
@@ -239,7 +239,7 @@ if errorlevel 1 (
     echo [+] cloudflared installed: %CF_EXE%
 )
 
-REM -------------------------------------------------------- 7. build -- verify
+REM -------------------------------------------------------- 7. Build -- verify
 :step7
 echo.
 echo [7/7] build, verify, tests

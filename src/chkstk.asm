@@ -18,12 +18,12 @@
 __chkstk proc
     mov     r10, rsp          ; caller's rsp (committed region)
     mov     r11, r10
-    sub     r11, rax          ; r11 = lowest address of the new frame
+    sub     r11, rax          ; R11 = lowest address of the new frame
 pl:
-    sub     r10, 1000h        ; step one page down
+    sub     r10, 1000h        ; Step one page down
     test    byte ptr [r10], al ; touch: on the guard page this expands it
     cmp     r10, r11
-    ja      pl                ; keep going until we probed at or below the bottom
+    ja      pl                ; Keep going until we probed at or below the bottom
     ret
 __chkstk endp
 end

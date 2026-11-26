@@ -47,7 +47,7 @@ echo "  EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING"
 echo "=============================================================================="
 echo
 
-# --- detect package manager -------------------------------------------------
+# --- Detect package manager -------------------------------------------------
 PKG=""
 SUDO=""
 if command -v apt-get >/dev/null 2>&1; then

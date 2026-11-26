@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test C: sink.py por named pipe real (cliente separado, protocolo do loader)."""
+"""Test C: sink.py over a real named pipe (separate client, loader protocol)."""
 import json, sys, time
 import ctypes
 from ctypes import wintypes

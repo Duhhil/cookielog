@@ -82,7 +82,7 @@ def find_sentinel(blob, sentinel, slot=None, section=".data"):
             return 1
         if name == ".text":
             return 3
-        return 1 if name else 2      # not a PE / unknown section: neutral
+        return 1 if name else 2      # Not a PE / unknown section: neutral
     return min(hits, key=lambda h: (rank(h), h))
 
 

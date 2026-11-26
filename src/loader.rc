@@ -1,4 +1,4 @@
-// loader.rc - neutral version info for the injector GUI exe.
+// loader.rc -- neutral version info for the injector GUI exe.
 // Do not impersonate Microsoft: an unsigned exe whose name, icon and signature
 // disagree with its version resource is a stronger anomaly than generic metadata.
 #include <winver.h>

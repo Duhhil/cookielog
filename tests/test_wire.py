@@ -95,7 +95,7 @@ class TestWire(unittest.TestCase):
         rows = self.get("/coverage")
         self.assertEqual(len(rows), 1)
         m = rows[0]
-        self.assertEqual(m["host"], "TESTHOST")     # header fills the missing host
+        self.assertEqual(m["host"], "TESTHOST")     # Header fills the missing host
         self.assertEqual(m["run"], "r1")
         self.assertEqual(m["totals"]["rows"], 10)
         self.assertEqual(m["totals"]["decrypted"], 9)

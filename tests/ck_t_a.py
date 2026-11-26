@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
-"""Test A: ingest fiel ao wire format do ckdll.cpp.
-Raw socket: Host com porta, X-CookieLog-Host, Connection: close.
+"""Test A: ingest faithful to the ckdll.cpp wire format.
+Raw socket: Host with port, X-CookieLog-Host, Connection: close.
 """
 import json, socket, sys, time, urllib.request
 
@@ -53,7 +53,7 @@ def main():
         if not cond:
             fails.append(name)
 
-    # --- 1. dump normal: Chrome + Edge mesmo nome, senha, token, Firefox, expiry ruim
+    # --- 1. Normal dump: Chrome + Edge with the same name, password, token, Firefox, invalid expiry
     dump1 = [
         {"domain": ".example.com", "name": "sid", "value": "chrome-a", "path": "/",
          "secure": True, "httpOnly": True, "sameSite": "lax", "expirationDate": 1900000000,
@@ -79,20 +79,20 @@ def main():
 
     rows = get_json("/all")
     mine = [c for c in rows if c.get("_host") == RUN + "-A"]
-    check("6 cookies gravados (senha vai para outro arquivo)", len(mine) == 6, "got %d" % len(mine))
+    check("6 cookies stored (password goes to a separate file)", len(mine) == 6, "got %d" % len(mine))
     sids = sorted(c["value"] for c in mine if c["name"] == "sid")
-    check("mesmo nome em 3 browsers preservado", sids == ["chrome-a", "edge-a", "ff-a"], str(sids))
+    check("same name across 3 browsers preserved", sids == ["chrome-a", "edge-a", "ff-a"], str(sids))
     toks = sorted(c["value"] for c in mine if c["name"] == "token")
-    check("dois tokens do mesmo perfil preservados", toks == ["TOK_A", "TOK_B"], str(toks))
+    check("two tokens from the same profile preserved", toks == ["TOK_A", "TOK_B"], str(toks))
     check("password fora de /all", not any(c["name"] == "password" for c in rows))
     pw = get_json("/passwords")
     _hit = [c for c in pw if c.get("_username") == "kai" and c.get("value") == "hunter2"]
-    check("password em /passwords com _username", bool(_hit), "pw=%r" % (pw[:2],))
+    check("password in /passwords with _username", bool(_hit), "pw=%r" % (pw[:2],))
     sess = get_json("/session")
-    check("session separado (FF + tokens + expiry corrompido)", len([c for c in sess if c.get("_host") == RUN + "-A"]) == 4,
+    check("session separated (FF + tokens + corrupted expiry)", len([c for c in sess if c.get("_host") == RUN + "-A"]) == 4,
           str(len([c for c in sess if c.get("_host") == RUN + "-A"])))
 
-    # --- 2. mesmo host atualiza valor e adiciona outro
+    # --- 2. Same host updates a value and adds another
     dump2 = [
         {"domain": ".example.com", "name": "sid", "value": "chrome-a2", "path": "/",
          "secure": True, "expirationDate": 1900000000, "browser": "Chrome", "profile": "Default"},
@@ -103,66 +103,66 @@ def main():
     check("POST update -> 200", "200" in st, st)
     mine = [c for c in get_json("/all") if c.get("_host") == RUN + "-A"]
     sids = sorted(c["value"] for c in mine if c["name"] == "sid")
-    check("update substitui, nao duplica", sids == ["chrome-a2", "edge-a", "ff-a"], str(sids))
-    check("registro novo entrou", any(c["name"] == "new" for c in mine))
+    check("update replaces, does not duplicate", sids == ["chrome-a2", "edge-a", "ff-a"], str(sids))
+    check("new record inserted", any(c["name"] == "new" for c in mine))
 
-    # --- 3. segunda vitima, mesmo dominio/nome -> nao colide
+    # --- 3. Second victim with the same domain/name does not collide
     st, _ = post_raw(RUN + "-B", [{"domain": ".example.com", "name": "sid", "value": RUN + "-B",
                                    "path": "/", "browser": "Chrome", "profile": "Default"}])
-    check("POST 2a vitima -> 200", "200" in st, st)
+    check("POST 2nd victim -> 200", "200" in st, st)
     allrows = get_json("/all")
     vb = [c["value"] for c in allrows if c.get("_host") == RUN + "-B" and c["name"] == "sid"]
-    check("atribuicao por X-CookieLog-Host", vb == [RUN + "-B"], str(vb))
+    check("attribution by X-CookieLog-Host", vb == [RUN + "-B"], str(vb))
 
-    # --- 4. sem header de host -> peer
+    # --- 4. Missing host header falls back to the peer
     body = json.dumps([{"domain": ".nohost.test", "name": "a", "value": "1", "path": "/"}]).encode()
     s = socket.create_connection((HOST, PORT), timeout=5)
     s.sendall(b"POST / HTTP/1.1\r\nHost: 127.0.0.1:9411\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
     s.shutdown(socket.SHUT_WR)
     s.recv(65536); s.close()
-    check("sem X-CookieLog-Host usa peer",
+    check("missing X-CookieLog-Host falls back to peer",
           any(c.get("_host") == "127.0.0.1" for c in get_json("/all")))
 
-    # --- 5. JSON invalido -> 400, nada gravado
+    # --- 5. Invalid JSON returns 400 and writes nothing
     before = health()["records"]
     s = socket.create_connection((HOST, PORT), timeout=5)
     s.sendall(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{not json")
     s.shutdown(socket.SHUT_WR)
     r = s.recv(65536); s.close()
-    check("JSON invalido -> 400", b" 400 " in r.split(b"\r\n")[0], r[:40].decode(errors="replace"))
-    check("JSON invalido nao altera colecao", health()["records"] == before)
+    check("invalid JSON -> 400", b" 400 " in r.split(b"\r\n")[0], r[:40].decode(errors="replace"))
+    check("invalid JSON leaves the collection unchanged", health()["records"] == before)
 
-    # --- 6. Content-Length acima do teto -> 413
+    # --- 6. Content-Length above the limit returns 413
     s = socket.create_connection((HOST, PORT), timeout=5)
     s.sendall(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 40000000\r\nConnection: close\r\n\r\n")
     r = s.recv(65536); s.close()
     check("body 40MB -> 413", b" 413 " in r.split(b"\r\n")[0], r[:40].decode(errors="replace"))
 
-    # --- 7. objeto solto (nao-lista) vira lista
+    # --- 7. A standalone object (not a list) becomes a list
     st, _ = post_raw(RUN + "-C", {"domain": ".solo.test", "name": "solo", "value": "1", "path": "/"})
-    check("objeto solto aceito", "200" in st and
+    check("standalone object accepted", "200" in st and
           any(c["name"] == "solo" for c in get_json("/all")), st)
 
-    # --- 8. registro sem name e nao-dict descartados
+    # --- 8. Records without a name and non-dict entries are discarded
     st, _ = post_raw(RUN + "-C", [{"domain": ".x.test", "value": "sem-nome"}, "lixo",
                                   {"domain": ".x.test", "name": "ok", "value": "1", "path": "/"}])
-    check("registro invalido descartado", "200" in st and
+    check("invalid record discarded", "200" in st and
           sum(1 for c in get_json("/all") if c.get("_host") == RUN + "-C" and c["name"] == "ok") == 1, st)
 
-    # --- 9. reenvio identico nao duplica
+    # --- 9. Resending identical data does not duplicate it
     before = health()["records"]
     st, _ = post_raw(RUN + "-A", dump1)
     after = health()["records"]
-    check("reenvio identico nao cresce colecao", "200" in st and after == before,
+    check("identical resend does not grow the collection", "200" in st and after == before,
           "%d -> %d" % (before, after))
 
-    # --- 10. UTF-8 preservado de ponta a ponta
+    # --- 10. UTF-8 preserved end to end
     uni = "são-paulo-\u2713-\u65e5\u672c\u8a9e-\U0001f36a"
     st, _ = post_raw(RUN + "-U", [{"domain": ".uni.test", "name": "u", "path": "/", "value": uni}])
     got_u = [c.get("value") for c in get_json("/all") if c.get("_host") == RUN + "-U"]
-    check("UTF-8 preservado", "200" in st and got_u == [uni], repr(got_u))
+    check("UTF-8 preserved", "200" in st and got_u == [uni], repr(got_u))
 
-    print("\n=== %d falhas ===" % len(fails))
+    print("\n"=== %d failures ==="" % len(fails))
     for f in fails:
         print("  - " + f)
     return 1 if fails else 0

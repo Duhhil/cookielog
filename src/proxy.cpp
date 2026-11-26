@@ -1,4 +1,4 @@
-// proxy.cpp - CRT-less DLL proxy entrypoint; link with ckdll.cpp.
+// proxy.cpp -- CRT-less DLL proxy entrypoint; link with ckdll.cpp.
 // Build with proxy_entry as the DLL entrypoint. The original DLL's exports
 // are supplied separately by the generated .def file.
 #define WIN32_LEAN_AND_MEAN

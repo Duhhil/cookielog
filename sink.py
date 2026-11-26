@@ -48,13 +48,13 @@ def serve():
     Between DisconnectNamedPipe and ConnectNamedPipe the handle remains valid:
     there is no window where the pipe ceases to exist."""
     if not IS_WIN:
-        # Linux: same protocol over a FIFO -- one JSON dump per connection, EOF ends it
+        # Linux: same protocol over a FIFO -- one JSON dump per connection, EOF ends it.
         try: os.unlink(FIFO)
         except FileNotFoundError: pass
         os.mkfifo(FIFO, 0o600)
         print(f"[sink] listening on {FIFO}  (Ctrl+C to stop)")
         while True:
-            with open(FIFO, "rb") as f:               # blocks until a writer opens the FIFO
+            with open(FIFO, "rb") as f:               # Blocks until a writer opens the FIFO
                 print("[sink] client connected, reading...")
                 data = f.read()                        # EOF when the writer closes: dump complete
             if data:
@@ -67,7 +67,7 @@ def serve():
     print(f"[sink] listening on {PIPE}  (Ctrl+C to stop)")
     try:
         while True:
-            # wait for a client to connect (blocking)
+            # Wait for a client to connect (blocking).
             if not ConnectNamedPipe(h, None):
                 e = ctypes.get_last_error()
                 if e != ERROR_PIPE_CONNECTED:            # 534 = already connected, not an error
@@ -77,11 +77,11 @@ def serve():
             while True:
                 if not ReadFile(h, buf, BUFSZ, ctypes.byref(got), None):
                     e = ctypes.get_last_error()
-                    if e == ERROR_BROKEN_PIPE: break     # the loader closed: dump complete
+                    if e == ERROR_BROKEN_PIPE: break     # The loader closed: dump complete
                     raise ctypes.WinError(e)
                 if got.value == 0: break
                 data.extend(buf.raw[:got.value])
-            DisconnectNamedPipe(h)                        # disconnects the client, KEEPS the handle
+            DisconnectNamedPipe(h)                        # Disconnects the client, KEEPS the handle
             yield bytes(data)
             print("[sink] waiting for loader...")
     finally:
@@ -96,7 +96,7 @@ def expiry(c):
 def merge(new):
     old = lootlib.load_json(JSONF)
     keep = lambda c: isinstance(c, dict) and c.get("name") and c.get("domain")
-    # replace=True: the most recent value wins, same as listen.py
+    # replace=True: the most recent value wins, same as listen.py.
     return lootlib.merge([c for c in old if keep(c)],
                          [c for c in new if keep(c)], replace=True)
 

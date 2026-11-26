@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test F: 8 vitimas simultaneas + swap com containers do Firefox."""
+"""Test F: 8 simultaneous victims + swap with Firefox containers."""
 import json, socket, sys, time, threading, urllib.request
 
 HOST, PORT = "127.0.0.1", 9411
@@ -46,31 +46,31 @@ def main():
     for t in ts:
         t.join()
     dt = time.time() - t0
-    print("[simultaneo] %d POSTs de %d registros em %.2fs" % (N, len(big), dt))
+    print("[concurrent] %d POSTs of %d records in %.2fs" % (N, len(big), dt))
 
     ok = sum(1 for v in results.values() if "200" in v)
-    fails.append("POSTs simultaneos") if ok != N else None
-    print(("  PASS  " if ok == N else "  FAIL  ") + "todos os %d POSTs -> 200" % N)
+    fails.append("concurrent POSTs") if ok != N else None
+    print(("  PASS  " if ok == N else "  FAIL  ") + "all %d POSTs -> 200" % N)
 
     rows = get("/all")
     for i in range(N):
         got = [c for c in rows if c.get("_host") == "%s-%d" % (RUN, i)]
         if len(got) != 200:
-            fails.append("vitima %d perdeu registros" % i)
-            print("  FAIL  vitima %d: %d/200" % (i, len(got)))
+            fails.append("victim %d lost records" % i)
+            print("  FAIL  victim %d: %d/200" % (i, len(got)))
     if len(fails) == 0:
-        print("  PASS  cada vitima com 200 registros intactos")
+        print("  PASS  every victim with 200 records intact")
 
-    # swap com cookies de container do Firefox: duas linhas mesmo nome/path
+    # Swap with Firefox container cookies: two lines with the same name/path.
     src = json.load(open(r"C:\Users\Dun\Documents\Codigos\tools\cookielog\cookies_all.json", encoding="utf-8"))
     dup = {}
     for c in src:
         k = (c.get("domain"), c.get("name"), c.get("path"))
         dup.setdefault(k, set()).add(c.get("value"))
     multi = [k for k, v in dup.items() if len(v) > 1]
-    print("[swap] %d cookies com mesmo dominio/nome/path e valores distintos" % len(multi))
+    print("[swap] %d cookies with the same domain/name/path and distinct values" % len(multi))
 
-    print("\n=== %d falhas ===" % len(fails))
+    print("\n"=== %d failures ==="" % len(fails))
     for f in fails:
         print("  - " + f)
     return 1 if fails else 0

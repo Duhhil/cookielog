@@ -1,5 +1,5 @@
 @echo off
-REM start_attack.bat - starts the HTTP listener and the infector GUI
+REM start_attack.bat -- starts the HTTP listener and the infector GUI
 REM EDUCATIONAL USE ONLY - FOR SECURITY RESEARCH AND TRAINING
 REM Usage: start_attack.bat [c2_port]
 

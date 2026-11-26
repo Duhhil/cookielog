@@ -30,7 +30,7 @@ def main():
 
     bot_token = sys.argv[1].strip()
 
-    # Validate token format (should contain a colon)
+    # Validate token format (should contain a colon).
     if ":" not in bot_token:
         print("[-] Invalid token format. Expected: 123456789:AAHxxx...")
         sys.exit(1)
@@ -56,7 +56,7 @@ def main():
         print("    Then run this script again.")
         sys.exit(1)
 
-    # Get chat ID from the latest message
+    # Get chat ID from the latest message.
     last = results[-1]
     if "message" in last:
         chat_id = last["message"]["chat"]["id"]

