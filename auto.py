@@ -679,7 +679,11 @@ def _rewrite_c2_port(url, port):
                                     parts.path, parts.query, parts.fragment))
 
 
+
 from auto_gui import pick_gui
+
+# ------------------------------------------------------------------ Interactive terminal
+
 def print_help():
     """Print all available commands."""
     log("")
