@@ -35,7 +35,7 @@ def main():
 
     a = load_auto()
     sys.path.insert(0, REPO)
-    from cklog import pe as peutil
+    import peutil
     sent = a.C2_SENTINEL
     print("[loader] C2_SENTINEL=%r  slot=256" % sent)
 
