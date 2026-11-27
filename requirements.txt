@@ -1,2 +1,2 @@
-cryptography>=42
-websocket-client>=1.7
+cryptography==50.0.2 \
+    --hash=sha256:7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c

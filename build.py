@@ -40,7 +40,7 @@ def cmd_check(args):
     print("root:     %s" % HERE)
 
     deps = []
-    for mod in ("cryptography", "websocket"):
+    for mod in ("cryptography",):
         deps.append((mod, importlib.util.find_spec(mod) is not None))
     print("python deps: " + ", ".join("%s=%s" % (m, _ok(v)) for m, v in deps))
 
@@ -72,7 +72,17 @@ def cmd_check(args):
             print("  %-8s %-8s %s" % (s["name"], s["state"],
                                       ("@%d %s" % (s["offset"], s["section"])) if s["offset"] >= 0 else ""))
     print("\n%s" % ("ready" if bad == 0 else "%d required artifact(s) missing" % bad))
-    return 0 if bad == 0 else 1
+
+    # Hash verification for tracked prebuilt binaries.
+    hash_ok, hash_bad = B.verify_hashes(HERE)
+    if hash_bad:
+        print("\nhash mismatches:")
+        for rel, expected, actual in hash_bad:
+            print("  %-24s expected %s  got %s" % (rel, expected[:16], actual[:16]))
+    else:
+        print("hashes:   all tracked binaries match")
+
+    return 0 if (bad == 0 and hash_ok) else 1
 
 
 def cmd_verify(args):

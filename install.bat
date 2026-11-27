@@ -89,8 +89,8 @@ echo.
 echo [2/7] pip packages
 echo ==============================================================================
 if "%CHECK_ONLY%"=="1" (
-    python -c "import cryptography, websocket" >nul 2>&1
-    if errorlevel 1 (echo   [-] cryptography / websocket-client: not installed & set "FAIL=1") else (echo   [+] cryptography, websocket-client)
+    python -c "import cryptography" >nul 2>&1
+    if errorlevel 1 (echo   [-] cryptography: not installed & set "FAIL=1") else (echo   [+] cryptography)
     goto step3
 )
 python -m pip install --disable-pip-version-check -r requirements.txt
@@ -283,7 +283,7 @@ echo   summary
 echo ==============================================================================
 where /q python 2>nul
 if errorlevel 1 (echo   python:       MISSING) else (echo   python:       ok)
-python -c "import cryptography, websocket" >nul 2>&1
+python -c "import cryptography" >nul 2>&1
 if errorlevel 1 (echo   pip packages: MISSING) else (echo   pip packages: ok)
 call :find_vcvars
 if defined VCVARS (echo   MSVC:         !VCVARS!) else (echo   MSVC:         not found)

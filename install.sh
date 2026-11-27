@@ -132,7 +132,7 @@ echo "==========================================================================
 if [ -z "$PYBIN" ]; then
     echo "    [-] no python interpreter, skipping"
     FAIL=1
-elif "$PYBIN" -c "import cryptography, websocket" >/dev/null 2>&1; then
+elif "$PYBIN" -c "import cryptography" >/dev/null 2>&1; then
     echo "    [+] already installed"
 elif [ "$CHECK_ONLY" = "1" ]; then
     echo "    [-] NOT installed"; FAIL=1
@@ -221,7 +221,7 @@ echo
 echo "[5/5] verify..."
 echo "=============================================================================="
 if [ -n "$PYBIN" ]; then
-    if "$PYBIN" -c "import cryptography, websocket, auto, c2auth" >/dev/null 2>&1; then
+    if "$PYBIN" -c "import cryptography, auto, c2auth" >/dev/null 2>&1; then
         echo "    [+] project imports: ok (deps + auto + c2auth)"
     else
         echo "    [-] project imports failed -- run: $PYBIN -c 'import auto, c2auth'"
@@ -245,7 +245,7 @@ echo "==========================================================================
 if [ -n "$PYBIN" ]; then
     echo "  interpreter:  $PYBIN ($("$PYBIN" -V 2>&1))"
     "$PYBIN" -m pip --version >/dev/null 2>&1 && echo "  pip:          ok" || echo "  pip:          MISSING"
-    "$PYBIN" -c "import cryptography, websocket" >/dev/null 2>&1 && echo "  pip packages: ok" || echo "  pip packages: MISSING"
+    "$PYBIN" -c "import cryptography" >/dev/null 2>&1 && echo "  pip packages: ok" || echo "  pip packages: MISSING"
 else
     echo "  python3:      MISSING"
 fi

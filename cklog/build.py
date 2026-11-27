@@ -23,6 +23,16 @@ SENTINELS = (
     ("anti-vm", b"CKAV0000", 8),
 )
 
+# SHA-256 of tracked prebuilt binaries. Regenerate with: python build.py hash
+# These guard against accidental corruption or tampering of shipped artifacts.
+KNOWN_HASHES = {
+    "bin/loader.exe": "76b7f9e64f56b68a8c9208acf3794c6c047a3c0e29b538cda5d1b51f06e43a0b",
+    "bin/ckdll.dll": "c3482382e90883721e89cfe41e2527d7ec87a8055ac53661457163862c103fdc",
+    "bin/ckdec.exe": "d7761a512474853971f57506b07868920c838e3153f919a9696d3e7e20c18a4a",
+    "bin/ckkey.exe": "e122eb6471d96f9f859d213a10fe7ab8501130efb8fa244057277fd820263e71",
+    "bin/chkstk.obj": "ea98ccd0364c91fc277ee6a51c0ef44141d9af8d19cdea86627361ec99e7e9a3",
+}
+
 PATCHED = {
     "persist": b"CKPR0001",
     "anti-vm": b"CKAV0001",
@@ -107,6 +117,29 @@ def build_proxy(root, def_path, out_path, implib_path, pdb_path):
 def toolchain_status(root):
     ok, info = toolchain.compiler_ready(root)
     return ok, info
+
+
+def verify_hashes(root):
+    """Check tracked prebuilt binaries against KNOWN_HASHES.
+
+    Returns (ok, list_of_mismatches). Missing files are not mismatches here;
+    artifacts() already reports those. Only files present but with wrong hash
+    are reported.
+    """
+    import hashlib
+    mismatches = []
+    for rel, expected in KNOWN_HASHES.items():
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        actual = h.hexdigest()
+        if actual != expected:
+            mismatches.append((rel, expected, actual))
+    return not mismatches, mismatches
 
 
 def complete(root):

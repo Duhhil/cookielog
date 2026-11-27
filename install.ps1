@@ -65,7 +65,7 @@ if ($Check) {
     & python build.py check
     & python build.py verify | Out-String | Write-Host
     $deps = $true
-    & python -c "import cryptography, websocket" 2>$null
+    & python -c "import cryptography" 2>$null
     if ($LASTEXITCODE -ne 0) { Note-Fail "pip packages missing"; $deps = $false }
     else { Write-Host "[+] pip packages: cryptography, websocket-client" }
     $cf = Join-Path $env:LOCALAPPDATA "cloudflared\cloudflared.exe"
