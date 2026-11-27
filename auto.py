@@ -59,9 +59,9 @@ HERE   = os.path.dirname(os.path.abspath(__file__))
 BIN    = os.path.join(HERE, "bin")
 
 # Modular imports (F3): config and network logic extracted to separate modules.
-from auto_config import (load_config, save_config, show_config, telegram_probe,
+from cklog.auto_config import (load_config, save_config, show_config, telegram_probe,
                          gate_telegram, tg_lookup_chatid)
-from auto_network import (detect_ip, _is_private_ip, detect_public_ip,
+from cklog.auto_network import (detect_ip, _is_private_ip, detect_public_ip,
                           find_best_port, check_c2_reachable, find_port_owner_pid)
 LOADER = os.path.join(BIN, "loader.exe")
 DLL    = os.path.join(BIN, "ckdll.dll")
@@ -680,7 +680,7 @@ def _rewrite_c2_port(url, port):
 
 
 
-from auto_gui import pick_gui
+from cklog.auto_gui import pick_gui
 
 # ------------------------------------------------------------------ Interactive terminal
 

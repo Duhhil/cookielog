@@ -7,8 +7,8 @@ import os
 import sys
 
 # Re-export dependencies that the GUI needs from auto.py's sibling modules.
-from auto_config import load_config, save_config
-from auto_network import detect_ip, _is_private_ip, detect_public_ip, find_best_port
+from cklog.auto_config import load_config, save_config
+from cklog.auto_network import detect_ip, _is_private_ip, detect_public_ip, find_best_port
 
 
 def pick_gui(default_tunnel=False):
